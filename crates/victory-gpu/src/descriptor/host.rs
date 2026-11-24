@@ -1067,8 +1067,12 @@ impl HostHeap {
         let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
             && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
         let n = n as usize;
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..self.dynamic as usize).chain(0..*next as usize);
+        // Search from `next` on, then from the start (extending past cursor by
+        // n - 1 so contiguous runs crossing the cursor are not missed).
+        let cursor = *next as usize;
+        let end = self.dynamic as usize;
+        let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
+        let starts = (cursor..end).chain(0..second_end);
         let mut run = 0;
         let mut found = None;
         let mut last = usize::MAX;
