@@ -747,10 +747,15 @@ fn emit_program(
     let mut inputs = sig(FourCC::ISG1)?;
     let mut outputs = sig(FourCC::OSG1)?;
     // Interpolation as DXC declares it by default; pixel inputs that are
-    // read get the mode their barycentrics say.
+    // read get the mode their barycentrics say. Under conservative depth
+    // (`SV_DepthGreaterEqual`/`SV_DepthLessEqual`) the validator wants the
+    // position centroid (or per sample, which `lower` sets when the program
+    // runs per sample), as in PR #136.
+    let conservative_depth = pixel && outputs.iter().any(|o| matches!(o.kind, 18 | 19));
     let interpolated = if pixel { &mut inputs } else { &mut outputs };
     for e in interpolated {
         e.interp = match (e.kind, e.comp) {
+            (3, _) if conservative_depth => 5,
             (3, _) => 4,
             // Constant, as DXC declares it (the AMD compiler crashed on a
             // front face without a mode).
@@ -2004,6 +2009,18 @@ mod barycentric_tests {
     /// Translates a pixel program with the input VGPRs `input_addr`
     /// enables and one float4 TEXCOORD0 attribute (attr 0, row 0).
     fn pixel(words: &[u32], input_addr: u32) -> Result<HostShader, ShaderError> {
+        let mut target = element("SV_Target", 16, 0);
+        target.usage = 15;
+        pixel_sig(words, input_addr, &[element("TEXCOORD", 0, 0)], &[target])
+    }
+
+    /// The same with the console signatures `inputs` and `outputs`.
+    fn pixel_sig(
+        words: &[u32],
+        input_addr: u32,
+        inputs: &[SigElement],
+        outputs: &[SigElement],
+    ) -> Result<HostShader, ShaderError> {
         let native = NativeProgram {
             stage: HwStage::Ps,
             wave64: false,
@@ -2027,10 +2044,8 @@ mod barycentric_tests {
             },
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
-        let mut target = element("SV_Target", 16, 0);
-        target.usage = 15;
-        let isg1 = container::signature(&[element("TEXCOORD", 0, 0)], true);
-        let osg1 = container::signature(&[target], false);
+        let isg1 = container::signature(inputs, true);
+        let osg1 = container::signature(outputs, false);
         let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
         let c = Container::parse(&bytes).unwrap();
         let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
@@ -2148,6 +2163,87 @@ mod barycentric_tests {
     }
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    /// The `PSV0` input elements: (kind, start row if allocated, mode).
+    fn psv_inputs(shader: &HostShader) -> Vec<(u8, Option<u8>, u8)> {
+        let c = Container::parse(&shader.dxil).unwrap();
+        let psv = c.part(FourCC::PSV0).unwrap().data;
+        let u = |at: usize| u32::from_le_bytes(psv[at..at + 4].try_into().unwrap()) as usize;
+        let info = u(0);
+        let n_in = psv[4 + 28] as usize;
+        let mut at = 4 + info;
+        let n_bind = u(at);
+        at += 4;
+        if n_bind > 0 {
+            at += 4 + n_bind * u(at);
+        }
+        at += 4 + u(at);
+        at += 4 + 4 * u(at);
+        let size = u(at);
+        at += 4;
+        (0..n_in)
+            .map(|k| {
+                let e = &psv[at + k * size..];
+                let row = (e[10] & 0x40 != 0).then_some(e[9]);
+                (e[11], row, e[13])
+            })
+            .collect()
+    }
+
+    /// A conservative depth output makes the position centroid, which the
+    /// validator wants (14 programs were rejected with the center mode).
+    #[test]
+    fn conservative_depth_declares_a_centroid_position() {
+        let [e0, e1] = exp_mrt0(2);
+        let words = [
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            e0,
+            e1,
+            S_ENDPGM,
+        ];
+        let mut position = element("SV_Position", 3, 1);
+        position.usage = 0;
+        let inputs = [element("TEXCOORD", 0, 0), position];
+        let mut target = element("SV_Target", 16, 0);
+        target.usage = 15;
+        for (kind, name) in [(18, "SV_DepthLessEqual"), (19, "SV_DepthGreaterEqual")] {
+            let mut depth = element(name, kind, 0);
+            (depth.row, depth.cols) = (None, 1);
+            let shader =
+                pixel_sig(&words, PERSP_CENTER, &inputs, &[target.clone(), depth]).unwrap();
+            let pos: Vec<_> = psv_inputs(&shader)
+                .into_iter()
+                .filter(|e| e.0 == 3)
+                .collect();
+            assert_eq!(pos, [(3, Some(1), 5)], "{name}");
+        }
+        // Plain depth or none: noperspective center, as DXC declares it.
+        let shader = pixel_sig(&words, PERSP_CENTER, &inputs, &[target]).unwrap();
+        assert!(psv_inputs(&shader).contains(&(3, Some(1), 4)));
+    }
+
+    /// Per sample, the conservative-depth position is per sample too.
+    #[test]
+    fn conservative_depth_per_sample_declares_a_sample_position() {
+        let mut position = element("SV_Position", 3, 0);
+        position.interp = 5;
+        let mut sample = element("SV_SampleIndex", 12, 0);
+        (sample.comp, sample.row, sample.cols) = (5, None, 1);
+        let mut inputs = vec![position.clone(), sample];
+        super::lower::settle_position_mode(&mut inputs);
+        assert_eq!(inputs[0].interp, 7);
+        // A per-sample interpolation alone does the same.
+        let mut texcoord = element("TEXCOORD", 0, 1);
+        texcoord.interp = 6;
+        let mut inputs = vec![position.clone(), texcoord];
+        super::lower::settle_position_mode(&mut inputs);
+        assert_eq!(inputs[0].interp, 7);
+        // Without either, centroid stays.
+        let mut alone = vec![position];
+        super::lower::settle_position_mode(&mut alone);
+        assert_eq!(alone[0].interp, 5);
+    }
 
     /// An interpolation whose i is computed (`v_mul_f32 v3, 0.5, v0`) reads
     /// the attribute's vertices: TEXCOORD0 becomes constant, read with

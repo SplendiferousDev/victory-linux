@@ -2384,6 +2384,9 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        if self.s.pixel {
+            settle_position_mode(&mut self.s.inputs);
+        }
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -11533,6 +11536,20 @@ impl<'a> Lower<'a> {
 
 /// The DXIL interpolation mode of a kind of barycentrics (none for the
 /// pull model).
+/// A pixel program under conservative depth declares its position centroid
+/// (`emit`); one that runs per sample (an `SV_SampleIndex` input or a
+/// per-sample interpolation) declares it per sample instead.
+pub(super) fn settle_position_mode(inputs: &mut [SigElement]) {
+    let per_sample = inputs
+        .iter()
+        .any(|e| e.kind == 12 || matches!(e.interp, 6 | 7));
+    for e in inputs.iter_mut().filter(|e| e.kind == 3 && e.interp == 5) {
+        if per_sample {
+            e.interp = 7;
+        }
+    }
+}
+
 fn interp_mode(kind: Barycentric) -> Option<u8> {
     Some(match kind {
         Barycentric::PerspectiveCenter => 2,
