@@ -8093,14 +8093,28 @@ impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    /// `over`: a second plane drawn over the first (`crate::over`), with
+    /// the state the title's lists leave it in.
+    pub(crate) fn present(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        frame: u64,
+        over: Option<(&ID3D12Resource, u32)>,
+    ) -> Option<bool> {
         let showing = std::time::Instant::now();
-        let shown = self.present_now(texture, state, frame);
+        let shown = self.present_now(texture, state, frame, over);
         crate::framelog::add(crate::framelog::T::PresentShowUs, showing.elapsed().as_micros() as u64);
         shown
     }
 
-    fn present_now(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    fn present_now(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        frame: u64,
+        over: Option<(&ID3D12Resource, u32)>,
+    ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -8185,6 +8199,23 @@ impl Host {
                 ),
             ]);
             list.CopyResource(&back, texture);
+            // The second plane over the first, drawn into the back buffer.
+            if let Some((plane, was)) = over {
+                const READABLE: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                let was = D3D12_RESOURCE_STATES(was as i32);
+                let readable = was.0 & READABLE.0 != 0;
+                let mut into = vec![transition(&back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET)];
+                if !readable {
+                    into.push(transition(plane, was, READABLE));
+                }
+                list.ResourceBarrier(&into);
+                crate::over::record(&self.device, list, &back, format, (width, height), plane);
+                let mut back_again = vec![transition(&back, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST)];
+                if !readable {
+                    back_again.push(transition(plane, READABLE, was));
+                }
+                list.ResourceBarrier(&back_again);
+            }
             // The frame rate, into the corner of what is shown (not of the
             // title's own frame, which the lines below read back).
             crate::fpsbox::draw(self, list, &back, (width, height, format));

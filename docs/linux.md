@@ -167,8 +167,17 @@ The file is taken (renamed away) as it is read; progress is written to
   asks for 1,245,184. What this costs is not measured yet.
 - **Wave64 compute is refused on NVIDIA.** Some compute pipelines need 64-lane
   waves, which NVIDIA GPUs do not offer. AMD RDNA GPUs do.
-- **The Series S profile shows a black window.** The 4K target renders, but the
-  1080p image its upscaler writes stays black. Use `--console series-x`.
+- **The Series S profile: the upscaler is replaced by a plain stretch.** The
+  title renders below 1080p and has its FidelityFX upscaler write the 1080p
+  image; the upscaler's passes are not translated, so that image stayed black.
+  On Series S the runtime takes the title's `ffxDispatch` import and records a
+  bilinear stretch of the colour input instead (no temporal upscaling or
+  sharpening). The log says `upscale dispatch: a stretch ... was recorded` once,
+  or `upscale dispatch NOT stretched` with the reason.
+  `VICTORY_UPSCALE_STRETCH=0` turns it off. The title also presents its
+  interface as a second 4K plane; on Series S it is drawn over the game image
+  in the window (`VICTORY_SECOND_PLANE=0` turns that off). Not yet confirmed
+  with the game; if the window stays black, use `--console series-x`.
 
 ## Performance
 
@@ -230,7 +239,8 @@ it) and prints which server it runs. `--wineserver <path>` picks another,
   `drive_c/windows/system32` and that the Vulkan driver works (`vulkaninfo`).
 - **Shader compile errors from `D3DCompile`.** The native `d3dcompiler_47` is
   missing from the prefix, or `d3dcompiler_47=n` is not in `WINEDLLOVERRIDES`.
-- **A black window with `--console series-s`.** Known; use `series-x`.
+- **A black window with `--console series-s`.** Look for `upscale` in the
+  log (see above); use `series-x` meanwhile.
 - **A `vkd3d-proton.cache` file appears in the working directory.**
   `VKD3D_SHADER_CACHE_PATH` was not set.
 - **The title exits after about 30 seconds of a slow load.** The watchdog is on;

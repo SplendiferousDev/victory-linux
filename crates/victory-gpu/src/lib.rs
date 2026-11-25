@@ -51,6 +51,8 @@ mod indirect;
 mod inplace;
 pub mod list;
 pub mod object;
+#[cfg(windows)]
+mod over;
 pub mod pipeline;
 #[cfg(windows)]
 mod plaincopy;
@@ -72,6 +74,8 @@ pub mod shader_cache;
 mod memory;
 #[cfg(windows)]
 mod shadow;
+#[cfg(windows)]
+mod stretch;
 #[cfg(windows)]
 mod tiles;
 pub mod signature;
