@@ -530,7 +530,16 @@ fn host() -> Box<dyn Source> {
     Box::new(Nothing)
 }
 
-static HUB: LazyLock<&'static Hub> = LazyLock::new(|| Hub::start(host()));
+static HUB: LazyLock<&'static Hub> = LazyLock::new(|| {
+    let source = host();
+    let source = match std::env::var_os(padscript::ENV) {
+        Some(path) => Box::new(padscript::Scripted::new(source, path.into())),
+        None => source,
+    };
+    Hub::start(source)
+});
+
+mod padscript;
 
 type This = *const Object;
 type Out = *mut *const c_void;
