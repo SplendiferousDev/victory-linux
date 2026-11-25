@@ -49,6 +49,56 @@ pub fn warm_shader(container: &[u8]) -> Result<bool, String> {
     }
 }
 
+/// The offline warm-up of `victory warm`: see `victory_gpu::pipeline::warm`.
+pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Option<bool>) {
+    #[cfg(windows)]
+    {
+        victory_gpu::pipeline::warm(stage, container, compute)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (stage, container, compute);
+        (false, None)
+    }
+}
+
+/// The title's shader archive, which its precompiled pipelines name their
+/// shaders in; indexed in the background, the index kept at `index` across
+/// runs.
+pub fn use_shader_pack(archive: std::path::PathBuf, index: std::path::PathBuf) {
+    victory_gpu::pipeline::use_shader_pack(archive, Some(index));
+}
+
+pub use victory_gpu::pipeline::PrecompileReport;
+
+/// `victory precompile-graphics`: see
+/// `victory_gpu::pipeline::precompile_graphics`.
+pub fn precompile_graphics(
+    archive: &std::path::Path,
+    index: Option<&std::path::Path>,
+    jobs: usize,
+    limit: Option<usize>,
+    skip: usize,
+    mesh_only: bool,
+    progress: &(dyn Fn(usize, &PrecompileReport) + Sync),
+) -> Result<PrecompileReport, String> {
+    #[cfg(windows)]
+    {
+        victory_gpu::pipeline::precompile_graphics(archive, index, jobs, limit, skip, mesh_only, progress)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (archive, index, jobs, limit, skip, mesh_only, progress);
+        Err("no host GPU on this host".into())
+    }
+}
+
+/// Saves the pipeline library now if anything was added.
+pub fn save_pipeline_cache() {
+    #[cfg(windows)]
+    victory_gpu::pipeline::save_pipeline_cache();
+}
+
 /// Keeps the host's translations of the title's shaders in `dir` (a
 /// folder of the cache) across runs, and its compiled pipelines beside it
 /// (`pipelines`).

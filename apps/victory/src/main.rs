@@ -9,7 +9,7 @@ mod run;
 mod shader;
 mod translate;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -92,6 +92,39 @@ enum Command {
         #[arg(long)]
         warm: Option<PathBuf>,
     },
+    /// Translate the shaders of a title's archives into the cache and make
+    /// their compute pipelines, so that a run finds them there. Set
+    /// `VICTORY_HOST_WAVE` and `VICTORY_VIEW_LIMIT` as for `translate --warm`.
+    Warm {
+        paths: Vec<PathBuf>,
+        /// Worker threads (default: every logical core).
+        #[arg(long)]
+        jobs: Option<usize>,
+        /// Only translate: no host pipelines.
+        #[arg(long)]
+        no_pipelines: bool,
+    },
+    /// Make the host pipelines of the graphics records of the title's
+    /// precompiled pipeline cache (in its shader archive) into the pipeline
+    /// library, at low priority, so that a run with
+    /// VICTORY_PRECOMPILED_GRAPHICS=1 compiles none of them. Needs a GPU.
+    PrecompileGraphics {
+        /// The title's shader archive (default: `VICTORY_SHADER_ARCHIVE`,
+        /// relative to the configured game folder unless absolute).
+        archive: Option<PathBuf>,
+        /// Worker threads (default: half the logical cores).
+        #[arg(long)]
+        jobs: Option<usize>,
+        /// Only the first N records (after --skip).
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Leave out the first N records (of those chosen).
+        #[arg(long, default_value_t = 0)]
+        skip: usize,
+        /// Only records with a mesh shader.
+        #[arg(long)]
+        mesh: bool,
+    },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -161,18 +194,25 @@ fn main() -> Result<()> {
             jobs,
             warm,
         } => {
-            // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
-            if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
-                victory_shader::emit::set_view_heap_limit(n);
-            }
-            // `VICTORY_HOST_WAVE=32`: translate as for a GPU whose waves are at most 32 lanes
-            if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
-                victory_shader::emit::set_host_max_wave(n);
-            }
+            translator_env();
             if let Some(file) = warm {
                 return translate::warm(paths, &file, jobs);
             }
             translate::run(paths, validate, pipelines, list, jobs)
+        }
+        Command::Warm { paths, jobs, no_pipelines } => {
+            translator_env();
+            translate::warm_pipelines(paths, jobs, !no_pipelines)
+        }
+        Command::PrecompileGraphics {
+            archive,
+            jobs,
+            limit,
+            skip,
+            mesh,
+        } => {
+            translator_env();
+            translate::precompile_graphics(archive, jobs, limit, skip, mesh)
         }
         Command::Run {
             exe,
@@ -219,6 +259,31 @@ fn show_config() -> Result<()> {
 }
 
 /// Paths given on the command line, or the configured game + test titles.
+/// The translator's host settings for the offline commands, as a run's log
+/// gives them.
+fn translator_env() {
+    // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
+    if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
+        victory_shader::emit::set_view_heap_limit(n);
+    }
+    // `VICTORY_HOST_WAVE=32`: translate as for a GPU whose waves are at most 32 lanes
+    if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
+        victory_shader::emit::set_host_max_wave(n);
+    }
+}
+
+/// The title's shader archive, which its precompiled pipelines name their
+/// shaders in: `VICTORY_SHADER_ARCHIVE`, relative to `dir` (the title's
+/// folder) unless absolute. The file's name is the title's, so it is not
+/// assumed here.
+pub(crate) fn shader_archive(dir: Option<&Path>) -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os("VICTORY_SHADER_ARCHIVE").filter(|v| !v.is_empty())?);
+    Some(match dir {
+        Some(dir) if path.is_relative() => dir.join(path),
+        _ => path,
+    })
+}
+
 pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
     if !paths.is_empty() {
         return Ok(paths);

@@ -233,6 +233,126 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
     Ok(())
 }
 
+/// `victory warm` (`Command::Warm`): every container of `paths` is
+/// translated into the run's shader cache, and with `pipelines` each compute
+/// program's host pipeline is made into the pipeline library, on `jobs`
+/// threads. A run of the title then finds both there.
+pub fn warm_pipelines(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result<()> {
+    let paths = crate::default_paths(paths)?;
+    let cfg = victory_core::Config::load()?;
+    victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+    let threads = jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    let seen = Mutex::new(HashSet::new());
+    let [done, refused, made, unmade] = [const { AtomicUsize::new(0) }; 4];
+    let started = std::time::Instant::now();
+    for root in &paths {
+        for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
+            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
+                continue;
+            }
+            let Ok(data) = std::fs::read(entry.path()) else {
+                continue;
+            };
+            let jobs = sources(&data);
+            let next = AtomicUsize::new(0);
+            std::thread::scope(|s| {
+                for _ in 0..threads.min(jobs.len()) {
+                    s.spawn(|| {
+                        while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            let Some(bytes) = job.bytes() else { continue };
+                            let Ok(container) = Container::parse(&bytes) else { continue };
+                            // As the title passes it: no more than the container.
+                            let Some(total) = bytes.get(0x18..0x1c).and_then(|b| b.try_into().ok()) else { continue };
+                            let total = u32::from_le_bytes(total) as usize;
+                            let bytes = &bytes[..total.min(bytes.len())];
+                            let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else { continue };
+                            if !lock(&seen).insert(blake3::hash(bytes)) {
+                                continue;
+                            }
+                            let Ok(programs) = native_programs(dxil) else { continue };
+                            let stage = programs.iter().find_map(|p| match p.stage {
+                                HwStage::Vs => Some("vertex"),
+                                HwStage::Ps => Some("pixel"),
+                                HwStage::Ms => Some("mesh"),
+                                HwStage::Cs => Some("compute"),
+                                _ => None,
+                            });
+                            let Some(stage) = stage else { continue };
+                            let compute = pipelines && stage == "compute";
+                            let (translated, pipeline) = victory_hle::modules::d3d12x::warm(stage, bytes, compute);
+                            let count = if translated { &done } else { &refused };
+                            let n = count.fetch_add(1, Ordering::Relaxed) + 1;
+                            match pipeline {
+                                Some(true) => made.fetch_add(1, Ordering::Relaxed),
+                                Some(false) => unmade.fetch_add(1, Ordering::Relaxed),
+                                None => 0,
+                            };
+                            if n.is_multiple_of(2000) {
+                                println!("{:6.0} s  {n} shaders", started.elapsed().as_secs_f64());
+                            }
+                        }
+                    });
+                }
+            });
+        }
+    }
+    victory_hle::modules::d3d12x::save_pipeline_cache();
+    println!(
+        "warm         {} translated, {} refused; {} compute pipelines, {} refused; {:.0} s",
+        done.into_inner(),
+        refused.into_inner(),
+        made.into_inner(),
+        unmade.into_inner(),
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+/// `victory precompile-graphics` (`Command::PrecompileGraphics`).
+pub fn precompile_graphics(
+    archive: Option<PathBuf>,
+    jobs: Option<usize>,
+    limit: Option<usize>,
+    skip: usize,
+    mesh: bool,
+) -> Result<()> {
+    let cfg = victory_core::Config::load()?;
+    let archive = match archive {
+        Some(a) => a,
+        None => crate::shader_archive(cfg.game_dir.as_deref())
+            .ok_or_else(|| anyhow::anyhow!("no shader archive: give its path, or set VICTORY_SHADER_ARCHIVE"))?,
+    };
+    anyhow::ensure!(archive.is_file(), "no shader archive at {}", archive.display());
+    victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+    let index = cfg.cache_subdir("precompiled")?.join("shader-archive.index");
+    let jobs = jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).max(1)));
+    let started = std::time::Instant::now();
+    let report = victory_hle::modules::d3d12x::precompile_graphics(&archive, Some(&index), jobs, limit, skip, mesh, &|done, r| {
+        println!(
+            "{:6.0} s  {done} records: {} made, {} failed, {} duplicates, {} unmapped, {} undecoded",
+            started.elapsed().as_secs_f64(),
+            r.made,
+            r.failed,
+            r.duplicates,
+            r.unmapped,
+            r.undecoded
+        );
+    })
+    .map_err(|e| anyhow::anyhow!(e))?;
+    victory_hle::modules::d3d12x::save_pipeline_cache();
+    println!(
+        "precompile-graphics  {} records: {} pipelines made, {} failed, {} duplicates, {} with a shader not in the archive, {} undecoded; {:.0} s",
+        report.records,
+        report.made,
+        report.failed,
+        report.duplicates,
+        report.unmapped,
+        report.undecoded,
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
 pub fn run(
     paths: Vec<PathBuf>,
     validate: bool,
