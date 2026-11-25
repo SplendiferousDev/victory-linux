@@ -342,6 +342,92 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
+/// What the host is asked to do with views, counted since the start for
+/// `VICTORY_XMEM_STATS` ([`stats_tick`]). Under Wine every map and unmap
+/// is a request to wineserver, which looks through all of the process's
+/// views to serve it: these say how many there are and how often.
+#[derive(Clone, Copy)]
+enum Stat {
+    /// Views mapped at title addresses (each a host call).
+    Maps,
+    /// Views unmapped (each a host call).
+    Unmaps,
+    /// Views of our own mapped and unmapped for one write (two host calls).
+    Temporary,
+    /// Writes served from a section's view of our own (no host call).
+    InSection,
+    /// Maps of the very pages a view at that address already showed.
+    SameRemaps,
+    /// Pages and groups of `XMemMapPhysicalPagesScatter` calls.
+    ScatterPages,
+    ScatterGroups,
+}
+
+const STATS: usize = 7;
+static COUNTS: [AtomicUsize; STATS] = [const { AtomicUsize::new(0) }; STATS];
+/// Views now at title addresses, and sections' whole views of our own.
+static LIVE_VIEWS: AtomicUsize = AtomicUsize::new(0);
+static SECTION_VIEWS: AtomicUsize = AtomicUsize::new(0);
+
+fn count(stat: Stat, n: usize) {
+    COUNTS[stat as usize].fetch_add(n, Ordering::Relaxed);
+}
+
+/// `VICTORY_XMEM_STATS`: unset or 0, off; 1, a line every 5 s; a larger
+/// number, every that many seconds.
+fn stats_interval() -> Option<std::time::Duration> {
+    static EVERY: LazyLock<Option<std::time::Duration>> = LazyLock::new(|| {
+        let seconds: u64 = std::env::var("VICTORY_XMEM_STATS").ok()?.trim().parse().ok()?;
+        let seconds = match seconds {
+            0 => return None,
+            1 => 5,
+            s => s,
+        };
+        Some(std::time::Duration::from_secs(seconds))
+    });
+    *EVERY
+}
+
+/// Logs the counters ([`Stat`]) when `VICTORY_XMEM_STATS` asks and its
+/// interval has passed: what happened since the last line, and the views
+/// alive now. Cheap otherwise (one load); takes no lock of the page
+/// table.
+fn stats_tick() {
+    let Some(every) = stats_interval() else {
+        return;
+    };
+    static START: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
+    static LAST_MS: AtomicUsize = AtomicUsize::new(0);
+    static SEEN: Mutex<[usize; STATS]> = Mutex::new([0; STATS]);
+    let now = START.elapsed().as_millis() as usize;
+    let last = LAST_MS.load(Ordering::Relaxed);
+    if now < last + every.as_millis() as usize
+        || LAST_MS.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err()
+    {
+        return;
+    }
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let total: [usize; STATS] = std::array::from_fn(|i| COUNTS[i].load(Ordering::Relaxed));
+    let d: [usize; STATS] = std::array::from_fn(|i| total[i] - seen[i]);
+    *seen = total;
+    tracing::info!(
+        seconds = (now - last) / 1000,
+        live_views = LIVE_VIEWS.load(Ordering::Relaxed),
+        section_views = SECTION_VIEWS.load(Ordering::Relaxed),
+        maps = d[Stat::Maps as usize],
+        unmaps = d[Stat::Unmaps as usize],
+        temporary_views = d[Stat::Temporary as usize],
+        section_writes = d[Stat::InSection as usize],
+        same_remaps = d[Stat::SameRemaps as usize],
+        scatter_pages = d[Stat::ScatterPages as usize],
+        scatter_groups = d[Stat::ScatterGroups as usize],
+        maps_total = total[Stat::Maps as usize],
+        unmaps_total = total[Stat::Unmaps as usize],
+        temporary_total = total[Stat::Temporary as usize],
+        "xmem host views (VICTORY_XMEM_STATS)"
+    );
+}
+
 struct Section(HANDLE);
 
 // SAFETY: a section handle may be used from any thread.
@@ -504,6 +590,7 @@ impl View {
         if at.Value.is_null() {
             return None;
         }
+        count(Stat::Temporary, 1);
         let view = View { at, len };
         commit(at.Value as usize, len).then_some(view)
     }
@@ -561,6 +648,7 @@ pub(crate) fn pages_known(pages: &[usize], offset: usize, len: usize) -> bool {
 /// costs a map, a commit and an unmap (which flushes every core's TLB).
 /// False if a page is unknown or the host fails.
 pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> bool {
+    stats_tick();
     let Some(runs) = runs(pages, offset, data.len()) else {
         return false;
     };
@@ -598,6 +686,7 @@ impl PageWindow {
 /// unknown, or a host failure), which `write_physical` then handles or
 /// reports.
 pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<PageWindow> {
+    stats_tick();
     let runs = runs(pages, offset, len)?;
     let [(slice, n)] = runs.as_slice() else {
         return None;
@@ -668,8 +757,16 @@ pub extern "system" fn XMemMapPhysicalPages(
     n: usize,
     pages: *const usize,
 ) -> *mut c_void {
+    stats_tick();
     let base = address as usize;
     let mut physical = physical();
+    if !pages.is_null() {
+        // SAFETY: the title passes `n` page numbers.
+        let pages = unsafe { std::slice::from_raw_parts(pages, n) };
+        if shows_already(&physical, base, pages) {
+            count(Stat::SameRemaps, 1);
+        }
+    }
     // Until the pages are mapped again: `unmap` takes whole views away and
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
@@ -703,6 +800,20 @@ pub extern "system" fn XMemMapPhysicalPages(
         i += run;
     }
     address
+}
+
+/// Whether the view at `base` shows exactly `pages`, in order (so mapping
+/// them there again changes nothing but costs an unmap and a map).
+fn shows_already(physical: &Physical, base: usize, pages: &[usize]) -> bool {
+    let Some((len, shown)) = physical.views.get(&base) else {
+        return false;
+    };
+    *len == pages.len() * PAGE
+        && pages.iter().enumerate().all(|(k, page)| {
+            physical.pages.get(page).is_some_and(|s| {
+                Arc::ptr_eq(&s.section, &shown.section) && s.index == shown.index + k
+            })
+        })
 }
 
 /// One page at each address; null `pages`, or a page number 0, unmaps
@@ -740,6 +851,7 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// the title maps pages into a pool view, then has the GPU map them into its tiled
 /// heap. Page by page; false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
+    stats_tick();
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let mut physical = physical();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
@@ -847,6 +959,7 @@ fn map_quiet(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> 
             0,
         )
     };
+    count(Stat::Maps, 1);
     if view.Value as usize != base {
         return Err(std::io::Error::last_os_error());
     }
@@ -854,8 +967,10 @@ fn map_quiet(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> 
         let error = std::io::Error::other("the view's pages could not be committed");
         // SAFETY: the view just mapped, back to a placeholder.
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
+        count(Stat::Unmaps, 1);
         return Err(error);
     }
+    LIVE_VIEWS.fetch_add(1, Ordering::Relaxed);
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
     // What the range shows now, for the GPU side's in-place census.
@@ -961,6 +1076,8 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 MEM_PRESERVE_PLACEHOLDER,
             )
         };
+        count(Stat::Unmaps, 1);
+        LIVE_VIEWS.fetch_sub(1, Ordering::Relaxed);
         if at < base {
             map(physical, at, base - at, slice.clone());
         }
@@ -1410,6 +1527,45 @@ mod tests {
         assert_eq!(query(second).host.State, MEM_RESERVE);
         assert_eq!(query(a).host.State, MEM_COMMIT);
         assert_eq!(XMemMapPhysicalPages(a, 1, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    /// A reservation of `n` 64 KiB pages, as titles make them for mapping.
+    fn reserve(n: usize) -> *mut c_void {
+        let at = XMemVirtualAlloc(std::ptr::null_mut(), n * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert!(!at.is_null());
+        at
+    }
+
+    fn counted(stat: Stat) -> usize {
+        COUNTS[stat as usize].load(Ordering::Relaxed)
+    }
+
+    /// The counters for `VICTORY_XMEM_STATS` move with the host's work
+    /// (other tests count too, so only at least).
+    #[test]
+    fn host_view_work_is_counted() {
+        let pages = allocate(2);
+        let a = reserve(2);
+        let maps = counted(Stat::Maps);
+        assert_eq!(XMemMapPhysicalPages(a, 2, pages.as_ptr()), a);
+        assert!(counted(Stat::Maps) > maps);
+        {
+            let physical = physical();
+            assert!(shows_already(&physical, a as usize, &pages));
+            assert!(!shows_already(&physical, a as usize, &[pages[1], pages[0]]));
+            assert!(!shows_already(&physical, a as usize, &pages[..1]));
+            assert!(!shows_already(&physical, a as usize + PAGE, &pages[1..]));
+        }
+        let same = counted(Stat::SameRemaps);
+        assert_eq!(XMemMapPhysicalPages(a, 2, pages.as_ptr()), a);
+        assert!(counted(Stat::SameRemaps) > same);
+        let unmaps = counted(Stat::Unmaps);
+        assert_eq!(XMemMapPhysicalPages(a, 2, std::ptr::null()), a);
+        assert!(counted(Stat::Unmaps) > unmaps);
+        let temporary = counted(Stat::Temporary);
+        drop(View::map(&physical().pages[&pages[0]].clone(), 1).expect("mapped"));
+        assert!(counted(Stat::Temporary) > temporary);
         assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
     }
 
