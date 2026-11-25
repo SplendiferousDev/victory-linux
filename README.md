@@ -10,6 +10,13 @@ correctly and playably on one particular PC.
 copy of the game. It is not affiliated with or endorsed by the game's
 developer or publisher.
 
+## Linux
+
+The runtime runs under Wine with a Proton build and vkd3d-proton. Setup,
+launch scripts, the scripted pad, known differences and troubleshooting are
+in [docs/linux.md](docs/linux.md); the scripts are in `scripts/linux/`
+(`setup.sh`, `run.sh`, `test.sh`).
+
 ## Credits
 
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
