@@ -829,23 +829,66 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     if addresses.is_null() {
         return 0;
     }
-    for i in 0..n {
-        // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
-        let (address, page) = unsafe {
-            (
-                *addresses.add(i),
-                if pages.is_null() || *pages.add(i) == 0 {
-                    std::ptr::null()
-                } else {
-                    pages.add(i)
-                },
-            )
-        };
-        if XMemMapPhysicalPages(address, 1, page).is_null() {
-            return 0;
-        }
+    // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
+    let (addresses, pages) = unsafe {
+        (
+            std::slice::from_raw_parts(addresses, n),
+            (!pages.is_null()).then(|| std::slice::from_raw_parts(pages, n)),
+        )
+    };
+    scatter(addresses, pages, scatter_runs()).into()
+}
+
+/// `VICTORY_XMEM_SCATTER_RUNS`: 1, [`XMemMapPhysicalPagesScatter`] maps
+/// neighbouring addresses as one range (one unmap pass, one view per run
+/// of consecutive pages); 0, one page at a time. On by default under Wine
+/// only: there every view mapped or unmapped is a wineserver request that
+/// searches all of the process's views, and page by page also leaves one
+/// view per page alive. Windows keeps the page-by-page path it was tested
+/// with. The pages each address ends up showing are the same either way.
+fn scatter_runs() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| switch("VICTORY_XMEM_SCATTER_RUNS", on_wine()));
+    *ON
+}
+
+/// A switch read from the environment: `1` on, `0` off, else `default`.
+fn switch(name: &str, default: bool) -> bool {
+    match std::env::var(name).as_deref().map(str::trim) {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => default,
     }
-    1
+}
+
+/// [`XMemMapPhysicalPagesScatter`]: entry by entry, in the title's order,
+/// or with `runs` each group of entries at neighbouring addresses that all
+/// map (or all unmap) at once ([`scatter_runs`]; after ScarlettPort's
+/// `scatter_batched`). An address named twice still ends as the title's
+/// last entry says: a group never holds one address twice.
+fn scatter(addresses: &[*mut c_void], pages: Option<&[usize]>, runs: bool) -> bool {
+    let unmaps = |i: usize| pages.is_none_or(|p| p[i] == 0);
+    count(Stat::ScatterPages, addresses.len());
+    let mut i = 0;
+    while i < addresses.len() {
+        let mut n = 1;
+        while runs
+            && i + n < addresses.len()
+            && (addresses[i + n - 1] as usize).checked_add(PAGE) == Some(addresses[i + n] as usize)
+            && unmaps(i + n) == unmaps(i)
+        {
+            n += 1;
+        }
+        count(Stat::ScatterGroups, 1);
+        let group = match pages {
+            Some(p) if !unmaps(i) => p[i..].as_ptr(),
+            _ => std::ptr::null(),
+        };
+        if XMemMapPhysicalPages(addresses[i], n, group).is_null() {
+            return false;
+        }
+        i += n;
+    }
+    true
 }
 
 /// Maps the physical pages shown at `[from, from + len)` at `to` as well,
@@ -1674,6 +1717,56 @@ mod tests {
             // SAFETY: our own reservations.
             unsafe { VirtualFree(at, 0, MEM_RELEASE) };
         }
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+    }
+
+    /// A Scatter batch maps the same pages at the same addresses with
+    /// neighbours joined as without, in fewer views.
+    #[test]
+    fn scatter_runs_map_what_page_by_page_maps() {
+        let pages = allocate(4);
+        let mut seen = Vec::new();
+        for runs in [false, true] {
+            let a = reserve(7);
+            let at = |k: usize| a.wrapping_byte_add(k * PAGE);
+            // Something to replace at the last address.
+            assert_eq!(XMemMapPhysicalPages(at(6), 1, pages.as_ptr()), at(6));
+            // Three neighbours with consecutive pages, a gap, one with
+            // the first page again, then an unmap; the second entry for
+            // address 1 is the one that counts.
+            let addresses = [at(0), at(1), at(2), at(4), at(5), at(6), at(1)];
+            let numbers = [pages[0], pages[1], pages[2], pages[3], pages[0], 0, pages[3]];
+            assert!(scatter(&addresses, Some(&numbers), runs));
+            let views: Vec<(usize, usize)> = physical()
+                .views
+                .range(a as usize..at(7) as usize)
+                .map(|(&b, &(len, _))| (b - a as usize, len / PAGE))
+                .collect();
+            let shown: Vec<Option<usize>> = (0..7)
+                .map(|k| {
+                    let physical = physical();
+                    let (base, (_, slice)) = physical.views.range(..=at(k) as usize).next_back()?;
+                    let page = (at(k) as usize - base) / PAGE;
+                    (page < physical.views[base].0 / PAGE).then(|| slice.index + page)
+                })
+                .collect();
+            assert_eq!(shown[3], None, "the gap");
+            assert_eq!(shown[6], None, "unmapped");
+            seen.push((shown, views.len()));
+            assert!(scatter(&addresses, None, runs), "all unmapped");
+            assert!(physical().views.range(a as usize..at(7) as usize).next().is_none());
+        }
+        assert_eq!(seen[0].0, seen[1].0, "the same pages shown");
+        // Page by page: 0, 1, 2, 4, 5; in runs 0-2 is one view until the
+        // last entry splits it around address 1.
+        assert_eq!(seen[0].1, 5);
+        assert!(seen[1].1 <= seen[0].1);
+        // Without the last entry, the run of three is one view.
+        let a = reserve(3);
+        let addresses: Vec<_> = (0..3).map(|k| a.wrapping_byte_add(k * PAGE)).collect();
+        assert!(scatter(&addresses, Some(&pages[..3]), true));
+        assert_eq!(physical().views.get(&(a as usize)).map(|v| v.0), Some(3 * PAGE));
+        assert!(scatter(&addresses, None, true));
         assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
     }
 
