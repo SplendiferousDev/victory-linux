@@ -320,9 +320,71 @@ pub extern "system" fn WSAConnectByList(
             return 0;
         }
     }
-    host!("ws2_32.dll", "WSAConnectByList": extern "system" fn(Socket, *const u8, *mut u32, *mut c_void, *mut u32, *mut c_void, *const c_void, *mut c_void) -> i32)(
-        s, list, local_len, local, remote_len, remote, timeout, reserved,
-    )
+    type ConnectByList = extern "system" fn(
+        Socket,
+        *const u8,
+        *mut u32,
+        *mut c_void,
+        *mut u32,
+        *mut c_void,
+        *const c_void,
+        *mut c_void,
+    ) -> i32;
+    static HOST: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    match *HOST.get_or_init(|| crate::host::function("ws2_32.dll", "WSAConnectByList")) {
+        Some(f) => {
+            // SAFETY: the host exports this function with this signature.
+            let f = unsafe { std::mem::transmute::<usize, ConnectByList>(f) };
+            f(
+                s, list, local_len, local, remote_len, remote, timeout, reserved,
+            )
+        }
+        None => connect_by_list(s, list, local_len, local, remote_len, remote),
+    }
+}
+
+/// `WSAConnectByList` for hosts without it (Wine): each candidate in turn
+/// with `connect`, then the addresses the call reports. The timeout is not
+/// honoured (`connect` blocks), and a socket whose `connect` failed is
+/// tried again, which Wine's sockets allow.
+fn connect_by_list(
+    s: Socket,
+    list: *const u8,
+    local_len: *mut u32,
+    local: *mut c_void,
+    remote_len: *mut u32,
+    remote: *mut c_void,
+) -> i32 {
+    if list.is_null() {
+        return 0;
+    }
+    // SAFETY: the title passes a `SOCKET_ADDRESS_LIST` (checked above).
+    let entries = unsafe {
+        let count = usize::try_from(list.cast::<i32>().read()).unwrap_or(0);
+        std::slice::from_raw_parts(list.add(8).cast::<SocketAddress>(), count)
+    };
+    let host_connect =
+        host!("ws2_32.dll", "connect": extern "system" fn(Socket, *const u8, i32) -> i32);
+    let Some(e) = entries.iter().find(|e| host_connect(s, e.addr, e.len) == 0) else {
+        return 0;
+    };
+    let name =
+        host!("ws2_32.dll", "getsockname": extern "system" fn(Socket, *mut u8, *mut i32) -> i32);
+    // SAFETY: the out-parameters are the title's, each with its length.
+    unsafe {
+        if !remote.is_null() && !remote_len.is_null() {
+            let n = (*remote_len).min(u32::try_from(e.len).unwrap_or(0));
+            std::ptr::copy_nonoverlapping(e.addr, remote.cast::<u8>(), n as usize);
+            *remote_len = n;
+        }
+        if !local.is_null() && !local_len.is_null() {
+            let mut n = i32::try_from(*local_len).unwrap_or(i32::MAX);
+            if name(s, local.cast(), &mut n) == 0 {
+                *local_len = u32::try_from(n).unwrap_or(0);
+            }
+        }
+    }
+    1
 }
 
 pub extern "system" fn WSAJoinLeaf(
@@ -580,9 +642,123 @@ pub extern "system" fn GetAddrInfoExA(
     if !resolvable(narrow(name)) {
         return WSAHOST_NOT_FOUND;
     }
-    host!("ws2_32.dll", "GetAddrInfoExA": extern "system" fn(*const c_char, *const c_char, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32)(
+    type ExA = extern "system" fn(
+        *const c_char,
+        *const c_char,
+        u32,
+        *const c_void,
+        *const c_void,
+        *mut *mut c_void,
+        *const c_void,
+        *mut c_void,
+        *const c_void,
+        *mut Handle,
+    ) -> i32;
+    static HOST: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    if let Some(f) = *HOST.get_or_init(|| crate::host::function("ws2_32.dll", "GetAddrInfoExA")) {
+        // SAFETY: the host exports this function with this signature.
+        let f = unsafe { std::mem::transmute::<usize, ExA>(f) };
+        return f(
+            name, service, namespace, provider, hints, result, timeout, overlapped, completion,
+            handle,
+        );
+    }
+    addr_info_ex_a_by_w(
         name, service, namespace, provider, hints, result, timeout, overlapped, completion, handle,
     )
+}
+
+/// `ADDRINFOEXA` and `ADDRINFOEXW` differ only in the type of
+/// `ai_canonname`; the fields used here.
+#[repr(C)]
+struct AddrInfoEx {
+    flags: i32,
+    family: i32,
+    socktype: i32,
+    protocol: i32,
+    addrlen: usize,
+    canonname: *mut c_void,
+    addr: *mut c_void,
+    blob: *mut c_void,
+    bloblen: usize,
+    provider: *mut c_void,
+    next: *mut AddrInfoEx,
+}
+
+const AI_CANONNAME: i32 = 0x2;
+
+/// `GetAddrInfoExA` for hosts without it (Wine) through `GetAddrInfoExW`.
+/// The results keep their memory (so the host's `FreeAddrInfoEx` frees
+/// them): a canonical name is rewritten in place as narrow text, which
+/// needs less room than the wide text it replaces. An asynchronous lookup
+/// completes after this returns, so it is made without `AI_CANONNAME`.
+#[allow(clippy::too_many_arguments)]
+fn addr_info_ex_a_by_w(
+    name: *const c_char,
+    service: *const c_char,
+    namespace: u32,
+    provider: *const c_void,
+    hints: *const c_void,
+    result: *mut *mut c_void,
+    timeout: *const c_void,
+    overlapped: *mut c_void,
+    completion: *const c_void,
+    handle: *mut Handle,
+) -> i32 {
+    let to_wide = |s: Option<String>| s.map(|s| s.encode_utf16().chain([0]).collect::<Vec<u16>>());
+    let (wname, wservice) = (to_wide(narrow(name)), to_wide(narrow(service)));
+    let ptr = |w: &Option<Vec<u16>>| w.as_ref().map_or(std::ptr::null(), |w| w.as_ptr());
+    let asynchronous = !overlapped.is_null();
+    let mut own_hints = (!hints.is_null()).then(|| {
+        // SAFETY: the title passes an `ADDRINFOEXA` as hints; read its fields.
+        let h = unsafe { hints.cast::<AddrInfoEx>().read() };
+        AddrInfoEx {
+            flags: if asynchronous {
+                h.flags & !AI_CANONNAME
+            } else {
+                h.flags
+            },
+            ..h
+        }
+    });
+    let hints = own_hints.as_mut().map_or(std::ptr::null(), |h| {
+        std::ptr::from_mut(h).cast_const().cast::<c_void>()
+    });
+    let rc = host!("ws2_32.dll", "GetAddrInfoExW": extern "system" fn(*const u16, *const u16, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32)(
+        ptr(&wname),
+        ptr(&wservice),
+        namespace,
+        provider,
+        hints,
+        result,
+        timeout,
+        overlapped,
+        completion,
+        handle,
+    );
+    if rc == 0 && !asynchronous && !result.is_null() {
+        // SAFETY: a list of `ADDRINFOEXW` the host just returned; each
+        // canonical name is a NUL-terminated wide string in its memory.
+        unsafe {
+            let mut at = (*result).cast::<AddrInfoEx>();
+            while !at.is_null() {
+                let wide_name = (*at).canonname.cast::<u16>();
+                if let Some(text) = wide(wide_name) {
+                    let bytes = text.as_bytes();
+                    let room = 2 * (text.encode_utf16().count() + 1);
+                    if bytes.len() < room {
+                        let out = wide_name.cast::<u8>();
+                        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len());
+                        out.add(bytes.len()).write(0);
+                    } else {
+                        (*at).canonname = std::ptr::null_mut();
+                    }
+                }
+                at = (*at).next;
+            }
+        }
+    }
+    rc
 }
 
 pub extern "system" fn GetAddrInfoExW(
@@ -883,6 +1059,107 @@ mod tests {
     use super::*;
     use victory_pe::ImportSymbol;
 
+    /// The fallback for hosts without `WSAConnectByList` skips a candidate
+    /// that refuses and connects to the next, reporting its address.
+    #[test]
+    fn connect_by_list_fallback_tries_each_candidate() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let open = listener.local_addr().unwrap().port();
+        // A port that was free a moment ago: nothing listens there.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let (a, b) = (v4([127, 0, 0, 1], closed), v4([127, 0, 0, 1], open));
+        // SOCKET_ADDRESS_LIST: a count, padding, then (pointer, length) pairs.
+        #[repr(C)]
+        struct List {
+            count: i32,
+            entries: [SocketAddress; 2],
+        }
+        let list = List {
+            count: 2,
+            entries: [
+                SocketAddress {
+                    addr: a.as_ptr(),
+                    len: 16,
+                },
+                SocketAddress {
+                    addr: b.as_ptr(),
+                    len: 16,
+                },
+            ],
+        };
+        let s = host!("ws2_32.dll", "socket": extern "system" fn(i32, i32, i32) -> Socket)(
+            i32::from(AF_INET),
+            1,
+            6,
+        );
+        assert_ne!(s, usize::MAX);
+        let (mut remote, mut remote_len) = ([0u8; 16], 16u32);
+        let (mut local, mut local_len) = ([0u8; 16], 16u32);
+        let ok = connect_by_list(
+            s,
+            std::ptr::from_ref(&list).cast(),
+            &mut local_len,
+            local.as_mut_ptr().cast(),
+            &mut remote_len,
+            remote.as_mut_ptr().cast(),
+        );
+        host!("ws2_32.dll", "closesocket": extern "system" fn(Socket) -> i32)(s);
+        assert_eq!(ok, 1);
+        assert_eq!((remote, remote_len), (b, 16));
+        assert_eq!(&local[4..8], &[127, 0, 0, 1]);
+    }
+
+    /// The fallback for hosts without `GetAddrInfoExA` returns results the
+    /// host frees, with the canonical name as narrow text.
+    #[test]
+    fn addr_info_ex_a_fallback_gives_narrow_names() {
+        let hints = AddrInfoEx {
+            flags: AI_CANONNAME,
+            family: i32::from(AF_INET),
+            socktype: 1,
+            protocol: 0,
+            addrlen: 0,
+            canonname: std::ptr::null_mut(),
+            addr: std::ptr::null_mut(),
+            blob: std::ptr::null_mut(),
+            bloblen: 0,
+            provider: std::ptr::null_mut(),
+            next: std::ptr::null_mut(),
+        };
+        let mut result: *mut c_void = std::ptr::null_mut();
+        let rc = addr_info_ex_a_by_w(
+            c"localhost".as_ptr(),
+            c"80".as_ptr(),
+            0,
+            std::ptr::null(),
+            std::ptr::from_ref(&hints).cast(),
+            &mut result,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        );
+        assert_eq!(rc, 0);
+        // SAFETY: the list the call above returned.
+        let (family, port, name) = unsafe {
+            let first = &*result.cast::<AddrInfoEx>();
+            let addr = std::slice::from_raw_parts(first.addr.cast::<u8>(), 4);
+            let name = narrow(first.canonname.cast());
+            (first.family, u16::from_be_bytes([addr[2], addr[3]]), name)
+        };
+        host!("ws2_32.dll", "FreeAddrInfoEx": extern "system" fn(*mut c_void))(result);
+        assert_eq!((family, port), (i32::from(AF_INET), 80));
+        let name = name.unwrap_or_default();
+        assert!(
+            !name.is_empty() && name.is_ascii(),
+            "canonical name {name:?}"
+        );
+    }
+
     fn v4(ip: [u8; 4], port: u16) -> [u8; 16] {
         let mut a = [0u8; 16];
         a[..2].copy_from_slice(&AF_INET.to_le_bytes());
@@ -1048,11 +1325,17 @@ mod tests {
                 named.name
             );
         }
-        // Every override names a real export of its DLL. Some exports only
-        // exist on newer Windows (WinHttpGetProxySettingsEx is absent from
-        // Windows 10's winhttp.dll); the HLE supplies those itself, so skip
-        // them only when the host really lacks them.
-        const NEWER_WINDOWS_ONLY: &[&str] = &["WinHttpGetProxySettingsEx"];
+        // Every override names a real export of its DLL. Some exports are
+        // missing on some hosts (WinHttpGetProxySettingsEx is absent from
+        // Windows 10's winhttp.dll, WSAConnectByList and GetAddrInfoExA from Wine's ws2_32);
+        // the HLE supplies those itself, so skip them only when the host
+        // really lacks them.
+        const NEWER_WINDOWS_ONLY: &[&str] = &[
+            "WinHttpGetProxySettingsEx",
+            "WSAConnectByList",
+            "GetAddrInfoExA",
+        ];
+        let mut lacking = Vec::new();
         for e in m.exports.iter().filter(|e| !e.name.starts_with('#')) {
             let dll = if e.name.starts_with("WinHttp") {
                 "winhttp.dll"
@@ -1060,10 +1343,10 @@ mod tests {
                 "ws2_32.dll"
             };
             let present = crate::host::function(dll, e.name).is_some();
-            if !present && NEWER_WINDOWS_ONLY.contains(&e.name) {
-                continue;
+            if !present && !NEWER_WINDOWS_ONLY.contains(&e.name) {
+                lacking.push(format!("{dll}!{}", e.name));
             }
-            assert!(present, "{dll} lacks {}", e.name);
         }
+        assert!(lacking.is_empty(), "the host lacks {lacking:?}");
     }
 }
