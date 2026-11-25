@@ -18,6 +18,11 @@ Usage: run.sh --game <folder> --exe <file name> [options]
   --prefix <dir>       Wine prefix (default: saved by setup.sh)
   --config <file>      victory.toml (default: $vl_config_home/victory.toml)
   --name <log name>    log file name (default: a timestamp)
+  --wineserver <path>  wineserver to run for the prefix (default: the patched one
+                       built by build-wineserver.sh, if installed, in
+                       $vl_data_home/wineserver-patched)
+  --stock-wineserver   use Proton's own wineserver (slow once the title holds
+                       tens of thousands of memory views)
 
 Memory guard (needs systemd; the title uses more than 10 GB, and a limit
 stops it from taking the whole desktop down when memory runs out):
@@ -32,7 +37,7 @@ USAGE
 }
 
 game= exe= console=series-x diag=0 proton=${VICTORY_PROTON:-} prefix=
-config= name=$(date +%Y%m%d-%H%M%S) scope=0 mhigh= mmax= swapmax=
+wserver= stock=0 config= name=$(date +%Y%m%d-%H%M%S) scope=0 mhigh= mmax= swapmax=
 
 while (($#)); do
   case $1 in
@@ -44,6 +49,8 @@ while (($#)); do
     --prefix) prefix=${2:?}; shift 2 ;;
     --config) config=${2:?}; shift 2 ;;
     --name) name=${2:?}; shift 2 ;;
+    --wineserver) wserver=${2:?--wineserver needs a path}; shift 2 ;;
+    --stock-wineserver) stock=1; shift ;;
     --scope) scope=1; shift ;;
     --memory-high) mhigh=${2:?}; shift 2 ;;
     --memory-max) mmax=${2:?}; shift 2 ;;
@@ -62,6 +69,16 @@ if [[ -z $mhigh$mmax$swapmax ]]; then
   ((scope == 0)) || die "--scope needs at least one of --memory-high, --memory-max, --swap-max"
 else
   ((scope)) || die "memory limits only apply with --scope"
+fi
+
+if ((stock)); then
+  [[ -z $wserver ]] || die "--wineserver and --stock-wineserver exclude each other"
+elif [[ -z $wserver && -x $vl_data_home/wineserver-patched ]]; then
+  wserver=$vl_data_home/wineserver-patched
+fi
+if [[ -n $wserver ]]; then
+  [[ -f $wserver && -x $wserver ]] || die "wineserver not found or not executable: $wserver"
+  wserver=$(realpath -- "$wserver")
 fi
 
 # A config file given by hand has its launcher.env beside it.
@@ -150,8 +167,21 @@ echo "prefix:   $prefix"
 echo "vkd3d:    ${b:-unknown version} (the log's 'vkd3d-proton - build:' line confirms the build)"
 echo "profile:  $console ($exe_dir build)"
 echo "log:      $log"
+if [[ -n $wserver ]]; then
+  echo "server:   $wserver (patched)"
+else
+  echo "server:   Proton's stock wineserver (slow in the world; see docs/linux.md)"
+fi
 
 cmd=("$wine" "$victory" run --execute --console "$console" "$(winpath "$game")\\$exe")
+if [[ -n $wserver ]]; then
+  # Wine's ntdll ignores WINESERVER and uses the server next to wine unless one
+  # already runs for the prefix, so start ours first, in the same scope and
+  # process group as wine. -p10 makes it exit 10 s after the last client.
+  # A server left over from an earlier run would be reused, so stop it first.
+  cmd=(bash -c '"$1" -k 2>/dev/null; sleep 1; "$2" -p10 && shift 2 && exec "$@"' _ \
+    "$proton/files/bin/wineserver" "$wserver" "${cmd[@]}")
+fi
 if ((scope)); then
   command -v systemd-run >/dev/null || die "systemd-run not found; run without --scope"
   props=()

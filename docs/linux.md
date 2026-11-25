@@ -172,13 +172,52 @@ The file is taken (renamed away) as it is read; progress is written to
 
 ## Performance
 
-- Loading is slow under Wine mostly in wineserver. It spends most of its time
-  walking the list of the process's mapped views (an overlap check on every
-  map, then a lookup by base address), which is linear in the number of views;
-  the title makes about 4,400 of them.
-- Frame rates are those of the Windows builds at the same stage (menus 30 fps;
-  the world is not playable).
+- Loading and the world are slow under stock Wine mostly in wineserver: it
+  walks the list of the process's mapped views (an overlap check on every map,
+  then a lookup by base address), which is linear in the number of views, and
+  the title holds about 140,000 of them in the world. The wineserver patch
+  below removes this; use it.
+- With the patch, Linux is in the same range as the Windows forks at the same
+  stage: menus at 30 fps, and in the world about 1-1.7 fps (frames of about
+  0.8 s at roughly 3,000 draws) on an RTX 3060 Ti with 8 GB. The world is not
+  playable yet on any fork.
+- Memory is the next wall. With 16 GB of RAM and an 8 GB card the driver runs
+  out of system memory in the world after a few minutes (the process is killed
+  with `NV_ERR_NO_MEMORY` in the kernel log). Plan on more RAM, or a card with
+  more memory; swap only delays it.
 - Swap helps with loading peaks. zram first and a swap file behind it work well.
+
+## Faster memory mapping: the wineserver patch
+
+The runtime keeps one mapped 64 KiB view per page of the title's memory, about
+140,000 in the world. Stock wineserver searches a process's views linearly on
+every map, unmap and address query. With 160,000 views, in a micro-benchmark:
+map 764 us to 11.8 us, unmap and remap 2854 us to 22 us, address query 900 us
+to 6 us. In the title, the first world frame arrives after 77 s instead of
+204-253 s, and world frames take about 0.8 s instead of 8.7-13.5 s.
+
+`patches/wine/0001-server-index-memory-views.patch` indexes the views by base
+address in the server. It is optional, but strongly recommended. It touches only
+the server, so Proton's other files stay as they are. It is LGPL-2.1-or-later
+like Wine and is not upstream yet (`patches/wine/README.md`).
+
+Build it from the Wine source your Proton build was made from (the protocol
+must match exactly; the script checks this by running `wine cmd /c echo ok`
+against the new server on a temporary prefix):
+
+```sh
+scripts/linux/build-wineserver.sh --proton <proton dir> \
+    --wine-src <git url or local clone> --wine-ref <commit>
+```
+
+The commit is the one the Proton build was made from; `--help` explains how to
+find it. Only `wineserver` is built (about a minute). It is installed to
+`~/.local/share/victory-linux/wineserver-patched`.
+
+`run.sh` uses that file if it exists, starts it for the prefix before wine
+(inside the same `--scope`, if any; wine would otherwise use the server next to
+it) and prints which server it runs. `--wineserver <path>` picks another,
+`--stock-wineserver` turns it off.
 
 ## Troubleshooting
 
