@@ -70,6 +70,10 @@
 *.7z
 *.rar
 
+# Shader caches vkd3d-proton writes to the working directory under Wine/Proton
+vkd3d-proton.cache
+vkd3d-proton.cache.write
+
 # Editor / OS noise
 .vs/
 .idea/
