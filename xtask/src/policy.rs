@@ -28,10 +28,16 @@ const ALLOWED_NAMES: &[&str] = &[
 ];
 
 /// Paths explicitly exempted, with a reason. Keep this empty if at all possible.
-const EXCEPTIONS: &[(&str, &str)] = &[(
-    "crates/victory-formats/src/bcpack-tables.bin",
-    "the BCPack format's constant tables: nothing decodes without them and they cannot be derived (owner's decision, 2026-11-23; docs/asset-policy.md)",
-)];
+const EXCEPTIONS: &[(&str, &str)] = &[
+    (
+        "crates/victory-formats/src/bcpack-tables.bin",
+        "the BCPack format's constant tables: nothing decodes without them and they cannot be derived (owner's decision, 2026-11-23; docs/asset-policy.md)",
+    ),
+    (
+        "patches/wine/0001-server-index-memory-views.patch",
+        "our own patch to Wine's server (LGPL-2.1-or-later): a small text diff, no game data; a patch is the form Wine changes take (patches/wine/README.md)",
+    ),
+];
 
 /// Signatures of formats that must never be committed.
 const FORBIDDEN_MAGIC: &[(&[u8], &str)] = &[
