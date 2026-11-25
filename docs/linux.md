@@ -153,6 +153,31 @@ The file is taken (renamed away) as it is read; progress is written to
 `A B X Y MENU VIEW UP DOWN LEFT RIGHT LB RB LS RS`, `LSTICK=x,y`, `RSTICK=x,y`,
 `LT=v`, `RT=v`, `WAIT @ms`, `CLEAR`, `@ms` for a hold time.
 
+### Ambient light (stopgap)
+
+The title's indirect diffuse light comes from ray-traced passes that do not run
+yet, so the world is dark where the sun does not reach. The runtime can fill
+that light with a constant, shaded by occlusion from the scene's depth, right
+after the compute program that resolves it. It is off until you name that
+program; nothing of any title is built in:
+
+```sh
+# 1. find candidates: each compute program that writes a 32-bit-integer image
+#    and reads a depth image of the same size is logged once
+VICTORY_AMBIENT_SCAN=1 scripts/linux/run.sh ...
+#    ("ambient light: a candidate program", with its hash and views)
+# 2. name it (start of its hash, or name:<text in its container>)
+VICTORY_AMBIENT_SHADER=<hash> scripts/linux/run.sh ...
+```
+
+The log says `ambient light: on for these programs` at the first dispatch, then
+`ambient light engaged` (with the views used) or `no ambient light after this
+program: <why>`. More settings, all optional: `VICTORY_AMBIENT=<level>` (0.6 by
+default) or `off` (turns it off), `VICTORY_AMBIENT_LIGHT=<root>:<offset>` and
+`VICTORY_AMBIENT_DEPTH=<root>:<offset>` to pin the views when the log says the
+choice is ambiguous, `VICTORY_AMBIENT_TINT=r,g,b`, `VICTORY_AMBIENT_SHADE=s,r,n,t`
+(see `crates/victory-gpu/src/ambient.rs`).
+
 ## Differences from Windows
 
 - **No pipeline library.** vkd3d-proton does not give the runtime a pipeline
