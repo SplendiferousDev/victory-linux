@@ -764,6 +764,49 @@ pub(crate) fn note_used(key: &str) {
     }
 }
 
+/// Title pipelines whose making ended the thread making them (this run and
+/// earlier ones; see `make::watch`), kept in `KILLERS_FILE`.
+static KILLERS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+const KILLERS_FILE: &str = "thread-ending-pipelines.txt";
+
+fn killers() -> MutexGuard<'static, Option<HashSet<String>>> {
+    let mut killers = KILLERS.lock().unwrap_or_else(|e| e.into_inner());
+    if killers.is_none() {
+        let listed = DIR
+            .get()
+            .and_then(|d| std::fs::read_to_string(d.join(KILLERS_FILE)).ok())
+            .unwrap_or_default();
+        let set: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
+        if !set.is_empty() {
+            tracing::info!(pipelines = set.len(), "title pipelines not made: making them ended a thread in an earlier run");
+        }
+        *killers = Some(set);
+    }
+    killers
+}
+
+/// Whether making the title pipeline with `key` ended its thread before.
+pub(crate) fn ends_its_thread(key: &str) -> bool {
+    killers().as_ref().is_some_and(|s| s.contains(key))
+}
+
+/// Making the title pipeline with `key` ended its thread: it is not made
+/// again, in this run or later ones.
+pub(crate) fn note_thread_ended(key: &str) {
+    let mut killers = killers();
+    let set = killers.get_or_insert_with(HashSet::new);
+    if !set.insert(key.to_owned()) {
+        return;
+    }
+    let listed: Vec<&str> = set.iter().map(String::as_str).collect();
+    let written = DIR.get().map(|d| {
+        std::fs::create_dir_all(d).and_then(|()| write_atomically(&d.join(KILLERS_FILE), listed.join("\n").as_bytes()))
+    });
+    if let Some(Err(e)) = written {
+        tracing::warn!(error = %e, "the list of thread-ending pipelines was not saved");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
