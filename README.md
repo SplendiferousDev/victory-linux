@@ -1,10 +1,16 @@
-# VIctory fork (work in progress)
+# victory-linux (work in progress)
 
-A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
-compatibility layer that runs an Xbox Series title natively on Windows from
-files the user supplies. This fork follows upstream
-`main` and adds fixes aimed at one goal: getting the game's world to render
-correctly and playably on one particular PC.
+A fork of [victory-fork](https://github.com/fxceless/victory-fork), itself a
+fork of [VIctory](https://github.com/Marvisak/VIctory): a compatibility layer
+that runs an Xbox Series title natively on a PC from files the user supplies.
+
+This fork has one goal: **the same runtime on Linux**, under Wine with a
+Proton build and vkd3d-proton. It follows the Windows forks and keeps its own
+changes small: Wine fallbacks, a cross-build from Linux, setup and launch
+scripts, tests that run under Wine, and a wineserver patch for the runtime's
+memory mapping. Making the game itself playable is the Windows forks' work;
+this fork is there so that Linux is ready when they get there. Nothing is
+playable yet, here or there.
 
 **This repository contains no game files, code or assets.** You need your own
 copy of the game. It is not affiliated with or endorsed by the game's
@@ -18,6 +24,16 @@ in [docs/linux.md](docs/linux.md); the scripts are in `scripts/linux/`
 (`setup.sh`, `run.sh`, `test.sh`).
 
 ## Credits
+
+- **[victory-fork](https://github.com/fxceless/victory-fork)** by fxceless and
+  its contributors is the base this fork follows; the sections below the
+  Linux one are its README.
+- Shader-translator fixes are cherry-picked from
+  **[VItoriaBr](https://github.com/uiliannn/VItoriaBr)** (uiliannn) and from
+  the AMD fork by **beloooo**, with their authorship kept.
+- The watchdog and upscaler hooks come from
+  **[ScarlettPort](https://github.com/ZigZagBoi1/ScarlettPort)**'s vendored
+  runtime; the idea of a scripted pad file is theirs too.
 
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
   contributors is the base of everything here: the loader, the runtime
