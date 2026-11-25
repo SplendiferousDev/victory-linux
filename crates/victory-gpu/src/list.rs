@@ -794,6 +794,73 @@ pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: 
     }
 }
 
+/// Whether `this` is one of our command lists (by its function table).
+#[cfg(windows)]
+fn is_list(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    // SAFETY: the caller has an object pointer from the title; every object
+    // starts with its function table pointer.
+    let table = unsafe { this.cast::<*const *const ()>().read() };
+    table == LIST_FUNCTIONS.0.as_ptr() || table == NEWER_LIST_FUNCTIONS.0.as_ptr()
+}
+
+/// Stands in for the console upscaler's dispatch on title list `this`:
+/// `output` gets the stretched top-left `render` texels of `colour`
+/// (`crate::stretch`). An error says why nothing was recorded (no host GPU,
+/// not our list, textures we do not hold, an output shaders cannot write).
+///
+/// The real dispatch leaves its own state in the list, so the title sets
+/// its own again afterwards; ours is replayed all the same.
+///
+/// Hand-ported from ScarlettPort's vendored runtime (`list.rs`
+/// `upscale_stretch`, GPL-3.0-or-later).
+#[cfg(windows)]
+pub fn upscale_stretch(
+    this: *const std::ffi::c_void,
+    colour: *const std::ffi::c_void,
+    output: *const std::ffi::c_void,
+    render: [u32; 2],
+) -> Result<(), &'static str> {
+    const SHADER_READ: u32 = 0x40;
+    const UNORDERED: u32 = 0x8;
+    let (this, colour, output): (This, This, This) = (this.cast(), colour.cast(), output.cast());
+    if this.is_null() || colour.is_null() || output.is_null() {
+        return Err("the description names no command list, colour input or output");
+    }
+    if !is_list(this) {
+        return Err("the description's command list is not one of ours");
+    }
+    let Some(host) = crate::host::host() else {
+        return Err("there is no host GPU");
+    };
+    let (Some(to), Some(from)) = (
+        crate::resource::host_resource(output),
+        crate::resource::host_resource(colour),
+    ) else {
+        return Err("the colour input or the output has no host texture");
+    };
+    if !crate::stretch::writable(to) {
+        return Err("the output is not a single-sample 2D texture shaders can write");
+    }
+    // Stays if `with_state` finds no host list.
+    let mut done = Err("the command list has no host list");
+    with_state(this, |list, state| {
+        ensure_state(list, colour, SHADER_READ);
+        ensure_state(list, output, UNORDERED);
+        done = crate::stretch::record(&host.device, &list.list, to, from, render);
+        if done.is_ok() {
+            crate::texture::host_written(output);
+            list.texture_written(output);
+        }
+        // Our heap, root signature and pipeline are set: the title's go
+        // back on with its next draw or dispatch.
+        state.replay(list);
+    });
+    done
+}
+
 #[cfg(windows)]
 const COPY_DEST: u32 = 0x400;
 #[cfg(windows)]

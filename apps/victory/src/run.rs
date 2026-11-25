@@ -114,7 +114,29 @@ pub fn run(
         show(name, dll.bind_imports(&with_dlls, policy)?);
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
-    show(&exe_name, image.bind_imports(&with_dlls, policy)?);
+    // On Series S the upscale dispatch is ours (`victory_hle::modules::ffx`);
+    // the rest of the DLL that exports it is the title's own.
+    use victory_hle::modules::ffx;
+    if ffx::wanted(matches!(console, Console::SeriesS)) {
+        let take = TakeUpscale {
+            inner: &with_dlls,
+            taken: std::cell::Cell::new(false),
+        };
+        show(&exe_name, image.bind_imports(&take, policy)?);
+        if take.taken.get() {
+            println!("upscale        {}: ours, a plain stretch ({}=0: the title's)", ffx::SYMBOL, ffx::ENV);
+        } else {
+            println!(
+                "upscale        not taken: the executable imports no {} that a title DLL exports; the title's upscaler runs as it is",
+                ffx::SYMBOL
+            );
+        }
+    } else {
+        show(&exe_name, image.bind_imports(&with_dlls, policy)?);
+        if matches!(console, Console::SeriesS) {
+            println!("upscale        the title's own ({}=0)", ffx::ENV);
+        }
+    }
     if !execute {
         println!("not executing (pass --execute to start the title)");
         return Ok(());
@@ -196,6 +218,38 @@ fn watch(base: usize, size: usize) {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
     });
+}
+
+/// Binds the title's `ffxDispatch` import to ours, which is told what the
+/// import resolves to without it (the title's own, for what is not
+/// stretched). Matched by symbol, whichever DLL it is imported from.
+#[cfg(windows)]
+struct TakeUpscale<'a> {
+    inner: &'a dyn victory_loader::ImportResolver,
+    taken: std::cell::Cell<bool>,
+}
+
+#[cfg(windows)]
+impl victory_loader::ImportResolver for TakeUpscale<'_> {
+    fn resolve(&self, dll: &str, symbol: &victory_pe::ImportSymbol) -> victory_loader::Resolution {
+        use victory_hle::modules::ffx;
+        use victory_loader::{Provenance, Resolution};
+        let resolved = self.inner.resolve(dll, symbol);
+        let named = matches!(symbol, victory_pe::ImportSymbol::Name { name, .. } if name == ffx::SYMBOL);
+        if named
+            && let Resolution::Found {
+                address,
+                provenance: Provenance::Title,
+            } = resolved
+        {
+            self.taken.set(true);
+            return Resolution::Found {
+                address: ffx::take(address),
+                provenance: Provenance::Hle,
+            };
+        }
+        resolved
+    }
 }
 
 /// DLLs the host or our runtime provide are never taken from the title.
