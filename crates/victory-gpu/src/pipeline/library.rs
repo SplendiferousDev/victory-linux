@@ -465,10 +465,28 @@ fn library() -> Option<&'static Library> {
 /// The library in `blob`, or an empty one if the host rejects the blob (an
 /// adapter or driver change, damage).
 fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
+    // An empty library is asked for with a null blob. The binding passes an
+    // empty slice's pointer, which is not null, and vkd3d-proton refuses a
+    // non-null blob of length 0 (E_INVALIDARG): under Wine no run had a
+    // library, so neither it nor the early list was ever saved.
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
-        // SAFETY: the bytes outlive the library (kept beside it).
+        if !bytes.is_empty() {
+            // SAFETY: the bytes outlive the library (kept beside it).
+            return unsafe { device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast() };
+        }
+        let mut library = std::ptr::null_mut();
+        // SAFETY: the device's own entry, a null blob of length 0, and an
+        // out pointer of the interface asked for.
         unsafe {
-            device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
+            (Interface::vtable(device).CreatePipelineLibrary)(
+                device.as_raw(),
+                std::ptr::null(),
+                0,
+                &ID3D12PipelineLibrary1::IID,
+                &mut library,
+            )
+            .ok()?;
+            Ok(ID3D12PipelineLibrary1::from_raw(library))
         }
     };
     let mut rejected = false;
@@ -593,7 +611,7 @@ pub(crate) fn pipeline(
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    let Some(dir) = DIR.get() else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
@@ -605,6 +623,18 @@ pub(crate) fn save(now: bool) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
     }
+    // Without a library the early list is still kept: the next run starts
+    // those pipelines during loading all the same.
+    let Some(library) = library() else {
+        if USED_CHANGED.swap(false, Ordering::Relaxed) {
+            let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
+            match write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()) {
+                Ok(()) => tracing::info!(early = used.len(), "early pipeline list saved (no host pipeline library)"),
+                Err(e) => tracing::warn!(error = %e, "early pipeline list not saved"),
+            }
+        }
+        return;
+    };
     let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
     // The bytes of the library written to `tmp`; 0 when no pipeline was
     // added: the library on disk is then what it was, and only the early
