@@ -1678,14 +1678,18 @@ mod tests {
     #[test]
     fn a_run_across_two_reservations_maps_one_view_in_each() {
         let pages = allocate(4);
-        // Room for four pages, then two reservations of two in it.
-        let room = reserve(4);
-        // SAFETY: our own reservation.
-        assert_ne!(unsafe { VirtualFree(room, 0, MEM_RELEASE) }, 0);
-        let a = XMemVirtualAlloc(room, 2 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
-        let b = XMemVirtualAlloc(room.wrapping_byte_add(2 * PAGE), 2 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
-        assert_eq!(a, room);
-        assert_eq!(b, room.wrapping_byte_add(2 * PAGE));
+        // Two reservations of two pages side by side: one of four split in
+        // two, and listed as two (reserving two at chosen addresses would
+        // race with the other tests' reservations).
+        let a = reserve(4);
+        let b = a.wrapping_byte_add(2 * PAGE);
+        // SAFETY: splits our own placeholder.
+        assert_ne!(unsafe { VirtualFree(a, 2 * PAGE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) }, 0);
+        {
+            let mut reservations = RESERVATIONS.lock().unwrap();
+            reservations.insert(a as usize, 2 * PAGE);
+            reservations.insert(b as usize, 2 * PAGE);
+        }
         assert_eq!(placeholder_pages(a as usize), 2);
         assert_eq!(placeholder_pages(a as usize + PAGE), 1);
         let views = |from: usize| {
@@ -1693,7 +1697,7 @@ mod tests {
         };
         assert!(one_reservation(a as usize, 2 * PAGE));
         assert!(!one_reservation(a as usize + PAGE, 2 * PAGE));
-        // It failed before; the placeholders are never joined (Wine would).
+        // It failed before; the placeholders are never joined.
         assert_eq!(XMemMapPhysicalPages(a, 4, pages.as_ptr()), a);
         assert_eq!(views(a as usize), vec![(a as usize, 2 * PAGE), (b as usize, 2 * PAGE)]);
         assert_eq!(placeholder_pages(a as usize), 0, "a view, not a placeholder");
