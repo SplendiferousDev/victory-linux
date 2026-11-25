@@ -6331,6 +6331,10 @@ impl<'a> Lower<'a> {
             }
             Source::Phi { block, args }
                 if sampler
+                    // Pixel shaders: the validator refuses a static-sampler
+                    // range there ("Module bitcode is invalid"), with fresh
+                    // non-overlapping samplers too; the 37 `PS_TexturedLit`
+                    // programs keep failing rather than emitting bad bitcode.
                     && !self.s.pixel
                     && (2..=3).contains(&args.len())
                     && args.iter().all(|a| matches!(a, Source::Constant(_))) =>
