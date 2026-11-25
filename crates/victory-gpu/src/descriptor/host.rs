@@ -3607,6 +3607,31 @@ mod tests {
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
     }
+
+    /// Contiguous free dynamic slot ranges that cross the search cursor are found.
+    #[test]
+    fn dynamic_allocation_finds_contiguous_range_crossing_search_cursor() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        // Fill the entire dynamic range, then position the search cursor at 12
+        // with all slots occupied so the only free run (10..14) actually
+        // crosses the cursor.
+        let a = heap.dynamic(8).unwrap();
+        let b = heap.dynamic(8).unwrap();
+        assert_eq!((a, b), (4, 12));
+        let rest = heap.dynamic - 16;
+        assert_eq!(heap.dynamic(rest), Some(20));
+        heap.release(4, 12);
+        assert_eq!(heap.dynamic(12), Some(4));
+
+        // Release dynamic slots 10..14 (heap slots 14..18, crossing cursor at 12).
+        // Before the fix, a request of 4 slots starting search at 12 scanned
+        // 12..end (2 free) then 0..12 (2 free), missing the contiguous run at 10..14.
+        heap.release(14, 4);
+        let c = heap.dynamic(4);
+        assert_eq!(c, Some(14));
+    }
 }
 
 #[cfg(test)]
