@@ -1265,7 +1265,10 @@ mod tests {
         let st = crate::structure::structure(&p).unwrap();
         let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = crate::io::raise(&p, &native).unwrap();
-        let out = super::emit(&c, &native, &p, &st, &io, &res).expect("a POPS pixel shader translates");
+        let out =
+            super::emit(&c, &native, &p, &st, &io, &res).expect("a POPS pixel shader translates");
+        let host = super::Container::parse(&out.dxil).expect("the emitted shader container parses");
+        assert!(host.part(super::FourCC::DXIL).is_some());
         #[cfg(windows)]
         if let Ok(mut v) =
             super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
