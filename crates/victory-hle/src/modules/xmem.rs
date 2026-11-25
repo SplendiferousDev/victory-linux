@@ -431,18 +431,106 @@ fn stats_tick() {
     );
 }
 
-struct Section(HANDLE);
+struct Section {
+    handle: HANDLE,
+    bytes: usize,
+    /// With [`section_views`]: a view of our own of the whole section,
+    /// mapped at the first write through one and kept while the section
+    /// lives; `None` inside if the host refused it (writes then map a view
+    /// each, as without).
+    whole: std::sync::OnceLock<Option<usize>>,
+}
 
-// SAFETY: a section handle may be used from any thread.
+// SAFETY: a section handle may be used from any thread, and the whole
+// view's address is only read once set.
 unsafe impl Send for Section {}
 // SAFETY: as above.
 unsafe impl Sync for Section {}
 
+impl Section {
+    fn new(handle: HANDLE, bytes: usize) -> Section {
+        Section {
+            handle,
+            bytes,
+            whole: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The address of the whole section's view of our own, mapped now if
+    /// it is not yet.
+    fn whole(&self) -> Option<usize> {
+        *self.whole.get_or_init(|| {
+            let at = map_whole(self.handle, self.bytes);
+            if at.is_none() {
+                let error = std::io::Error::last_os_error();
+                tracing::warn!(bytes = self.bytes, %error, "a view of a whole physical page section failed");
+            }
+            at
+        })
+    }
+}
+
 impl Drop for Section {
     fn drop(&mut self) {
-        // SAFETY: our handle; views keep the section alive on their own.
-        unsafe { CloseHandle(self.0) };
+        // SAFETY: our view and handle; views at title addresses keep the
+        // section alive on their own (none is left once the last `Slice`
+        // goes, which is when this runs).
+        unsafe {
+            if let Some(&Some(at)) = self.whole.get() {
+                windows_sys::Win32::System::Memory::UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: at as *mut c_void,
+                });
+                count(Stat::Unmaps, 1);
+                SECTION_VIEWS.fetch_sub(1, Ordering::Relaxed);
+            }
+            CloseHandle(self.handle);
+        }
     }
+}
+
+/// `VICTORY_XMEM_SECTION_VIEWS`: 1, DirectStorage writes into physical
+/// pages through one view of each whole section, mapped once and kept
+/// ([`Section::whole`]); 0, through a view mapped and unmapped for each
+/// write ([`View`]). On by default under Wine only: there each of those
+/// maps and unmaps is a wineserver request that searches all of the
+/// process's views, two per write, and sections are committed whole
+/// (`XMemAllocatePhysicalPages`), so a whole view needs no commit. On
+/// Windows sections are committed page by page as views show them; a
+/// whole view kept alongside was tried upstream (Belobug fork c153ae6)
+/// and taken out again (85f90f1) after the title read memory reserved but
+/// not yet committed there, so Windows keeps the view per write.
+fn section_views() -> bool {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| on_wine() && switch("VICTORY_XMEM_SECTION_VIEWS", true));
+    *ON
+}
+
+/// Maps all of a section, read-write, above the 40-bit range where the
+/// title's reservations go when the host takes that request (else
+/// anywhere). Its address, or `None`.
+fn map_whole(handle: HANDLE, bytes: usize) -> Option<usize> {
+    let mut requirements = MEM_ADDRESS_REQUIREMENTS {
+        LowestStartingAddress: (1usize << 40) as *mut c_void,
+        HighestEndingAddress: std::ptr::null_mut(),
+        Alignment: 0,
+    };
+    let mut parameter = MEM_EXTENDED_PARAMETER::default();
+    parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
+    parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
+    let map = |parameter: *mut MEM_EXTENDED_PARAMETER, n: u32| {
+        count(Stat::Maps, 1);
+        // SAFETY: our own section, mapped whole at an address of the
+        // host's choice; `parameter` points at `requirements`, which
+        // outlives the call.
+        let at = unsafe {
+            MapViewOfFile3(handle, GetCurrentProcess(), std::ptr::null(), 0, bytes, 0, PAGE_READWRITE, parameter, n)
+        };
+        (!at.Value.is_null()).then_some(at.Value as usize)
+    };
+    let at = map(&mut parameter, 1).or_else(|| map(std::ptr::null_mut(), 0))?;
+    SECTION_VIEWS.fetch_add(1, Ordering::Relaxed);
+    tracing::debug!(bytes, at = format_args!("{at:#x}"), "physical page section mapped whole");
+    Some(at)
 }
 
 /// Where a page lives, or what a view starts with: a section and a page
@@ -533,7 +621,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
     victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
-    let section = Arc::new(Section(handle));
+    let section = Arc::new(Section::new(handle, size));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -569,21 +657,40 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
 }
 
 /// A view of our own on consecutive slices of one section, committed and
-/// writable, unmapped when dropped.
+/// writable: mapped for it and unmapped when dropped, or part of the
+/// section's whole view ([`section_views`]), which it keeps alive.
 struct View {
     at: MEMORY_MAPPED_VIEW_ADDRESS,
     len: usize,
+    whole: Option<Arc<Section>>,
 }
 
 impl View {
-    /// Maps `n` slices from `slice` on.
+    /// Maps `n` slices from `slice` on, or finds them in the section's
+    /// whole view with [`section_views`].
     fn map(slice: &Slice, n: usize) -> Option<View> {
+        Self::map_with(slice, n, section_views())
+    }
+
+    /// [`View::map`]; `whole` says whether to use the whole view (only
+    /// where sections are committed whole, see [`section_views`]).
+    fn map_with(slice: &Slice, n: usize, whole: bool) -> Option<View> {
         use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+        if whole && let Some(at) = slice.section.whole() {
+            count(Stat::InSection, 1);
+            return Some(View {
+                at: MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: (at + slice.index * PAGE) as *mut c_void,
+                },
+                len: n * PAGE,
+                whole: Some(slice.section.clone()),
+            });
+        }
         let (offset, len) = ((slice.index * PAGE) as u64, n * PAGE);
         // SAFETY: slices of a section we own; the view is ours until dropped.
         let at = unsafe {
             MapViewOfFile(
-                slice.section.0,
+                slice.section.handle,
                 FILE_MAP_WRITE,
                 (offset >> 32) as u32,
                 offset as u32,
@@ -594,14 +701,15 @@ impl View {
             return None;
         }
         count(Stat::Temporary, 1);
-        let view = View { at, len };
+        let view = View { at, len, whole: None };
         commit(at.Value as usize, len).then_some(view)
     }
 
     fn bytes(&mut self) -> &mut [u8] {
         // SAFETY: the view holds `len` committed read-write bytes, ours
         // alone while `self` lives (other views of the slices only alias
-        // them, as the console's do).
+        // them, as the console's do; so do other `View`s in the same whole
+        // view, each written by its own request, as before).
         unsafe { std::slice::from_raw_parts_mut(self.at.Value.cast(), self.len) }
     }
 }
@@ -609,8 +717,10 @@ impl View {
 impl Drop for View {
     fn drop(&mut self) {
         use windows_sys::Win32::System::Memory::UnmapViewOfFile;
-        // SAFETY: our view.
-        unsafe { UnmapViewOfFile(self.at) };
+        if self.whole.is_none() {
+            // SAFETY: our view.
+            unsafe { UnmapViewOfFile(self.at) };
+        }
     }
 }
 
@@ -648,8 +758,9 @@ pub(crate) fn pages_known(pages: &[usize], offset: usize, len: usize) -> bool {
 /// Copies `data` into physical pages, from `offset` bytes into the first,
 /// whether or not they are mapped anywhere (DirectStorage destinations).
 /// One view per run of consecutive pages, not one per page: each view
-/// costs a map, a commit and an unmap (which flushes every core's TLB).
-/// False if a page is unknown or the host fails.
+/// costs a map, a commit and an unmap (which flushes every core's TLB);
+/// none with [`section_views`]. False if a page is unknown or the host
+/// fails.
 pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> bool {
     stats_tick();
     let Some(runs) = runs(pages, offset, data.len()) else {
@@ -1052,7 +1163,7 @@ fn map_quiet(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> 
             MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
         );
         MapViewOfFile3(
-            slice.section.0,
+            slice.section.handle,
             GetCurrentProcess(),
             base as *const c_void,
             (slice.index * PAGE) as u64,
@@ -1078,7 +1189,7 @@ fn map_quiet(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> 
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
     // What the range shows now, for the GPU side's in-place census.
-    victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
+    victory_gpu::title_memory_view(base, len, slice.section.handle as usize, (slice.index * PAGE) as u64);
     for k in 0..len.div_ceil(PAGE) {
         physical.shown.entry(slice.key(k)).or_default().push(base + k * PAGE);
     }
@@ -1668,7 +1779,7 @@ mod tests {
         assert_eq!(XMemMapPhysicalPages(a, 2, std::ptr::null()), a);
         assert!(counted(Stat::Unmaps) > unmaps);
         let temporary = counted(Stat::Temporary);
-        drop(View::map(&physical().pages[&pages[0]].clone(), 1).expect("mapped"));
+        drop(View::map_with(&physical().pages[&pages[0]].clone(), 1, false).expect("mapped"));
         assert!(counted(Stat::Temporary) > temporary);
         assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
     }
@@ -1774,6 +1885,56 @@ mod tests {
         assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
     }
 
+    /// Under Wine, writes into physical pages go through one view of the
+    /// whole section, mapped once, and land where a view per write would
+    /// put them.
+    #[test]
+    fn writes_go_through_one_view_of_the_whole_section() {
+        let (a, b) = (allocate(3), allocate(2));
+        let pages = [a[1], a[2], b[0], b[1]];
+        let data: Vec<u8> = (0..3 * PAGE).map(|i| (i * 13 % 241) as u8).collect();
+        let offset = PAGE / 2;
+        let section = |page: usize| physical().pages[&page].section.clone();
+        assert!(section(a[0]).whole.get().is_none(), "mapped at the first write only");
+        let before = SECTION_VIEWS.load(Ordering::Relaxed);
+        assert!(write_physical(&pages, offset, &data));
+        let whole = section(a[0]).whole.get().copied();
+        if section_views() {
+            assert!(whole.is_some_and(|at| at.is_some()));
+            assert!(SECTION_VIEWS.load(Ordering::Relaxed) >= before + 2);
+        } else {
+            assert!(whole.is_none());
+        }
+        let seen: Vec<u8> = pages.iter().flat_map(|&p| page_bytes(p)).collect();
+        assert!(seen[..offset].iter().all(|&b| b == 0));
+        assert_eq!(seen[offset..offset + 3 * PAGE], data[..]);
+        assert!(seen[offset + 3 * PAGE..].iter().all(|&b| b == 0));
+        // A window, through the whole view and through one of its own, at
+        // the bytes of the same pages; the whole view stays where it was.
+        for whole in [true, false] {
+            let slice = physical().pages[&a[1]].clone();
+            let mut view = View::map_with(&slice, 2, whole).expect("mapped");
+            assert_eq!(view.bytes().len(), 2 * PAGE);
+            assert_eq!(view.bytes()[offset..PAGE], data[..PAGE - offset]);
+            view.bytes()[PAGE] = whole as u8 + 1;
+            drop(view);
+            assert_eq!(page_bytes(a[2])[0], whole as u8 + 1);
+        }
+        // Mapped once (here by the window, if writes do not use it).
+        let after = section(a[0]).whole.get().copied();
+        assert!(whole.is_none() || after == whole, "mapped once");
+        // Out of the way of the title's reservations, which stay below 2^40.
+        if let Some(Some(at)) = after {
+            assert!(at >= 1 << 40, "{at:#x}");
+        }
+        // Freed pages with no view at title addresses: the section and
+        // its whole view go.
+        let gone = Arc::downgrade(&section(a[0]));
+        assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
+        assert!(gone.upgrade().is_none());
+        assert_eq!(XMemFreePhysicalPages(2, b.as_ptr()), 1);
+    }
+
     /// `n` pages of one new allocation.
     fn allocate(n: usize) -> Vec<usize> {
         let (mut pages, mut given) = (vec![0; n], n);
@@ -1788,7 +1949,7 @@ mod tests {
     /// The bytes of one page, through a view of our own.
     fn page_bytes(page: usize) -> Vec<u8> {
         let slice = physical().pages.get(&page).cloned().expect("known page");
-        View::map(&slice, 1).expect("mapped").bytes().to_vec()
+        View::map_with(&slice, 1, false).expect("mapped").bytes().to_vec()
     }
 
     #[test]
