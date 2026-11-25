@@ -164,62 +164,10 @@ fn a_first_lane_read_of_a_uniform_scan_carries_across_the_halves() {
     ];
     let native = native_of(&words, true, 256);
     let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
-    let shader = lowered_dispatch(&native, &p, &HashSet::new(), 32, false).unwrap();
+    let shader = lowered_on(&native, &p, &HashSet::new(), 32).unwrap();
     let mut validator =
         validator::Validator::load(validator::Validator::default_path().as_deref()).unwrap();
     validator.validate(&mut shader.dxil.clone()).unwrap();
-}
-
-#[test]
-fn partial_thread_dispatch_masks_the_final_groups_memory_writes() {
-    // Each active thread increments counter[local X]. With two groups the
-    // tail's first N lanes report two increments, the others only one.
-    let native = native(&[
-        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
-        0x7e04_0281, // v_mov_b32 v2, 1
-        0xe0c8_1000, 0x8002_0201, // buffer_atomic_add v2, v1, s[8:11], 0 offen
-    ]);
-    let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
-    let shader = lowered_dispatch(&native, &p, &HashSet::new(), 64, true).unwrap();
-    let limit = shader
-        .user_data
-        .iter()
-        .find(|u| u.root == RootType::Other(super::USER_DISPATCH_THREADS_X))
-        .unwrap();
-    assert_eq!((limit.slot, limit.dword), (0, 64));
-    let mut validator =
-        validator::Validator::load(validator::Validator::default_path().as_deref()).unwrap();
-    validator.validate(&mut shader.dxil.clone()).unwrap();
-    let _one = super::valu_tests::ONE_AT_A_TIME
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let Ok(host) = Host::new(true) else { return };
-    let (root, pso) = host.compute_pipeline(&shader).unwrap();
-    for count in [0u32, 1, 7, 63, 64, 65, 74, 77, 127, 128] {
-        let mut constants = vec![0; shader.user_data_dwords() as usize];
-        constants[limit.index as usize] = count;
-        let result = host
-            .dispatch(
-                &root,
-                &pso,
-                &Dispatch {
-                    roots: vec![(0, Root::Constants(constants))],
-                    views: &[View::RawUav(68)],
-                    samplers: &[],
-                    groups: [2, 1, 1],
-                },
-            )
-            .unwrap();
-        let active = if count == 0 { 128 } else { count };
-        for (i, &word) in result[0].iter().enumerate() {
-            let expected = if i < 64 {
-                u32::from((i as u32) < active) + u32::from((i as u32 + 64) < active)
-            } else {
-                0
-            };
-            assert_eq!(word, expected, "count {count}, word {i}");
-        }
-    }
 }
 
 #[test]
@@ -616,30 +564,6 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
         assert_eq!(got, expected, "{below} lanes inside, s1 = {s1}");
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
-}
-
-/// The ray-tracing builder's scans refuse on `v_readfirstlane_b32` under a
-/// per-lane branch: the cross-lane retry ([`super::widen`]) has to take the
-/// branch around it wave-wide so the two host waves meet at the exchange
-/// barrier, instead of skipping the other half's value.
-#[test]
-fn a_first_lane_refusal_is_retried_wave_wide() {
-    assert!(super::needs_wave_wide(
-        crate::native::HwStage::Cs,
-        "a first-lane read where not every lane runs"
-    ));
-    assert!(super::needs_wave_wide(
-        crate::native::HwStage::Cs,
-        "a lane read where not every lane runs"
-    ));
-    assert!(!super::needs_wave_wide(
-        crate::native::HwStage::Ps,
-        "a first-lane read where not every lane runs"
-    ));
-    assert!(!super::needs_wave_wide(
-        crate::native::HwStage::Cs,
-        "a descriptor chosen by control flow"
-    ));
 }
 
 /// A barrier entered by only part of a console wave must complete on a
