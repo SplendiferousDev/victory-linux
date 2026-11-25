@@ -153,6 +153,9 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    if placeholder && !at.is_null() {
+        RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).insert(at as usize, size);
+    }
     if base.is_null() {
         tracing::debug!(
             size,
@@ -794,7 +797,7 @@ pub extern "system" fn XMemMapPhysicalPages(
                 })
             })
             .count();
-        if !map(&mut physical, base + i * PAGE, run * PAGE, first) {
+        if !map_run(&mut physical, base + i * PAGE, run, first) {
             return std::ptr::null_mut();
         }
         i += run;
@@ -889,23 +892,30 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
             .zip(1..)
             .take_while(|&(s, k)| Arc::ptr_eq(&s.section, &first.section) && s.index == first.index + k)
             .count();
-        let base = to + i * PAGE;
-        let mapped = run > 1 && {
-            coalesce(base, run * PAGE);
-            map_quiet(&mut physical, base, run * PAGE, first.clone()).is_ok()
-        };
-        // One page at a time when the run is one page, or the place could
-        // not take it whole (placeholders of earlier views left apart).
-        if !mapped {
-            for (k, slice) in slices[i..i + run].iter().enumerate() {
-                if !map(&mut physical, base + k * PAGE, PAGE, slice.clone()) {
-                    return false;
-                }
-            }
+        if !map_run(&mut physical, to + i * PAGE, run, first.clone()) {
+            return false;
         }
         i += run;
     }
     true
+}
+
+/// The title's reservations of 64 KiB pages (placeholders), start and
+/// bytes, as `XMemVirtualAlloc` made them. Reservations it has freed since
+/// stay listed until one made over them replaces the entry.
+static RESERVATIONS: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+
+/// Whether `[base, base + len)` lies in one reservation of the title's, or
+/// in none we know of (as the GPU's page-mapping copies were treated before
+/// this list). Wine joins neighbouring placeholders of two reservations,
+/// which Windows refuses: one view across them would make the two one
+/// reservation there, and freeing one would free both.
+fn one_reservation(base: usize, len: usize) -> bool {
+    let reservations = RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner());
+    match reservations.range(..=base).next_back() {
+        Some((&start, &size)) if base < start + size => base + len <= start + size,
+        _ => true,
+    }
 }
 
 /// `VirtualFree`'s flag that joins placeholders (not in windows-sys).
@@ -917,6 +927,57 @@ const MEM_COALESCE_PLACEHOLDERS: u32 = 0x1;
 fn coalesce(base: usize, len: usize) {
     // SAFETY: acts only on placeholders in that range.
     unsafe { VirtualFree(base as *mut c_void, len, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) };
+}
+
+/// Maps `n` consecutive slices from `first` on at `base`, as few views as
+/// the placeholders there allow: one when they join into one placeholder
+/// (earlier views of other lengths leave theirs apart), else one per
+/// placeholder the range crosses (two reservations side by side never
+/// join: Windows refuses, and Wine, which would join them, is not asked,
+/// see [`one_reservation`]), else one per page.
+fn map_run(physical: &mut Physical, base: usize, n: usize, first: Slice) -> bool {
+    let join = n > 1 && one_reservation(base, n * PAGE);
+    if join {
+        coalesce(base, n * PAGE);
+        if map_quiet(physical, base, n * PAGE, first.clone()).is_ok() {
+            return true;
+        }
+    }
+    let mut k = 0;
+    while k < n {
+        let at = base + k * PAGE;
+        let slice = Slice {
+            index: first.index + k,
+            section: first.section.clone(),
+        };
+        let piece = if n - k > 1 { placeholder_pages(at).clamp(1, n - k) } else { 1 };
+        if !(piece > 1 && (piece < n || !join) && map_quiet(physical, at, piece * PAGE, slice.clone()).is_ok()) {
+            for j in 0..piece {
+                let page = Slice {
+                    index: slice.index + j,
+                    section: slice.section.clone(),
+                };
+                if !map(physical, at + j * PAGE, PAGE, page) {
+                    return false;
+                }
+            }
+        }
+        k += piece;
+    }
+    true
+}
+
+/// The 64 KiB pages from `at` to the end of the placeholder holding it,
+/// or 0 if `at` is not in one.
+fn placeholder_pages(at: usize) -> usize {
+    let mut info = MEMORY_BASIC_INFORMATION::default();
+    let size = size_of::<MEMORY_BASIC_INFORMATION>();
+    // SAFETY: a query of our own process into a sized structure.
+    let got = unsafe { VirtualQueryEx(GetCurrentProcess(), at as *const c_void, &mut info, size) };
+    if got == 0 || info.State != MEM_RESERVE {
+        return 0;
+    }
+    (info.BaseAddress as usize + info.RegionSize).saturating_sub(at) / PAGE
 }
 
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
@@ -1567,6 +1628,53 @@ mod tests {
         drop(View::map(&physical().pages[&pages[0]].clone(), 1).expect("mapped"));
         assert!(counted(Stat::Temporary) > temporary);
         assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    /// A run of pages over two reservations side by side (placeholders that
+    /// never join) is one view in each, not a failure nor one per page.
+    #[test]
+    fn a_run_across_two_reservations_maps_one_view_in_each() {
+        let pages = allocate(4);
+        // Room for four pages, then two reservations of two in it.
+        let room = reserve(4);
+        // SAFETY: our own reservation.
+        assert_ne!(unsafe { VirtualFree(room, 0, MEM_RELEASE) }, 0);
+        let a = XMemVirtualAlloc(room, 2 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        let b = XMemVirtualAlloc(room.wrapping_byte_add(2 * PAGE), 2 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert_eq!(a, room);
+        assert_eq!(b, room.wrapping_byte_add(2 * PAGE));
+        assert_eq!(placeholder_pages(a as usize), 2);
+        assert_eq!(placeholder_pages(a as usize + PAGE), 1);
+        let views = |from: usize| {
+            physical().views.range(from..from + 4 * PAGE).map(|(&at, &(len, _))| (at, len)).collect::<Vec<_>>()
+        };
+        assert!(one_reservation(a as usize, 2 * PAGE));
+        assert!(!one_reservation(a as usize + PAGE, 2 * PAGE));
+        // It failed before; the placeholders are never joined (Wine would).
+        assert_eq!(XMemMapPhysicalPages(a, 4, pages.as_ptr()), a);
+        assert_eq!(views(a as usize), vec![(a as usize, 2 * PAGE), (b as usize, 2 * PAGE)]);
+        assert_eq!(placeholder_pages(a as usize), 0, "a view, not a placeholder");
+        assert!(write_physical(&pages[3..], 5, &[0x77]));
+        // SAFETY: mapped read-write.
+        assert_eq!(unsafe { b.cast::<u8>().add(PAGE + 5).read() }, 0x77);
+        // Unmapping `a` leaves `b` as it is.
+        assert_eq!(XMemMapPhysicalPages(a, 2, std::ptr::null()), a);
+        assert_eq!(views(a as usize), vec![(b as usize, 2 * PAGE)]);
+        // Over a lone page's placeholder and into the next reservation: a
+        // view in each.
+        let second = a.wrapping_byte_add(PAGE);
+        assert_eq!(XMemMapPhysicalPages(a, 1, pages.as_ptr()), a);
+        assert_eq!(XMemMapPhysicalPages(b, 2, std::ptr::null()), b);
+        assert_eq!(XMemMapPhysicalPages(second, 3, pages[1..].as_ptr()), second);
+        assert_eq!(views(a as usize), vec![(a as usize, PAGE), (second as usize, PAGE), (b as usize, 2 * PAGE)]);
+        // SAFETY: mapped read-write.
+        assert_eq!(unsafe { b.cast::<u8>().add(PAGE + 5).read() }, 0x77);
+        for at in [a, b] {
+            assert_eq!(XMemMapPhysicalPages(at, 2, std::ptr::null()), at);
+            // SAFETY: our own reservations.
+            unsafe { VirtualFree(at, 0, MEM_RELEASE) };
+        }
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
     }
 
     /// `n` pages of one new allocation.
