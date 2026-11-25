@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn cache_inside_repo_is_refused() {
-        let inside = Path::new(env!("CARGO_MANIFEST_DIR")).join("cache");
+        let inside = crate::policy::build_path(env!("CARGO_MANIFEST_DIR")).join("cache");
         let cfg = Config {
             cache_dir: inside,
             ..Default::default()
@@ -207,7 +207,7 @@ mod tests {
 
     #[test]
     fn data_inside_repo_is_refused() {
-        let inside = Path::new(env!("CARGO_MANIFEST_DIR")).join("data");
+        let inside = crate::policy::build_path(env!("CARGO_MANIFEST_DIR")).join("data");
         let cfg = Config {
             data_dir: inside,
             ..Default::default()

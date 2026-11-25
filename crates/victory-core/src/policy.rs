@@ -14,7 +14,61 @@ pub const ROOT_MARKER: &str = ".victory-root";
 /// The source tree this binary was compiled from.
 fn compiled_workspace_root() -> PathBuf {
     // crates/victory-core -> workspace root
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
+    build_path(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
+}
+
+/// A path the compiler saw (such as `env!("CARGO_MANIFEST_DIR")`), as this
+/// process can open it.
+///
+/// A Windows binary cross-compiled on Linux carries Unix paths, which are
+/// not absolute on Windows. Under Wine they are translated with the
+/// loader's own `wine_get_dos_file_name`, or onto Wine's default `Z:`
+/// drive (the Unix root) when that export is missing. Any other path is
+/// returned as it is.
+pub fn build_path(path: &str) -> PathBuf {
+    #[cfg(windows)]
+    if path.starts_with('/') {
+        return wine::dos_path(path)
+            .unwrap_or_else(|| PathBuf::from(format!("Z:{}", path.replace('/', "\\"))));
+    }
+    PathBuf::from(path)
+}
+
+#[cfg(windows)]
+mod wine {
+    use std::ffi::{CString, OsString};
+    use std::os::windows::ffi::OsStringExt;
+    use std::path::PathBuf;
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+    use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapFree};
+
+    /// `kernel32!wine_get_dos_file_name`: a Unix path to a DOS one, in
+    /// memory of the process heap. Present only under Wine.
+    type DosFileName = unsafe extern "system" fn(*const u8) -> *mut u16;
+
+    pub(super) fn dos_path(path: &str) -> Option<PathBuf> {
+        let unix = CString::new(path).ok()?;
+        let kernel32: Vec<u16> = "kernel32.dll\0".encode_utf16().collect();
+        // SAFETY: kernel32 is always loaded; the export, when present, has
+        // the signature above and returns a NUL-terminated wide string from
+        // the process heap (or null), which is freed here.
+        unsafe {
+            let module = GetModuleHandleW(kernel32.as_ptr());
+            if module.is_null() {
+                return None;
+            }
+            let f = GetProcAddress(module, c"wine_get_dos_file_name".as_ptr().cast())?;
+            let f: DosFileName = std::mem::transmute(f);
+            let wide = f(unix.as_ptr().cast());
+            if wide.is_null() {
+                return None;
+            }
+            let len = (0..).take_while(|&i| *wide.add(i) != 0).count();
+            let out = OsString::from_wide(std::slice::from_raw_parts(wide, len));
+            HeapFree(GetProcessHeap(), 0, wide.cast());
+            Some(PathBuf::from(out))
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

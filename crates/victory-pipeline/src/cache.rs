@@ -153,7 +153,7 @@ mod tests {
 
     #[test]
     fn refuses_cache_inside_repo() {
-        let inside = Path::new(env!("CARGO_MANIFEST_DIR")).join("cache");
+        let inside = victory_core::policy::build_path(env!("CARGO_MANIFEST_DIR")).join("cache");
         assert!(Cache::open(inside).is_err());
     }
 }
