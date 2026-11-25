@@ -137,6 +137,21 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
     p.made.get().is_some_and(|made| made.is_some())
 }
 
+/// Translates the containers of compute programs and makes their host
+/// pipelines, for the caches on disk; whether it has one.
+pub(crate) fn warm(shaders: Vec<Arc<Shader>>) -> bool {
+    HostPipeline::new(&shaders, None).is_some()
+}
+
+/// As [`warm`], for a graphics pipeline with its state (the offline
+/// precompile of the title's cache, [`super::precompiled::precompile_graphics`]).
+/// Also the key a run will name it by.
+pub(crate) fn warm_graphics(shaders: Vec<Arc<Shader>>, graphics: GraphicsState) -> (String, bool) {
+    let p = Pending::new(shaders, Some(Box::new(graphics)));
+    let made = HostPipeline::new(&p.shaders, p.graphics.as_deref()).is_some();
+    (p.key, made)
+}
+
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {

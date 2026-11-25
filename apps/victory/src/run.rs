@@ -63,6 +63,19 @@ pub fn run(
     );
     // The console's fixed drives: the package as `G:`, temporary files `T:`.
     victory_hle::modules::files::mount_at('G', title_dir);
+    // The shader archive the title's precompiled pipelines name their
+    // shaders in (`VICTORY_SHADER_ARCHIVE`); without it they are refused and
+    // the title makes them from its own descriptions.
+    match crate::shader_archive(Some(title_dir)) {
+        Some(archive) => {
+            println!("shader archive {}", archive.display());
+            victory_hle::modules::d3d12x::use_shader_pack(
+                archive,
+                cfg.cache_subdir("precompiled")?.join("shader-archive.index"),
+            );
+        }
+        None => println!("shader archive none (VICTORY_SHADER_ARCHIVE): precompiled pipelines are refused"),
+    }
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
     victory_hle::modules::files::mount_at('T', &temp);
     victory_hle::runtime::set_title(victory_hle::runtime::Title { storage, ..title });

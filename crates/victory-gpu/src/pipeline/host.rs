@@ -174,6 +174,92 @@ impl GraphicsState {
         }
     }
 
+    /// The state of a precompiled pipeline's decoded state blocks
+    /// ([`victory_game::pso_state`]), as [`GraphicsState::read`] takes in
+    /// the same fields from a stream (formats through the same
+    /// conversions).
+    pub(crate) fn from_precompiled(d: &victory_game::pso_state::GraphicsDesc) -> GraphicsState {
+        let mut g = GraphicsState::default();
+        let target = |t: &victory_game::pso_state::TargetBlend| D3D12_RENDER_TARGET_BLEND_DESC {
+            BlendEnable: t.blend.into(),
+            LogicOpEnable: t.logic_op_enable.into(),
+            SrcBlend: D3D12_BLEND(t.src as i32),
+            DestBlend: D3D12_BLEND(t.dst as i32),
+            BlendOp: D3D12_BLEND_OP(t.op as i32),
+            SrcBlendAlpha: D3D12_BLEND(t.src_alpha as i32),
+            DestBlendAlpha: D3D12_BLEND(t.dst_alpha as i32),
+            BlendOpAlpha: D3D12_BLEND_OP(t.op_alpha as i32),
+            LogicOp: D3D12_LOGIC_OP(t.logic_op as i32),
+            RenderTargetWriteMask: t.write_mask,
+        };
+        g.blend = D3D12_BLEND_DESC {
+            AlphaToCoverageEnable: d.alpha_to_coverage.into(),
+            IndependentBlendEnable: d.independent_blend.into(),
+            RenderTarget: d.targets_blend.each_ref().map(target),
+        };
+        g.sample_mask = d.sample_mask;
+        g.rasterizer = D3D12_RASTERIZER_DESC {
+            FillMode: D3D12_FILL_MODE(d.fill_mode as i32),
+            CullMode: D3D12_CULL_MODE(d.cull_mode as i32),
+            FrontCounterClockwise: d.front_ccw.into(),
+            DepthBias: d.depth_bias,
+            DepthBiasClamp: d.depth_bias_clamp,
+            SlopeScaledDepthBias: d.slope_scaled_depth_bias,
+            DepthClipEnable: d.depth_clip.into(),
+            ..Default::default()
+        };
+        let face = |f: &victory_game::pso_state::StencilFace| D3D12_DEPTH_STENCILOP_DESC {
+            StencilFailOp: D3D12_STENCIL_OP(f.fail as i32),
+            StencilDepthFailOp: D3D12_STENCIL_OP(f.depth_fail as i32),
+            StencilPassOp: D3D12_STENCIL_OP(f.pass as i32),
+            StencilFunc: D3D12_COMPARISON_FUNC(f.func as i32),
+        };
+        g.depth = D3D12_DEPTH_STENCIL_DESC {
+            DepthEnable: d.depth_enable.into(),
+            DepthWriteMask: D3D12_DEPTH_WRITE_MASK(d.depth_write as i32),
+            DepthFunc: D3D12_COMPARISON_FUNC(d.depth_func as i32),
+            StencilEnable: d.stencil_enable.into(),
+            StencilReadMask: d.stencil_read_mask,
+            StencilWriteMask: d.stencil_write_mask,
+            FrontFace: face(&d.front),
+            BackFace: face(&d.back),
+        };
+        g.depth_bounds = d.depth_bounds;
+        g.names = d
+            .inputs
+            .iter()
+            .map(|e| CString::new(e.name.as_str()).unwrap_or_default())
+            .collect();
+        g.inputs = d
+            .inputs
+            .iter()
+            .zip(&g.names)
+            .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR(name.as_ptr().cast()),
+                SemanticIndex: e.index,
+                Format: DXGI_FORMAT(crate::resource::pc_format(e.format) as i32),
+                InputSlot: e.slot,
+                AlignedByteOffset: e.offset,
+                InputSlotClass: D3D12_INPUT_CLASSIFICATION(e.class as i32),
+                InstanceDataStepRate: e.step_rate,
+            })
+            .collect();
+        g.strip_cut = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE(d.strip_cut as i32);
+        g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE(d.topology as i32);
+        g.targets = D3D12_RT_FORMAT_ARRAY {
+            RTFormats: d.target_formats.map(|f| {
+                DXGI_FORMAT(crate::resource::target_format(crate::resource::pc_format(f)) as i32)
+            }),
+            NumRenderTargets: d.num_targets,
+        };
+        g.depth_format = DXGI_FORMAT(crate::resource::pc_format(d.depth_format) as i32);
+        g.samples = DXGI_SAMPLE_DESC {
+            Count: d.sample_count,
+            Quality: d.sample_quality,
+        };
+        g
+    }
+
     /// Everything the state holds, as text: part of a pipeline's name in
     /// the library and of the key a title pipeline is started early by.
     pub(crate) fn describe(&self) -> String {

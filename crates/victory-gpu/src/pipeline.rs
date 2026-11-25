@@ -124,6 +124,31 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .clone()
 }
 
+/// Puts the translation of a container of the title's into the cache on
+/// disk, and with `compute` its host pipeline into the driver's, before any
+/// run wants them. Whether it translated, and whether it has a pipeline
+/// (`None`: not asked for).
+#[cfg(windows)]
+pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Option<bool>) {
+    if compute {
+        // The host first: translation follows what it says of itself (its
+        // wave size, its view heap).
+        let _ = crate::host::host();
+    }
+    let full = blake3::hash(container);
+    // Not through the table, which lets nothing go.
+    let shader = Arc::new(Shader {
+        stage,
+        hash: full.to_hex()[..16].to_owned(),
+        container: container.to_vec(),
+        translated: OnceLock::new(),
+        walks: OnceLock::new(),
+    });
+    let translated = shader.translated().is_some();
+    let made = (translated && compute).then(|| make::warm(vec![shader]));
+    (translated, made)
+}
+
 /// A translated shader and the console resources its code reads.
 #[cfg(windows)]
 pub(crate) struct Translated {
@@ -443,6 +468,11 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// What a precompiled pipeline (device methods 0x1c8 and 0x218) was
+    /// made from; its shaders are the archive's containers its stages name
+    /// (none with `VICTORY_PRECOMPILED_PSO=stub`).
+    #[cfg_attr(not(all(windows, feature = "diagnostics")), allow(dead_code))]
+    precompiled: Option<Precompiled>,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -544,6 +574,10 @@ pub(crate) fn note_drop(this: This) {
         let p = pipeline(this);
         skipped_shader(p)
             .map(|hash| format!("skipped shader {hash}"))
+            .or_else(|| {
+                (p.precompiled.is_some() && p.shaders.is_empty())
+                    .then(|| "precompiled pipeline without a host pipeline (VICTORY_PRECOMPILED_PSO=stub)".to_owned())
+            })
             .or_else(|| make::missing(&p.host))
     };
     if let Some(why) = why {
@@ -584,6 +618,7 @@ fn copy(stage: &'static str, code: &Bytecode) -> Option<Arc<Shader>> {
 fn hand_out(
     shaders: Vec<Arc<Shader>>,
     #[cfg(windows)] graphics: Option<Box<host::GraphicsState>>,
+    precompiled: Option<Precompiled>,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
@@ -609,6 +644,7 @@ fn hand_out(
         #[cfg(windows)]
         builder,
         shaders,
+        precompiled,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
     object::hand_out(PIPELINE, pipeline, iid, &PIPELINE_IIDS, out)
@@ -631,6 +667,7 @@ pub(crate) extern "system" fn create_graphics(
         shaders,
         #[cfg(windows)]
         None,
+        None,
         iid,
         out,
     )
@@ -650,6 +687,7 @@ pub(crate) extern "system" fn create_compute(
     hand_out(
         copy("compute", &desc.stage).into_iter().collect(),
         #[cfg(windows)]
+        None,
         None,
         iid,
         out,
@@ -753,6 +791,7 @@ pub(crate) extern "system" fn create_stream(
         shaders,
         #[cfg(windows)]
         Some(Box::new(graphics)),
+        None,
         iid,
         out,
     )
@@ -774,6 +813,14 @@ static FUNCTIONS: Table<24> = {
     f[7] = object::parent_device as *const (); // 0x38
     Table(f)
 };
+
+mod pack;
+mod precompiled;
+pub use pack::use_shader_pack;
+pub use precompiled::PrecompileReport;
+#[cfg(windows)]
+pub use precompiled::precompile_graphics;
+pub(crate) use precompiled::{Precompiled, create_precompiled};
 
 #[cfg(windows)]
 pub(crate) mod host;

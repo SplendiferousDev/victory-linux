@@ -49,6 +49,11 @@ in [docs/linux.md](docs/linux.md); the scripts are in `scripts/linux/`
   VIctory #1122 by tightfall. The read-beside fix for kernel reads into title
   memory is by **Joshua Odom** (commit `10ea38e` of the same fork family). Both
   are carried here unchanged apart from one merge conflict.
+- The title's precompiled pipelines (device methods 0x1c8 and 0x218, the
+  shader archive index, the pipeline cache and state-block decoders, and the
+  `warm` and `precompile-graphics` commands) are ported from the vendored
+  runtime of **[ScarlettPort](https://github.com/ZigZagBoi1/ScarlettPort)**
+  (GPL-3.0-or-later) and its contributors.
 - This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
 
 ## Status of this fork (2026-11-25)
