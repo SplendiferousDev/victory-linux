@@ -64,6 +64,10 @@ else
   ((scope)) || die "memory limits only apply with --scope"
 fi
 
+# A config file given by hand has its launcher.env beside it.
+if [[ -n $config && -z ${VICTORY_LINUX_CONFIG_DIR:-} ]]; then
+  VICTORY_LINUX_CONFIG_DIR=$(dirname -- "$(realpath -- "$config")")
+fi
 load_saved
 [[ -n $proton ]] || proton=${PROTON:-}
 [[ -n $prefix ]] || prefix=${PREFIX:-}
