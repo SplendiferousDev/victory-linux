@@ -67,6 +67,9 @@ pub(crate) struct Shader {
     /// ([`Shader::walks`]).
     #[cfg(windows)]
     walks: OnceLock<bool>,
+    /// Whether the user named it for the ambient light ([`Shader::ambient`]).
+    #[cfg(windows)]
+    ambient: OnceLock<bool>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -119,6 +122,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 translated: OnceLock::new(),
                 #[cfg(windows)]
                 walks: OnceLock::new(),
+                #[cfg(windows)]
+                ambient: OnceLock::new(),
             })
         })
         .clone()
@@ -143,6 +148,7 @@ pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Opti
         container: container.to_vec(),
         translated: OnceLock::new(),
         walks: OnceLock::new(),
+        ambient: OnceLock::new(),
     });
     let translated = shader.translated().is_some();
     let made = (translated && compute).then(|| make::warm(vec![shader]));
@@ -161,6 +167,14 @@ pub(crate) struct Translated {
 
 #[cfg(windows)]
 impl Shader {
+    /// Whether the user named it as the program whose light the ambient
+    /// light replaces (`crate::ambient`), looked at once.
+    pub(crate) fn ambient(&self) -> bool {
+        *self
+            .ambient
+            .get_or_init(|| crate::ambient::named(&self.hash, &self.container))
+    }
+
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
