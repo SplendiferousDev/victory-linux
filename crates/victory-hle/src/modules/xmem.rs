@@ -950,9 +950,10 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     scatter(addresses, pages, scatter_runs()).into()
 }
 
-/// `VICTORY_XMEM_SCATTER_RUNS`: 1, [`XMemMapPhysicalPagesScatter`] maps
-/// neighbouring addresses as one range (one unmap pass, one view per run
-/// of consecutive pages); 0, one page at a time. On by default under Wine
+/// `VICTORY_XMEM_SCATTER_RUNS`: 1, [`XMemMapPhysicalPagesScatter`] unmaps
+/// neighbouring addresses as one range (one call, one hold of the page
+/// table and of reads in place); 0, one page at a time.
+/// Maps stay one view per entry either way (see [`scatter`]). On by default under Wine
 /// only: there every view mapped or unmapped is a wineserver request that
 /// searches all of the process's views, and page by page also leaves one
 /// view per page alive. Windows keeps the page-by-page path it was tested
@@ -973,9 +974,16 @@ fn switch(name: &str, default: bool) -> bool {
 
 /// [`XMemMapPhysicalPagesScatter`]: entry by entry, in the title's order,
 /// or with `runs` each group of entries at neighbouring addresses that all
-/// map (or all unmap) at once ([`scatter_runs`]; after ScarlettPort's
+/// unmap at once ([`scatter_runs`]; after ScarlettPort's
 /// `scatter_batched`). An address named twice still ends as the title's
 /// last entry says: a group never holds one address twice.
+///
+/// Entries that map stay one view each. The title changes them one by one
+/// later, and its threads read the others meanwhile with no lock of ours;
+/// a view across several entries would be unmapped whole and mapped again
+/// around the one changed (a host view cannot be cut), leaving its
+/// neighbours unmapped for that moment. A game run crashed so in the
+/// title's own code.
 fn scatter(addresses: &[*mut c_void], pages: Option<&[usize]>, runs: bool) -> bool {
     let unmaps = |i: usize| pages.is_none_or(|p| p[i] == 0);
     count(Stat::ScatterPages, addresses.len());
@@ -985,7 +993,8 @@ fn scatter(addresses: &[*mut c_void], pages: Option<&[usize]>, runs: bool) -> bo
         while runs
             && i + n < addresses.len()
             && (addresses[i + n - 1] as usize).checked_add(PAGE) == Some(addresses[i + n] as usize)
-            && unmaps(i + n) == unmaps(i)
+            && unmaps(i)
+            && unmaps(i + n)
         {
             n += 1;
         }
@@ -1872,15 +1881,14 @@ mod tests {
             assert!(physical().views.range(a as usize..at(7) as usize).next().is_none());
         }
         assert_eq!(seen[0].0, seen[1].0, "the same pages shown");
-        // Page by page: 0, 1, 2, 4, 5; in runs 0-2 is one view until the
-        // last entry splits it around address 1.
+        // One view per entry that maps either way: 0, 1, 2, 4, 5.
         assert_eq!(seen[0].1, 5);
-        assert!(seen[1].1 <= seen[0].1);
-        // Without the last entry, the run of three is one view.
+        assert_eq!(seen[1].1, 5);
+        // Without the last entry, still one view per entry.
         let a = reserve(3);
         let addresses: Vec<_> = (0..3).map(|k| a.wrapping_byte_add(k * PAGE)).collect();
         assert!(scatter(&addresses, Some(&pages[..3]), true));
-        assert_eq!(physical().views.get(&(a as usize)).map(|v| v.0), Some(3 * PAGE));
+        assert_eq!(physical().views.range(a as usize..a as usize + 3 * PAGE).count(), 3);
         assert!(scatter(&addresses, None, true));
         assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
     }
@@ -1933,6 +1941,95 @@ mod tests {
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert!(gone.upgrade().is_none());
         assert_eq!(XMemFreePhysicalPages(2, b.as_ptr()), 1);
+    }
+
+    /// The title's own threads read its pages with no lock of ours: a
+    /// Scatter entry changed must leave the pages of the other entries
+    /// mapped throughout. A view across several entries cannot: changing
+    /// one page of it unmaps the whole view and maps the rest again, and
+    /// a read of a neighbour in that moment faults (a game run crashed so
+    /// in the title's own code). Without the fix this test dies of that
+    /// access violation.
+    #[test]
+    fn a_scatter_entry_changes_without_a_gap_at_its_neighbours() {
+        use std::sync::atomic::AtomicBool;
+        let pages = allocate(3);
+        let a = reserve(3);
+        let addresses: Vec<*mut c_void> = (0..3).map(|k| a.wrapping_byte_add(k * PAGE)).collect();
+        assert!(scatter(&addresses, Some(&pages), true));
+        let (first, last) = (addresses[0] as usize, addresses[2] as usize);
+        // SAFETY: mapped read-write.
+        unsafe {
+            (first as *mut u8).write(1);
+            (last as *mut u8).write(3);
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut reads = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    // SAFETY: the title never changed these two entries.
+                    unsafe {
+                        assert_eq!((first as *const u8).read_volatile(), 1);
+                        assert_eq!((last as *const u8).read_volatile(), 3);
+                    }
+                    reads += 1;
+                }
+                reads
+            })
+        };
+        for _ in 0..2000 {
+            assert!(scatter(&addresses[1..2], Some(&[0]), true));
+            assert!(scatter(&addresses[1..2], Some(&pages[1..2]), true));
+        }
+        stop.store(true, Ordering::Relaxed);
+        assert!(reader.join().expect("the reader never faulted") > 0);
+        assert!(scatter(&addresses, None, true));
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    /// Pages Scatter mapped, written through the section's whole view,
+    /// read back at every address that shows them, also after one entry
+    /// is unmapped.
+    #[test]
+    fn writes_show_at_every_scattered_address() {
+        let pages = allocate(4);
+        let (a, b) = (reserve(4), reserve(2));
+        let at = |p: *mut c_void, k: usize| p.wrapping_byte_add(k * PAGE);
+        // All four at `a`, pages 2 and 3 again at `b`.
+        let addresses = [at(a, 0), at(a, 1), at(a, 2), at(a, 3), at(b, 0), at(b, 1)];
+        let numbers = [pages[0], pages[1], pages[2], pages[3], pages[2], pages[3]];
+        assert!(scatter(&addresses, Some(&numbers), true));
+        let data: Vec<u8> = (0..3 * PAGE).map(|i| (i * 7 % 253) as u8 + 1).collect();
+        let check = |data: &[u8], skip: Option<usize>| {
+            for (k, &address) in addresses.iter().enumerate() {
+                if Some(k) == skip {
+                    continue;
+                }
+                let page = numbers[k];
+                let n = pages.iter().position(|&p| p == page).unwrap();
+                // Bytes `[PAGE / 2, PAGE / 2 + 3 PAGE)` of the four pages.
+                let lo = (n * PAGE).max(PAGE / 2);
+                let hi = ((n + 1) * PAGE).min(PAGE / 2 + 3 * PAGE);
+                // SAFETY: mapped read-write.
+                let seen = unsafe { std::slice::from_raw_parts((address as *const u8).add(lo - n * PAGE), hi - lo) };
+                assert!(seen == &data[lo - PAGE / 2..hi - PAGE / 2], "entry {k}");
+            }
+        };
+        assert!(write_physical(&pages, PAGE / 2, &data));
+        check(&data, None);
+        assert_eq!(shown_at(&pages, 2 * PAGE, PAGE).len(), 2);
+        // Entry 1 unmapped; the rest still show what is written now.
+        assert!(scatter(&addresses[1..2], None, true));
+        let data: Vec<u8> = data.iter().map(|b| b.wrapping_add(1)).collect();
+        let mut window = page_window(&pages, PAGE / 2, 3 * PAGE).expect("one run");
+        window.bytes().copy_from_slice(&data);
+        drop(window);
+        check(&data, Some(1));
+        assert_eq!(query(addresses[1]).host.State, MEM_RESERVE);
+        assert!(scatter(&addresses, None, true));
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
     }
 
     /// `n` pages of one new allocation.
