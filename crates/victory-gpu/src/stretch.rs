@@ -99,7 +99,7 @@ fn make(device: &ID3D12Device) -> windows::core::Result<Pass> {
 }
 
 /// A typeless colour format as the typed one shaders read and write.
-fn typed(format: DXGI_FORMAT) -> DXGI_FORMAT {
+pub(crate) fn typed(format: DXGI_FORMAT) -> DXGI_FORMAT {
     DXGI_FORMAT(match format.0 {
         1 => 2,
         9 => 10,
@@ -222,7 +222,7 @@ pub(crate) fn record(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Typeless colour formats are read and written as their typed ones;
@@ -273,6 +273,7 @@ mod tests {
             eprintln!("stretch test: skipped, no D3D12 device");
             return;
         };
+        use windows::Win32::Graphics::Direct3D12::*;
         // RGBA8: red ramps across the part (0, 255), blue down it (0, 255);
         // texels outside the part are opaque green.
         let mut input = [[0u8, 255, 0, 255]; 16];
@@ -280,7 +281,24 @@ mod tests {
         input[1] = [255, 0, 0, 255];
         input[4] = [0, 0, 255, 255];
         input[5] = [255, 0, 255, 255];
-        let out = rig.stretch(&input, 4, 4, [2, 2]);
+        let source = rig.texture(4, 4, D3D12_RESOURCE_FLAG_NONE);
+        let target = rig.texture(4, 4, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        let out = rig.run(&[(&source, &input, 4, 4)], (&target, 4, 4), |l| {
+            let transition = crate::host::transition;
+            // SAFETY: an open list of the rig's; its own textures.
+            unsafe {
+                l.ResourceBarrier(&[
+                    transition(&source, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                    transition(&target, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                ]);
+                record(rig.device(), l, &target, &source, [2, 2]).expect("a stretch recorded");
+                l.ResourceBarrier(&[transition(
+                    &target,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+            }
+        });
         let at = |x: usize, y: usize| out[y * 4 + x];
         for (i, texel) in out.iter().enumerate() {
             assert_eq!(texel[1], 0, "texel {i} has green from outside the rendered part: {texel:?}");
@@ -298,17 +316,21 @@ mod tests {
         assert_eq!(at(0, 1)[2], at(3, 1)[2]);
     }
 
-    mod gpu {
+    /// A device of the tests' own and one list, for the passes of ours
+    /// (also `crate::over`'s tests): RGBA8 textures filled by upload,
+    /// one submission, one texture read back.
+    pub(crate) mod gpu {
         use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
         use windows::Win32::Graphics::Direct3D12::*;
         use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
         use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+        use windows::core::Interface;
 
-        pub(super) struct Rig {
+        pub(crate) struct Rig {
             device: ID3D12Device,
             queue: ID3D12CommandQueue,
-            allocator: ID3D12CommandAllocator,
+            _allocator: ID3D12CommandAllocator,
             list: ID3D12GraphicsCommandList,
             fence: ID3D12Fence,
             event: HANDLE,
@@ -321,10 +343,15 @@ mod tests {
             }
         }
 
+        /// Bytes from one row to the next in the copy buffers: textures of
+        /// up to 64 texels a row.
         const PITCH: u32 = 256;
 
         impl Rig {
-            pub(super) fn new() -> Option<Rig> {
+            /// The software adapter if there is one, else the default one
+            /// (under Wine: the card through vkd3d-proton); `None` without a
+            /// device.
+            pub(crate) fn new() -> Option<Rig> {
                 // SAFETY: plain object creation on a device of our own.
                 unsafe {
                     let mut device: Option<ID3D12Device> = None;
@@ -335,7 +362,7 @@ mod tests {
                     }
                     let device = device?;
                     eprintln!(
-                        "stretch test: on {}",
+                        "pass test: on {}",
                         if warp.is_some() { "the software adapter" } else { "the default adapter" }
                     );
                     let queue: ID3D12CommandQueue = device
@@ -353,7 +380,7 @@ mod tests {
                     Some(Rig {
                         device,
                         queue,
-                        allocator,
+                        _allocator: allocator,
                         list,
                         fence,
                         event,
@@ -361,10 +388,14 @@ mod tests {
                 }
             }
 
-            fn buffer(&self, kind: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES) -> ID3D12Resource {
+            pub(crate) fn device(&self) -> &ID3D12Device {
+                &self.device
+            }
+
+            fn buffer(&self, kind: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES, rows: u32) -> ID3D12Resource {
                 let desc = D3D12_RESOURCE_DESC {
                     Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                    Width: u64::from(PITCH) * 4,
+                    Width: u64::from(PITCH) * u64::from(rows),
                     Height: 1,
                     DepthOrArraySize: 1,
                     MipLevels: 1,
@@ -375,7 +406,9 @@ mod tests {
                 self.committed(kind, &desc, state)
             }
 
-            fn texture(&self, width: u32, height: u32, flags: D3D12_RESOURCE_FLAGS) -> ID3D12Resource {
+            /// An RGBA8 texture in the copy-destination state.
+            pub(crate) fn texture(&self, width: u32, height: u32, flags: D3D12_RESOURCE_FLAGS) -> ID3D12Resource {
+                assert!(width * 4 <= PITCH);
                 let desc = D3D12_RESOURCE_DESC {
                     Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
                     Width: u64::from(width),
@@ -439,51 +472,48 @@ mod tests {
                 }
             }
 
-            /// Uploads `input` (`width` by `height`, at most 4 rows), runs
-            /// the stretch of its top-left `render` texels over an output of
-            /// the same size and reads the output back.
-            pub(super) fn stretch(&self, input: &[[u8; 4]], width: u32, height: u32, render: [u32; 2]) -> Vec<[u8; 4]> {
-                let upload = self.buffer(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
-                let back = self.buffer(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
-                let source = self.texture(width, height, D3D12_RESOURCE_FLAG_NONE);
-                let target = self.texture(width, height, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-                let transition = |r: &ID3D12Resource, from, to| crate::host::transition(r, from, to);
+            /// One submission: each input texture (in the copy-destination
+            /// state) gets its texels, `record` records what is tested (it
+            /// leaves `output` in the copy-source state), and `output` is
+            /// read back.
+            pub(crate) fn run(
+                &self,
+                inputs: &[(&ID3D12Resource, &[[u8; 4]], u32, u32)],
+                (output, width, height): (&ID3D12Resource, u32, u32),
+                record: impl FnOnce(&ID3D12GraphicsCommandList),
+            ) -> Vec<[u8; 4]> {
+                let back = self.buffer(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, height);
+                let mut uploads = Vec::new();
                 // SAFETY: our own resources, list and queue; the mapped
                 // buffers are written and read inside their sizes, and read
                 // after the card finished.
                 unsafe {
-                    let mut at = std::ptr::null_mut();
-                    upload.Map(0, None, Some(&mut at)).expect("a mapped upload buffer");
-                    for y in 0..height as usize {
-                        let row = &input[y * width as usize..][..width as usize];
-                        std::ptr::copy_nonoverlapping(
-                            row.as_ptr().cast::<u8>(),
-                            at.cast::<u8>().add(y * PITCH as usize),
-                            row.len() * 4,
-                        );
-                    }
-                    upload.Unmap(0, None);
                     let l = &self.list;
-                    l.CopyTextureRegion(&Self::whole(&source), 0, 0, 0, &Self::footprint(&upload, width, height), None);
-                    l.ResourceBarrier(&[
-                        transition(&source, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-                        transition(&target, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-                    ]);
-                    super::super::record(&self.device, l, &target, &source, render).expect("a stretch recorded");
-                    l.ResourceBarrier(&[transition(
-                        &target,
-                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                        D3D12_RESOURCE_STATE_COPY_SOURCE,
-                    )]);
-                    l.CopyTextureRegion(&Self::footprint(&back, width, height), 0, 0, 0, &Self::whole(&target), None);
+                    for &(texture, texels, w, h) in inputs {
+                        let upload = self.buffer(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, h);
+                        let mut at = std::ptr::null_mut();
+                        upload.Map(0, None, Some(&mut at)).expect("a mapped upload buffer");
+                        for y in 0..h as usize {
+                            let row = &texels[y * w as usize..][..w as usize];
+                            std::ptr::copy_nonoverlapping(
+                                row.as_ptr().cast::<u8>(),
+                                at.cast::<u8>().add(y * PITCH as usize),
+                                row.len() * 4,
+                            );
+                        }
+                        upload.Unmap(0, None);
+                        l.CopyTextureRegion(&Self::whole(texture), 0, 0, 0, &Self::footprint(&upload, w, h), None);
+                        uploads.push(upload);
+                    }
+                    record(l);
+                    l.CopyTextureRegion(&Self::footprint(&back, width, height), 0, 0, 0, &Self::whole(output), None);
                     l.Close().expect("a closed list");
                     self.queue.ExecuteCommandLists(&[Some(l.cast().expect("a command list"))]);
                     self.queue.Signal(&self.fence, 1).expect("a signal");
                     self.fence.SetEventOnCompletion(1, self.event).expect("an event");
-                    assert_eq!(WaitForSingleObject(self.event, 10_000), WAIT_OBJECT_0, "the stretch did not finish");
+                    assert_eq!(WaitForSingleObject(self.event, 10_000), WAIT_OBJECT_0, "the submission did not finish");
                     let removed = self.device.GetDeviceRemovedReason();
                     assert!(removed.is_ok(), "the device is lost: {removed:?}");
-                    let _ = &self.allocator;
                     let mut at = std::ptr::null_mut();
                     back.Map(0, None, Some(&mut at)).expect("a mapped read-back buffer");
                     let mut out = Vec::new();
@@ -496,7 +526,5 @@ mod tests {
                 }
             }
         }
-
-        use windows::core::Interface;
     }
 }

@@ -60,8 +60,14 @@ enum Held {
     Running,
     /// With [`present_behind`]: the title's present of a frame, due after
     /// what the queue holds before it: the host texture shown, the state
-    /// the title's lists leave it in, and the frame's number.
-    Present(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32, u64),
+    /// the title's lists leave it in, and the frame's number; and the
+    /// second plane drawn over it with its state ([`second_plane`]).
+    Present(
+        windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        u32,
+        u64,
+        Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)>,
+    ),
 }
 
 /// Presents that are in a queue's line and have not run ([`Held::Present`]).
@@ -163,9 +169,11 @@ fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool 
     let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
     crate::resource::host_transition(resource, state);
     let texture = texture.clone();
+    // SAFETY: the title passes `planes` plane descriptions.
+    let over = unsafe { over_plane(planes, plane_parameters, resource) }.map(|(t, was)| (t.clone(), was));
     let sent = hold(this, || {
         PRESENTS_HELD.fetch_add(1, Ordering::Relaxed);
-        Held::Present(texture, state, frame)
+        Held::Present(texture, state, frame, over)
     });
     if sent {
         PRESENTS_BEHIND.fetch_add(1, Ordering::Relaxed);
@@ -891,10 +899,11 @@ fn release_held_now(all: bool) {
                             }
                         }
                     }
-                    Held::Present(texture, state, frame) => {
+                    Held::Present(texture, state, frame, over) => {
                         let show = || {
                             if let Some(host) = crate::host::host() {
-                                let _ = host.present(&texture, state, frame);
+                                let over = over.as_ref().map(|(t, was)| (t, *was));
+                                let _ = host.present(&texture, state, frame, over);
                             }
                         };
                         if all {
@@ -1404,7 +1413,9 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
+        // SAFETY: the title passes `planes` plane descriptions.
+        let over = unsafe { over_plane(planes, plane_parameters, resource) };
+        let shown = host.present(texture, state, frame, over);
         crate::resource::host_transition(resource, state);
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
@@ -1415,6 +1426,139 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     let _ = (planes, plane_parameters);
     S_OK
 }
+/// The bytes from one plane's description to the next in a present.
+const PLANE_STRIDE: usize = 0x48;
+
+/// The first resource of a present's second plane, if it has one that is not
+/// the first plane's (`first`): what is drawn over the first.
+///
+/// # Safety
+/// `parameters` is null or points at `planes` plane descriptions,
+/// [`PLANE_STRIDE`] bytes apart, each listing `count` resources.
+#[cfg_attr(not(windows), allow(dead_code))]
+unsafe fn second_plane(planes: u32, parameters: *const Plane, first: This) -> Option<This> {
+    if planes < 2 || parameters.is_null() {
+        return None;
+    }
+    // SAFETY: the caller's: a second description follows the first.
+    let plane = unsafe { &*parameters.cast::<u8>().add(PLANE_STRIDE).cast::<Plane>() };
+    if plane.count == 0 || plane.resources.is_null() {
+        return None;
+    }
+    // SAFETY: the caller's: the plane lists `count` resources.
+    let resource = unsafe { *plane.resources };
+    (!resource.is_null() && resource != first).then_some(resource)
+}
+
+/// Whether a present's second plane is drawn over the first: on the Series
+/// S profile, unless `VICTORY_SECOND_PLANE=0`.
+#[cfg(windows)]
+fn planes_composed() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let series_s = crate::console::current() == crate::console::Console::SeriesS;
+        let on = series_s && std::env::var_os("VICTORY_SECOND_PLANE").is_none_or(|v| v != "0");
+        if series_s {
+            tracing::info!(
+                on,
+                "a present's second plane (the interface) is drawn over the first (VICTORY_SECOND_PLANE=0: it is not)"
+            );
+        }
+        on
+    })
+}
+
+/// The host texture of a present's second plane ([`second_plane`]) and the
+/// state the title's lists leave it in, if it is drawn over the first
+/// ([`planes_composed`]).
+///
+/// # Safety
+/// As [`second_plane`].
+#[cfg(windows)]
+unsafe fn over_plane<'a>(
+    planes: u32,
+    parameters: *const Plane,
+    first: This,
+) -> Option<(&'a windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)> {
+    if !planes_composed() {
+        return None;
+    }
+    // SAFETY: the caller's.
+    let resource = unsafe { second_plane(planes, parameters, first) }?;
+    let texture = crate::resource::host_resource(resource)?;
+    // The state the lists recorded so far leave it in (looked at, not
+    // changed), as for the first plane.
+    const READABLE: u32 = 0x80;
+    let was = crate::resource::host_transition(resource, READABLE).map_or(READABLE, |(_, before)| before);
+    crate::resource::host_transition(resource, was);
+    static TOLD: std::sync::Once = std::sync::Once::new();
+    TOLD.call_once(|| {
+        // SAFETY: a live resource.
+        let desc = unsafe { texture.GetDesc() };
+        tracing::info!(
+            width = desc.Width,
+            height = desc.Height,
+            format = desc.Format.0,
+            "a present has a second plane: drawn over the first (logged once)"
+        );
+    });
+    Some((texture, was))
+}
+
+#[cfg(test)]
+mod plane_tests {
+    use super::*;
+
+    /// Two plane descriptions as a title lays them out, [`PLANE_STRIDE`]
+    /// bytes apart, the second naming `count` resources at `resources`.
+    fn two(count: u32, resources: *const This) -> [u64; 2 * PLANE_STRIDE / 8] {
+        let mut words = [0u64; 2 * PLANE_STRIDE / 8];
+        let second = PLANE_STRIDE / 8;
+        words[second] = 7; // frame token
+        words[second + 1] = u64::from(count);
+        words[second + 2] = resources as u64;
+        words
+    }
+
+    #[test]
+    fn the_second_plane_is_chosen_only_when_it_names_another_resource() {
+        let (a, b) = (0x1000 as This, 0x2000 as This);
+        let other = [b];
+        let same = [a];
+        let none = [std::ptr::null::<crate::object::Object>()];
+        // SAFETY: each description is a whole local array laid out as the
+        // title's; resource lists are local arrays of one.
+        unsafe {
+            let with_other = two(1, other.as_ptr());
+            let p = with_other.as_ptr().cast::<Plane>();
+            assert_eq!(second_plane(2, p, a), Some(b));
+            // One plane, or no descriptions at all: nothing over the first.
+            assert_eq!(second_plane(1, p, a), None);
+            assert_eq!(second_plane(0, p, a), None);
+            assert_eq!(second_plane(2, std::ptr::null(), a), None);
+            // The same resource twice is not drawn over itself.
+            let with_same = two(1, same.as_ptr());
+            assert_eq!(second_plane(2, with_same.as_ptr().cast(), a), None);
+            // An empty plane, a plane without a list, a null resource.
+            let empty = two(0, other.as_ptr());
+            assert_eq!(second_plane(2, empty.as_ptr().cast(), a), None);
+            let unlisted = two(1, std::ptr::null());
+            assert_eq!(second_plane(2, unlisted.as_ptr().cast(), a), None);
+            let with_null = two(1, none.as_ptr());
+            assert_eq!(second_plane(2, with_null.as_ptr().cast(), a), None);
+        }
+    }
+
+    /// The description's fields the plane is read by sit where the title
+    /// writes them.
+    #[test]
+    fn a_plane_description_starts_with_its_token_count_and_resources() {
+        assert_eq!(std::mem::offset_of!(Plane, count), 8);
+        assert_eq!(std::mem::offset_of!(Plane, resources), 16);
+        const _: () = assert!(size_of::<Plane>() <= PLANE_STRIDE);
+    }
+}
+
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
 #[cfg(all(windows, feature = "diagnostics"))]

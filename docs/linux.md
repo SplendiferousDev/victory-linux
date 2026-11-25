@@ -174,8 +174,10 @@ The file is taken (renamed away) as it is read; progress is written to
   bilinear stretch of the colour input instead (no temporal upscaling or
   sharpening). The log says `upscale dispatch: a stretch ... was recorded` once,
   or `upscale dispatch NOT stretched` with the reason.
-  `VICTORY_UPSCALE_STRETCH=0` turns it off. Not yet confirmed with the game; if
-  the window stays black, use `--console series-x`.
+  `VICTORY_UPSCALE_STRETCH=0` turns it off. The title also presents its
+  interface as a second 4K plane; on Series S it is drawn over the game image
+  in the window (`VICTORY_SECOND_PLANE=0` turns that off). Not yet confirmed
+  with the game; if the window stays black, use `--console series-x`.
 
 ## Performance
 
