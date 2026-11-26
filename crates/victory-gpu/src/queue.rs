@@ -1376,6 +1376,8 @@ impl Written {
                 at.cast::<u64>().write_unaligned(value);
             }
         }
+        // A title thread may wait for it in an emulated `mwaitx` (`VICTORY_MWAITX=wait`).
+        victory_core::wake::written(at as usize, bytes);
     }
 }
 

@@ -245,6 +245,17 @@ choice is ambiguous, `VICTORY_AMBIENT_TINT=r,g,b`, `VICTORY_AMBIENT_SHADE=s,r,n,
   with `NV_ERR_NO_MEMORY` in the kernel log). Plan on more RAM, or a card with
   more memory; swap only delays it.
 - Swap helps with loading peaks. zram first and a swap file behind it work well.
+- The title waits for fences with AMD's `monitorx` / `mwaitx`, which Intel CPUs
+  lack. Each one is an exception that the runtime emulates, and under Wine an
+  exception costs far more than on Windows (a signal, then the exception
+  dispatch). So once a wait has lasted 200 us, an emulated `mwaitx` blocks on
+  the monitored address (`RtlWaitOnAddress`, a futex under Wine) for up to
+  1 ms. The runtime's fence and bottom-of-pipe writes wake it. Before this, a
+  long wait took about 250,000 exceptions a second. `VICTORY_MWAITX=spin`
+  brings back the old behaviour. `VICTORY_MWAITX_SPIN_US` and
+  `VICTORY_MWAITX_TIMEOUT_US` tune the two phases. The log's "console CPU
+  instructions, exceptions a second" line counts the blocks, their ends and
+  the wakes.
 
 ## Measuring a run
 
