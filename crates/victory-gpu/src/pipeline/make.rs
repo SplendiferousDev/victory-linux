@@ -374,12 +374,12 @@ fn workers() -> bool {
 struct Worker {
     index: usize,
     thread: std::thread::JoinHandle<()>,
-    making: Arc<Mutex<Option<Arc<Pending>>>>,
+    making: Arc<Mutex<Option<(Arc<Pending>, Instant)>>>,
 }
 
 impl Worker {
     fn spawn(index: usize) -> Option<Worker> {
-        let making = Arc::new(Mutex::new(None::<Arc<Pending>>));
+        let making = Arc::new(Mutex::new(None::<(Arc<Pending>, Instant)>));
         let mine = making.clone();
         let spawned = std::thread::Builder::new()
             .name(format!("victory-pipelines-{index}"))
@@ -392,9 +392,11 @@ impl Worker {
                 }
                 loop {
                     let p = next();
-                    *mine.lock().unwrap_or_else(|e| e.into_inner()) = Some(p.clone());
+                    *mine.lock().unwrap_or_else(|e| e.into_inner()) = Some((p.clone(), Instant::now()));
                     p.make();
                     *mine.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                    let with = p.made.get().is_some_and(|made| made.is_some());
+                    (if with { &MADE_OK } else { &MADE_NONE }).fetch_add(1, Ordering::Relaxed);
                     finished();
                 }
             });
@@ -436,14 +438,19 @@ fn finished() {
 /// stayed "being made"), until few or none were left; the pipelines are
 /// listed in the cache folder and not made in later runs.
 fn watch(mut workers: Vec<Worker>) {
+    let mut last_report = Instant::now();
     loop {
         std::thread::sleep(Duration::from_millis(500));
+        if last_report.elapsed() >= REPORT_EVERY {
+            last_report = Instant::now();
+            report(&workers);
+        }
         workers.retain_mut(|w| {
             if !w.ended() {
                 return true;
             }
             let p = w.making.lock().unwrap_or_else(|e| e.into_inner()).take();
-            if let Some(p) = p {
+            if let Some((p, _)) = p {
                 tracing::warn!(
                     worker = w.index,
                     shaders = ?p.shaders,
@@ -469,6 +476,56 @@ fn watch(mut workers: Vec<Worker>) {
             }
         });
     }
+}
+
+/// Pipelines the workers finished with a host pipeline, and without one
+/// (refused, or a shader that does not translate).
+static MADE_OK: AtomicU64 = AtomicU64::new(0);
+static MADE_NONE: AtomicU64 = AtomicU64::new(0);
+const REPORT_EVERY: Duration = Duration::from_secs(10);
+
+/// One line every [`REPORT_EVERY`] while there is work: the queue, what was
+/// finished since the last line (and how: loaded from the library or
+/// compiled), and what each worker is making and for how long.
+fn report(workers: &[Worker]) {
+    use std::fmt::Write;
+    use super::library::{LOADED, MADE};
+    static LAST: Mutex<[u64; 4]> = Mutex::new([0; 4]);
+    let (requested, early) = {
+        let queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        let early = queue.early.iter().filter(|p| p.queue_state.load(Ordering::Relaxed) == EARLY).count();
+        (queue.requested.len(), early)
+    };
+    let now = [
+        MADE_OK.load(Ordering::Relaxed),
+        MADE_NONE.load(Ordering::Relaxed),
+        LOADED.load(Ordering::Relaxed),
+        MADE.load(Ordering::Relaxed),
+    ];
+    let before = std::mem::replace(&mut *LAST.lock().unwrap_or_else(|e| e.into_inner()), now);
+    let d = |i: usize| now[i].saturating_sub(before[i]);
+    let mut busy = String::new();
+    for w in workers {
+        let making = w.making.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = match &*making {
+            Some((p, since)) => {
+                let stages: Vec<&str> = p.shaders.iter().map(|s| s.stage).collect();
+                write!(busy, " {}:{}+{:.1}s", w.index, stages.join("+"), since.elapsed().as_secs_f64())
+            }
+            None => write!(busy, " {}:idle", w.index),
+        };
+    }
+    if requested + early == 0 && d(0) + d(1) == 0 {
+        return;
+    }
+    tracing::info!(
+        "pipeline workers: queued {requested} asked for by draws + {early} started early; in {} s finished {} with a host pipeline ({} loaded from the library, {} compiled) and {} without; workers{busy}",
+        REPORT_EVERY.as_secs(),
+        d(0),
+        d(2),
+        d(3),
+        d(1)
+    );
 }
 
 /// The most pipelines waiting at once since the workers last ran out.
