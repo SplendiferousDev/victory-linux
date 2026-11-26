@@ -137,6 +137,8 @@ pub extern "system" fn create(
     // SAFETY: checked non-null; the title passes its parameters and an id.
     let (version, iid) = unsafe { (parameters.read(), &*iid) };
     tracing::info!(version = format_args!("{version:#x}"), "D3D12.X device");
+    #[cfg(windows)]
+    crate::shadow::say_memory_switches();
     if version != CHECKED_VERSION {
         tracing::warn!(
             version = format_args!("{version:#x}"),

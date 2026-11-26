@@ -462,7 +462,7 @@ thread_local! {
 /// buffer grows to the largest texture the thread has read and stays that
 /// size for the run, all of it resident; over this most it is freed after
 /// the read that needed it, and the next large texture allocates again.
-fn read_keep() -> usize {
+pub(crate) fn read_keep() -> usize {
     static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
         std::env::var("VICTORY_TEXTURE_READ_KEEP_MB")

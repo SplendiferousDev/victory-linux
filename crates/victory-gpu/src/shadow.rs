@@ -1314,6 +1314,23 @@ fn pool_most() -> usize {
     })
 }
 
+/// Says once the values in force of the switches for the PC's memory and
+/// for large copies.
+pub(crate) fn say_memory_switches() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let read_keep = crate::texture::read_keep();
+        tracing::info!(
+            "memory switches: VICTORY_SNAPSHOT_POOL_MB={} VICTORY_TEXTURE_READ_KEEP_MB={} \
+             VICTORY_WIDE_THREADS={} VICTORY_FAST_COPY={}",
+            pool_most() >> 20,
+            if read_keep == usize::MAX { "none".to_string() } else { (read_keep >> 20).to_string() },
+            wide_threads(),
+            if crate::fastcopy::on() { "on" } else { "off" },
+        );
+    });
+}
+
 /// Returns a snapshot buffer to the pool.
 fn give_back(v: Vec<u8>) {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
