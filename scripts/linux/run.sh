@@ -23,6 +23,9 @@ Usage: run.sh --game <folder> --exe <file name> [options]
                        $vl_data_home/wineserver-patched)
   --stock-wineserver   use Proton's own wineserver (slow once the title holds
                        tens of thousands of memory views)
+  --measure <file>     sample once a second into <file> while it runs: memory,
+                       CPU and I/O pressure, MemAvailable, swap, and the
+                       resident size of the title's processes (measure.sh)
 
 Memory guard (needs systemd; the title uses more than 10 GB, and a limit
 stops it from taking the whole desktop down when memory runs out):
@@ -37,7 +40,7 @@ USAGE
 }
 
 game= exe= console=series-x diag=0 proton=${VICTORY_PROTON:-} prefix=
-wserver= stock=0 config= name=$(date +%Y%m%d-%H%M%S) scope=0 mhigh= mmax= swapmax=
+wserver= stock=0 measure= config= name=$(date +%Y%m%d-%H%M%S) scope=0 mhigh= mmax= swapmax=
 
 while (($#)); do
   case $1 in
@@ -51,6 +54,7 @@ while (($#)); do
     --name) name=${2:?}; shift 2 ;;
     --wineserver) wserver=${2:?--wineserver needs a path}; shift 2 ;;
     --stock-wineserver) stock=1; shift ;;
+    --measure) measure=${2:?--measure needs a file}; shift 2 ;;
     --scope) scope=1; shift ;;
     --memory-high) mhigh=${2:?}; shift 2 ;;
     --memory-max) mmax=${2:?}; shift 2 ;;
@@ -148,6 +152,12 @@ if [[ -f $config ]]; then
   done
 fi
 
+preflight_host
+if [[ -n $measure ]]; then
+  refuse_inside_repo "measure file" "$measure"
+  mkdir -p "$(dirname -- "$measure")"
+fi
+
 mkdir -p "$run_dir" "$log_dir" "$vkd3d_cache"
 log=$log_dir/$name.log
 
@@ -159,6 +169,10 @@ fi
 export VICTORY_CONFIG=$win_config
 export VICTORY_NO_WATCHDOG=1
 export VICTORY_LOG=${VICTORY_LOG:-info}
+# Proton's own defaults; launching wine directly would otherwise leave
+# vkd3d-proton's logging on.
+export VKD3D_DEBUG=${VKD3D_DEBUG:-none}
+export VKD3D_SHADER_DEBUG=${VKD3D_SHADER_DEBUG:-none}
 # Any other VICTORY_* or VKD3D_* variable is already in the environment and is
 # inherited as it is.
 
@@ -192,6 +206,12 @@ if ((scope)); then
 fi
 
 cd "$run_dir"
+if [[ -n $measure ]]; then
+  "$here/measure.sh" "$measure" $$ &
+  sampler=$!
+  trap 'kill "$sampler" 2>/dev/null || true' EXIT
+  echo "measure:  $measure"
+fi
 set +e
 "${cmd[@]}" 2>&1 | tee "$log"
 rc=${PIPESTATUS[0]}
