@@ -20,7 +20,10 @@
 //!   device has no such heaps a window is not put on the card as two
 //!   buffers either (that keeps the PC's side and takes the card's room);
 //! - the spare pools keep less: list scratch chunks, texture staging
-//!   buffers, snapshot buffers, the threads' texture read buffers.
+//!   buffers, snapshot buffers, the threads' texture read buffers;
+//! - the CPU sides of copies in the card's memory are plain (swappable)
+//!   memory, sent up through upload chunks (`VICTORY_CARD_TWIN_PLAIN`,
+//!   `crate::shadow::plain_twins`).
 //!
 //! The memory line ([`line`], in every build, every 10 s with the frame
 //! line) says what the host copies hold by kind and where, so a run with
@@ -115,12 +118,20 @@ pub(crate) struct Held {
     /// the card (the card's sides are the card's memory).
     pub buffers: [u64; 2],
     pub buffers_card: [u64; 2],
+    /// CPU sides of copies on the card in plain memory
+    /// (`VICTORY_CARD_TWIN_PLAIN`; not pinned, counted in the kinds above
+    /// all the same): copies, bytes, bytes of title memory.
+    pub twins_plain: [u64; 3],
+    /// Their send's upload chunks: held now, the most held since the last
+    /// line, and the waits for the card a full ring took since then.
+    pub twin_ring: [u64; 3],
 }
 
 impl Held {
-    /// The PC's memory the copies hold (pinned by the driver).
+    /// The PC's memory the copies hold (pinned by the driver): CPU sides
+    /// in plain memory not counted.
     pub(crate) fn pc_bytes(&self) -> u64 {
-        self.windows_pc[1] + self.windows_card[1] + self.buffers[1]
+        (self.windows_pc[1] + self.windows_card[1] + self.buffers[1]).saturating_sub(self.twins_plain[2])
     }
 }
 
@@ -149,9 +160,10 @@ pub(crate) fn text(
         "memory of host copies (PC memory the driver pins, unless on the card): {} MB in the PC's memory; windows \
          outside buffers: {} in the PC's memory {} MB, {} in GPU upload heaps {} MB (the card's), {} with a card side \
          {} MB (and as much on the card); their 4 MiB cells: {} MB; held by descriptor slots alone and not asked for \
-         in 30 s: {} {} MB; title buffers' copies: {} {} MB, of them {} CPU sides of copies on the card {} MB; list \
-         scratch {} MB ({} MB spare); texture staging {} MB ({} MB spare); the PC has {} MB available; the card: {}; \
-         VICTORY_TIGHT_MEMORY {}",
+         in 30 s: {} {} MB; title buffers' copies: {} {} MB, of them {} CPU sides of copies on the card {} MB; CPU \
+         sides in plain (swappable) memory: {} {} MB, sent through upload chunks {} MB now, {} MB at most, {} waits \
+         for a full ring; list scratch {} MB ({} MB spare); texture staging {} MB ({} MB spare); the PC has {} MB \
+         available; the card: {}; VICTORY_TIGHT_MEMORY {}",
         mb(held.pc_bytes()),
         held.windows_pc[0],
         mb(held.windows_pc[1]),
@@ -166,6 +178,11 @@ pub(crate) fn text(
         mb(held.buffers[1]),
         held.buffers_card[0],
         mb(held.buffers_card[1]),
+        held.twins_plain[0],
+        mb(held.twins_plain[1]),
+        mb(held.twin_ring[0]),
+        mb(held.twin_ring[1]),
+        held.twin_ring[2],
         mb(pools[0]),
         mb(pools[1]),
         mb(pools[2]),
@@ -190,7 +207,8 @@ pub(crate) fn line() {
     {
         return;
     }
-    let held = crate::shadow::held();
+    let mut held = crate::shadow::held();
+    held.twin_ring = crate::host::twin_ring();
     let pools = [
         crate::host::ALIVE[2].load(Relaxed),
         crate::host::ALIVE[4].load(Relaxed),
@@ -216,7 +234,7 @@ pub(crate) fn say() {
             "VICTORY_TIGHT_MEMORY=1: defaults for a PC short of memory, where not set: VICTORY_WINDOW_KB={WINDOW_KB} \
              VICTORY_WINDOW_UPLOAD=1 VICTORY_CARD_WINDOWS_MB={CARD_WINDOWS_MB} (no windows on the card beside a copy \
              in the PC's memory) VICTORY_STAGING_POOL_MB={STAGING_SPARE_MB} VICTORY_SNAPSHOT_POOL_MB={SNAPSHOT_POOL_MB} \
-             VICTORY_TEXTURE_READ_KEEP_MB={TEXTURE_READ_KEEP_MB}; list scratch kept spare: {} MB",
+             VICTORY_TEXTURE_READ_KEEP_MB={TEXTURE_READ_KEEP_MB} VICTORY_CARD_TWIN_PLAIN=1; list scratch kept spare: {} MB",
             SCRATCH_SPARE >> 20
         );
     });
@@ -277,6 +295,8 @@ mod tests {
             windows_slot_idle: [1, 8 << 20],
             buffers: [5, 50 << 20],
             buffers_card: [1, 40 << 20],
+            twins_plain: [0; 3],
+            twin_ring: [0; 3],
         };
         // Upload heaps are the card's; a card window's CPU side and every
         // title buffer's copy (the CPU sides of card copies among them) are
@@ -300,5 +320,27 @@ mod tests {
         assert!(line.contains("4000 of 6000 MB in use"), "{line}");
         assert!(line.ends_with("VICTORY_TIGHT_MEMORY on"), "{line}");
         assert!(text(&Held::default(), [0; 4], 0, None, false).contains("the card: unknown"));
+    }
+
+    #[test]
+    fn plain_cpu_sides_are_not_counted_as_pinned() {
+        let held = Held {
+            windows_pc: [3, 30 << 20],
+            buffers: [5, 50 << 20],
+            buffers_card: [0, 0],
+            twins_plain: [2, 41 << 20, 40 << 20],
+            twin_ring: [8 << 20, 12 << 20, 3],
+            ..Held::default()
+        };
+        assert_eq!(held.pc_bytes(), (30 + 50 - 40) << 20);
+        let line = text(&held, [0; 4], 0, None, true);
+        assert!(line.contains("of them 0 CPU sides of copies on the card 0 MB"), "{line}");
+        assert!(
+            line.contains("CPU sides in plain (swappable) memory: 2 41 MB, sent through upload chunks 8 MB now, 12 MB at most, 3 waits"),
+            "{line}"
+        );
+        // Never below nothing, whatever the counts' moments.
+        let odd = Held { twins_plain: [1, 1 << 20, 1 << 20], ..Held::default() };
+        assert_eq!(odd.pc_bytes(), 0);
     }
 }

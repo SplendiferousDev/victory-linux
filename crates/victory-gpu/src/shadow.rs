@@ -85,10 +85,10 @@ pub(crate) struct Shadow {
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
 /// shaders see.
 struct Card {
-    /// The CPU's side, in the PC's memory: what `data` maps. Title memory
-    /// is copied into it as into any copy, and what changed in it goes to
-    /// the card's side before the next submission.
-    staging: ID3D12Resource,
+    /// The CPU's side, in the PC's memory: what `data` points at. Title
+    /// memory is copied into it as into any copy, and what changed in it
+    /// goes to the card's side before the next submission.
+    cpu: Side,
     /// The card side's bytes as they were when the submission's shaders
     /// started, in the card's memory too: made when shader writes are
     /// first declared for the copy, and compared with the card's side, on
@@ -104,6 +104,154 @@ struct Card {
     sent: Mutex<Vec<(usize, usize, u64)>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
+}
+
+/// Where a card copy's CPU side is.
+enum Side {
+    /// A buffer in the PC's memory that the driver pins (mapped by `data`),
+    /// which the card copies from: the usual.
+    Buffer(ID3D12Resource),
+    /// Plain memory of the process ([`plain_twins`]): the changed ranges go
+    /// up through upload chunks (`Host::card_before`).
+    Plain(Plain),
+}
+
+/// A card copy's CPU side in plain memory of the process
+/// ([`plain_twins`]): committed on first touch, swappable, given back
+/// when the copy goes.
+struct Plain {
+    at: *mut u8,
+    size: usize,
+    /// The bytes of title memory the copy holds (counted as [`LIVE`] counts
+    /// them), and whether it is a window outside buffers.
+    len: u64,
+    window: bool,
+}
+
+/// Card copies' CPU sides in plain memory ([`plain_twins`]), of title
+/// buffers and of windows: (copies, bytes, bytes of title memory).
+static PLAIN: [[AtomicU64; 3]; 2] = [const { [const { AtomicU64::new(0) }; 3] }; 2];
+
+impl Plain {
+    /// `size` bytes of zeros (as a new buffer holds), `None` if the
+    /// process has no room.
+    fn new(size: u64, len: u64, window: bool) -> Option<Plain> {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        let size = usize::try_from(size).ok()?;
+        // SAFETY: a plain allocation of our own.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) }.cast::<u8>();
+        if at.is_null() {
+            tracing::warn!(size, "no plain memory for a card copy's CPU side; it takes a buffer in the PC's memory");
+            return None;
+        }
+        let counts = &PLAIN[usize::from(window)];
+        counts[0].fetch_add(1, Ordering::Relaxed);
+        counts[1].fetch_add(size as u64, Ordering::Relaxed);
+        counts[2].fetch_add(len, Ordering::Relaxed);
+        Some(Plain { at, size, len, window })
+    }
+}
+
+impl Drop for Plain {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+        // SAFETY: our own allocation; the copy holding it is going, and the
+        // card never reads it (its bytes went up through chunks).
+        unsafe { VirtualFree(self.at.cast(), 0, MEM_RELEASE) };
+        let counts = &PLAIN[usize::from(self.window)];
+        counts[0].fetch_sub(1, Ordering::Relaxed);
+        counts[1].fetch_sub(self.size as u64, Ordering::Relaxed);
+        counts[2].fetch_sub(self.len, Ordering::Relaxed);
+    }
+}
+
+/// For the memory line: card copies' CPU sides in plain memory, title
+/// buffers' and windows' together: copies, bytes, bytes of title memory;
+/// and of them the title buffers' copies and bytes.
+pub(crate) fn plain_held() -> ([u64; 3], [u64; 2]) {
+    let get = |k: usize, i: usize| PLAIN[k][i].load(Ordering::Relaxed);
+    ([get(0, 0) + get(1, 0), get(0, 1) + get(1, 1), get(0, 2) + get(1, 2)], [get(0, 0), get(0, 1)])
+}
+
+/// Whether the CPU side of a copy in the card's memory ([`cards`]) is plain
+/// memory of the process instead of a buffer in the PC's memory
+/// (`VICTORY_CARD_TWIN_PLAIN=1`; `VICTORY_TIGHT_MEMORY=1` turns it on unless
+/// it is set; off by default). Read when a copy is made.
+///
+/// The CPU side only takes title memory and is compared with what the card
+/// wrote; nothing on the card reads it but the copy of its changed ranges
+/// to the card's side before each submission. As a buffer in the PC's
+/// memory it is memory the driver pins, as big as the card's side (some
+/// 660 MB in a world), never swapped however cold. In plain memory the
+/// system may swap or compress its cold pages, and the changed ranges go
+/// up through upload chunks of the list scratch pool, at most
+/// [`twin_ring_most`] bytes of them a submission
+/// (`Host::card_before`): one more copy on the CPU for every byte sent.
+///
+/// Not with the title bytes sent up on a copy queue (`VICTORY_QUEUE2` bit
+/// 2), which copies from the pinned side: the switch is refused then, and
+/// says so.
+pub(crate) fn plain_twins() -> bool {
+    #[cfg(test)]
+    match PLAIN_FORCED.load(Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = crate::tight::flag(std::env::var("VICTORY_CARD_TWIN_PLAIN").ok().as_deref(), crate::tight::on());
+        if !on {
+            return false;
+        }
+        if crate::queue2::bits() & 2 != 0 {
+            tracing::warn!(
+                "VICTORY_CARD_TWIN_PLAIN: refused, the title bytes go up on a copy queue (VICTORY_QUEUE2 bit 2), which reads \
+                 the CPU sides as buffers; card copies keep their CPU sides in the PC's pinned memory"
+            );
+            return false;
+        }
+        tracing::info!(
+            "VICTORY_CARD_TWIN_PLAIN=1: the CPU sides of copies in the card's memory are plain (swappable) memory; their \
+             changed ranges go up through upload chunks, at most {} MB a submission (VICTORY_CARD_TWIN_RING_MB)",
+            twin_ring_most() >> 20
+        );
+        true
+    })
+}
+
+/// Tests: [`plain_twins`] forced off (1) or on (2); 0 the switch.
+#[cfg(test)]
+pub(crate) static PLAIN_FORCED: AtomicU8 = AtomicU8::new(0);
+
+/// Tests: [`twin_ring_most`] in bytes; 0 the switch.
+#[cfg(test)]
+pub(crate) static TWIN_RING_FORCED: AtomicU64 = AtomicU64::new(0);
+
+/// The most bytes of upload chunks one submission's send of plain CPU sides
+/// holds (`VICTORY_CARD_TWIN_RING_MB`, 64): past it the send so far is
+/// run, waited for, and the chunks are filled again ([`plain_twins`]).
+pub(crate) fn twin_ring_most() -> u64 {
+    #[cfg(test)]
+    if let forced @ 1.. = TWIN_RING_FORCED.load(Ordering::Relaxed) {
+        return forced;
+    }
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| crate::tight::env_number("VICTORY_CARD_TWIN_RING_MB", 64, 64).max(4) << 20)
+}
+
+/// A copy's CPU side for a card copy of `size` bytes (`len` of title
+/// memory): plain memory with [`plain_twins`], else a buffer in the PC's
+/// memory. The side and where its bytes are.
+fn card_side(size: u64, len: u64, window: bool) -> Option<(Side, *mut u8)> {
+    if plain_twins()
+        && let Some(plain) = Plain::new(size, len, window)
+    {
+        let at = plain.at;
+        return Some((Side::Plain(plain), at));
+    }
+    let (buffer, data) = host()?.shared_buffer(size)?;
+    Some((Side::Buffer(buffer), data))
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -123,9 +271,9 @@ struct Card {
 ///
 /// With the switch, a title buffer of [`card_limits`]' size or more has two
 /// sides. Shaders see `Shadow::buffer`, in the card's memory. The CPU's
-/// side (`Card::staging`, what `Shadow::data` maps) takes title memory as
-/// before, and the ranges that changed in it are copied to the card's side
-/// before each submission (`Host::card_before`). What shaders wrote is
+/// side (`Card::cpu`, what `Shadow::data` points at; [`plain_twins`])
+/// takes title memory as before, and the ranges that changed in it are
+/// copied to the card's side before each submission (`Host::card_before`). What shaders wrote is
 /// found on the card: after the submission's lists a compute pass of ours
 /// compares each declared range, by 64 KiB piece, with the card side's
 /// bytes from before (`Card::before`), and only the pieces that differ are
@@ -2818,7 +2966,14 @@ pub(crate) fn held() -> crate::tight::Held {
     // (Counted without taking a reference: the last one dropped here would
     // free the buffer outside `crate::host::retire`.)
     let carded = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|w| w.strong_count() > 0).count() as u64;
-    held.buffers_card = [carded.saturating_sub(held.windows_card[0]), CARD_BYTES[0].load(Ordering::Relaxed)];
+    // CPU sides in plain memory (`plain_twins`) are not pinned: only the
+    // others are counted as the PC's.
+    let (plain, plain_buffers) = plain_held();
+    held.buffers_card = [
+        carded.saturating_sub(held.windows_card[0]).saturating_sub(plain_buffers[0]),
+        CARD_BYTES[0].load(Ordering::Relaxed).saturating_sub(plain_buffers[1]),
+    ];
+    held.twins_plain = plain;
     held
 }
 
@@ -3901,12 +4056,33 @@ impl Shadow {
         }
     }
 
-    /// Of a copy in the card's memory: the CPU's side (PC memory), the
-    /// card side's bytes from before if made yet, and their size.
-    pub(crate) fn card_sides(&self) -> Option<(&ID3D12Resource, Option<ID3D12Resource>, u64)> {
+    /// Of a copy in the card's memory: the CPU's side as a buffer in the PC's
+    /// memory (`None` where it is plain memory, [`plain_twins`]: see
+    /// [`Shadow::plain_side`]), the card side's bytes from before if made
+    /// yet, and their size.
+    pub(crate) fn card_sides(&self) -> Option<(Option<&ID3D12Resource>, Option<ID3D12Resource>, u64)> {
         let card = self.card.as_ref()?;
         let before = card.before.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        Some((&card.staging, before, card.size))
+        let buffer = match &card.cpu {
+            Side::Buffer(buffer) => Some(buffer),
+            Side::Plain(_) => None,
+        };
+        Some((buffer, before, card.size))
+    }
+
+    /// Of a copy in the card's memory whose CPU side is plain memory
+    /// ([`plain_twins`]): the bytes `[from, to)` of that side (cut to it),
+    /// for the send to the card's side. Read on the submitting thread, which
+    /// is the one that writes them; what the relay's merge writes there
+    /// lies outside the ranges still to go up (`Shadow::card_merge_relay`).
+    pub(crate) fn plain_side(&self, from: usize, to: usize) -> Option<&[u8]> {
+        let Side::Plain(plain) = &self.card.as_ref()?.cpu else {
+            return None;
+        };
+        let to = to.min(plain.size);
+        let from = from.min(to);
+        // SAFETY: inside our allocation, alive as long as `self`.
+        Some(unsafe { std::slice::from_raw_parts(plain.at.add(from), to - from) })
     }
 
     /// The bytes of the copy the card's hashes cover: with
@@ -4291,28 +4467,53 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
-        let (buffer, data) = host()?.shared_buffer(size)?;
-        crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
-        // A big one, with `cards`: shaders get a buffer in the card's own
-        // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
-            Some(on_card) => {
-                crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
-                tracing::info!(
-                    start = format_args!("{:#x}", key.0),
-                    len,
-                    "a buffer's host copy is in the card's memory"
-                );
-                let card = Card {
-                    staging: buffer,
-                    before: Mutex::default(),
-                    dirty: Mutex::default(),
-                    sent: Mutex::default(),
-                    size,
-                };
-                (on_card, Some(card))
+        // With plain CPU sides (`plain_twins`) the card is asked first: a
+        // copy there takes no buffer in the PC's memory at all.
+        let early = if plain_twins() { card_for(size) } else { None };
+        let (buffer, data, card) = if let Some(on_card) = early {
+            let Some((side, data)) = card_side(size, len, false) else {
+                CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+                return None;
+            };
+            crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
+            tracing::info!(
+                start = format_args!("{:#x}", key.0),
+                len,
+                "a buffer's host copy is in the card's memory"
+            );
+            let card = Card {
+                cpu: side,
+                before: Mutex::default(),
+                dirty: Mutex::default(),
+                sent: Mutex::default(),
+                size,
+            };
+            (on_card, data, Some(card))
+        } else {
+            let (buffer, data) = host()?.shared_buffer(size)?;
+            crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
+            // A big one, with `cards`: shaders get a buffer in the card's own
+            // memory, and the one just made is the CPU's side.
+            let on_card = if plain_twins() { None } else { card_for(size) };
+            match on_card {
+                Some(on_card) => {
+                    crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
+                    tracing::info!(
+                        start = format_args!("{:#x}", key.0),
+                        len,
+                        "a buffer's host copy is in the card's memory"
+                    );
+                    let card = Card {
+                        cpu: Side::Buffer(buffer),
+                        before: Mutex::default(),
+                        dirty: Mutex::default(),
+                        sent: Mutex::default(),
+                        size,
+                    };
+                    (on_card, data, Some(card))
+                }
+                None => (buffer, data, None),
             }
-            None => (buffer, None),
         };
         placed_count(size, card.is_some());
         // SAFETY: a live buffer.
@@ -4528,23 +4729,43 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
-    let (buffer, data) = host()?.shared_buffer(len)?;
-    crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
-    // With room for windows on the card (`window_card_most`): shaders get a
-    // buffer there, and the one just made is the CPU's side.
-    let (buffer, card) = match window_card_for(len) {
-        Some(on_card) => {
-            crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
-            let card = Card {
-                staging: buffer,
-                before: Mutex::default(),
-                dirty: Mutex::default(),
-                sent: Mutex::default(),
-                size: len,
-            };
-            (on_card, Some(card))
+    // With plain CPU sides (`plain_twins`) the card is asked first: a
+    // window there takes no buffer in the PC's memory at all.
+    let early = if plain_twins() { window_card_for(len) } else { None };
+    let (buffer, data, card) = if let Some(on_card) = early {
+        let Some((side, data)) = card_side(len, len, true) else {
+            WINDOW_CARD_BYTES.fetch_sub(len, Ordering::Relaxed);
+            return None;
+        };
+        crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
+        let card = Card {
+            cpu: side,
+            before: Mutex::default(),
+            dirty: Mutex::default(),
+            sent: Mutex::default(),
+            size: len,
+        };
+        (on_card, data, Some(card))
+    } else {
+        let (buffer, data) = host()?.shared_buffer(len)?;
+        crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
+        // With room for windows on the card (`window_card_most`): shaders get a
+        // buffer there, and the one just made is the CPU's side.
+        let on_card = if plain_twins() { None } else { window_card_for(len) };
+        match on_card {
+            Some(on_card) => {
+                crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
+                let card = Card {
+                    cpu: Side::Buffer(buffer),
+                    before: Mutex::default(),
+                    dirty: Mutex::default(),
+                    sent: Mutex::default(),
+                    size: len,
+                };
+                (on_card, data, Some(card))
+            }
+            None => (buffer, data, None),
         }
-        None => (buffer, None),
     };
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -4749,7 +4970,7 @@ mod window_tests {
 
 #[cfg(test)]
 mod card_merge_tests {
-    use super::{Card, Shadow};
+    use super::{Card, Shadow, Side};
     use std::sync::Mutex;
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
     use windows::Win32::Graphics::Direct3D12::*;
@@ -4815,7 +5036,7 @@ mod card_merge_tests {
             side[title_byte] = title[title_byte];
             let mut shadow = Shadow::new(buffer.clone(), side.as_mut_ptr(), 0, title.as_ptr() as u64, LEN as u64);
             shadow.card = Some(Card {
-                staging: staging.clone(),
+                cpu: Side::Buffer(staging.clone()),
                 before: Mutex::new(None),
                 dirty: Mutex::default(),
                 sent: Mutex::new(vec![(title_byte, title_byte + 1, 7)]),

@@ -1608,6 +1608,100 @@ struct CardWork {
     /// The fetch inside flights ([`inflight_fetch`]), if it is on and was
     /// made.
     inflight: Option<CardInflight>,
+    /// For sends of plain CPU sides past a full ring
+    /// (`crate::shadow::plain_twins`): a fence, its event and the last
+    /// value signalled. Made on the first such send.
+    twin_wait: Option<(ID3D12Fence, HANDLE, u64)>,
+}
+
+/// Upload chunks of the list scratch pool held by sends of plain CPU sides
+/// (`crate::shadow::plain_twins`): bytes now, the most since the last
+/// memory line, waits for a full ring since then.
+static TWIN_RING: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// For the memory line (`crate::tight::line`): [`TWIN_RING`], the most and
+/// the waits taken.
+pub(crate) fn twin_ring() -> [u64; 3] {
+    let now = TWIN_RING[0].load(Ordering::Relaxed);
+    [now, TWIN_RING[1].swap(now, Ordering::Relaxed).max(now), TWIN_RING[2].swap(0, Ordering::Relaxed)]
+}
+
+/// Where a send of plain CPU sides puts its next bytes
+/// ([`twin_ring_place`]).
+#[derive(Debug, PartialEq, Eq)]
+enum RingPlace {
+    /// In chunk `chunk` from offset `at`, `n` bytes (at most those asked).
+    Here { chunk: usize, at: u64, n: u64 },
+    /// No room in the chunks held: take another.
+    Take,
+    /// No room, and `most` chunks are held: run what was recorded, wait
+    /// for it, and fill the chunks again from the first.
+    Full,
+}
+
+/// Where `len` more bytes of a send go in a ring of `held` chunks of
+/// `chunk` bytes, of which chunk `current` is filled up to `used` (those
+/// before it are full); at most `most` chunks. Pieces start on 256 bytes.
+fn twin_ring_place(held: usize, most: usize, current: usize, used: u64, chunk: u64, len: u64) -> RingPlace {
+    let at = used.next_multiple_of(256);
+    if current < held && at < chunk {
+        return RingPlace::Here { chunk: current, at, n: len.min(chunk - at) };
+    }
+    if current + 1 < held {
+        return RingPlace::Here { chunk: current + 1, at: 0, n: len.min(chunk) };
+    }
+    if held < most.max(1) { RingPlace::Take } else { RingPlace::Full }
+}
+
+/// A send's upload chunks for plain CPU sides, held until its plan is done
+/// with (its lists have run): then given back to the pool.
+#[derive(Default)]
+struct TwinRing {
+    chunks: Vec<(Chunk, u64)>,
+    current: usize,
+    used: u64,
+}
+
+impl TwinRing {
+    /// Room for up to `len` bytes: the chunk's buffer, the offset in it,
+    /// where it is mapped there, and the bytes. `Ok(None)`: the ring is
+    /// full ([`RingPlace::Full`]); `Err`: no memory for a chunk.
+    fn place(&mut self, host: &Host, len: u64) -> Result<Option<(ID3D12Resource, u64, *mut u8, u64)>, ()> {
+        let most = (crate::shadow::twin_ring_most() / SCRATCH_CHUNK).max(1) as usize;
+        loop {
+            match twin_ring_place(self.chunks.len(), most, self.current, self.used, SCRATCH_CHUNK, len) {
+                RingPlace::Here { chunk, at, n } => {
+                    (self.current, self.used) = (chunk, at + n);
+                    let c = &self.chunks[chunk].0;
+                    return Ok(Some((c._buffer.clone(), at, (c.data + at as usize) as *mut u8, n)));
+                }
+                RingPlace::Take => {
+                    let chunk = take_chunk(host, SCRATCH_CHUNK).ok_or(())?;
+                    let now = TWIN_RING[0].fetch_add(SCRATCH_CHUNK, Ordering::Relaxed) + SCRATCH_CHUNK;
+                    TWIN_RING[1].fetch_max(now, Ordering::Relaxed);
+                    if self.chunks.is_empty() {
+                        (self.current, self.used) = (0, 0);
+                    }
+                    self.chunks.push((chunk, SCRATCH_CHUNK));
+                }
+                RingPlace::Full => return Ok(None),
+            }
+        }
+    }
+
+    /// What was recorded from the chunks has run: they are filled again
+    /// from the first.
+    fn rewind(&mut self) {
+        (self.current, self.used) = (0, 0);
+    }
+}
+
+impl Drop for TwinRing {
+    fn drop(&mut self) {
+        let bytes: u64 = self.chunks.iter().map(|c| c.1).sum();
+        TWIN_RING[0].fetch_sub(bytes, Ordering::Relaxed);
+        give_chunks(std::mem::take(&mut self.chunks));
+    }
 }
 
 /// What the fetch inside flights needs ([`inflight_fetch`], [`CARD_FETCH`]).
@@ -1922,6 +2016,9 @@ struct CardPlan {
     /// The `CardInflight::landed` its [`CARD_FETCH`] was told: which of its
     /// tickets got a slot ([`inflight_gets_slot`]).
     inflight_landed: u32,
+    /// The upload chunks the send of plain CPU sides copied from
+    /// (`crate::shadow::plain_twins`), alive until the submission has run.
+    _twin: TwinRing,
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -4017,6 +4114,7 @@ impl Host {
                 taken: 0,
                 out: 0,
                 inflight: if inflight_fetch() { self.make_card_inflight(RESULTS) } else { None },
+                twin_wait: None,
             })
         }
     }
@@ -4189,7 +4287,11 @@ impl Host {
         // ranges, once the direct queue has waited. `None`: straight from
         // the PC's memory on the direct queue, as before.
         let mut landed: Option<ID3D12Resource> = None;
-        if let Some(second) = crate::queue2::second().filter(|s| s.uploads()) {
+        // (Not with CPU sides in plain memory, `crate::shadow::plain_twins`,
+        // which refuses the copy queue's sends: the copy queue reads the
+        // CPU sides as buffers.)
+        let plain = dirty.iter().any(|(shadow, _)| shadow.card_sides().is_some_and(|(cpu, _, _)| cpu.is_none()));
+        if !plain && let Some(second) = crate::queue2::second().filter(|s| s.uploads()) {
             let bytes: u64 = dirty
                 .iter()
                 .filter(|(shadow, _)| shadow.carded())
@@ -4209,7 +4311,7 @@ impl Host {
                         let copy = second.up.list()?;
                         let mut at = 0u64;
                         for (shadow, ranges) in &dirty {
-                            let Some((staging, _, _)) = shadow.card_sides() else {
+                            let Some((Some(staging), _, _)) = shadow.card_sides() else {
                                 continue;
                             };
                             for &(a, b) in ranges {
@@ -4231,11 +4333,14 @@ impl Host {
                 landed = Some(landing);
             }
         }
+        // The upload chunks plain CPU sides go up through.
+        let mut ring = TwinRing::default();
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
             };
             let (allocator, list) = &sync;
+            let twin_wait = &mut work.twin_wait;
             // SAFETY: the list's last run finished (it ran ahead of a
             // submission that was waited for, and came back after that);
             // live buffers, and the ranges lie in them.
@@ -4243,9 +4348,10 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    let timed = crate::cardmeter::begin(list, crate::cardmeter::Kind::Sync);
+                    let mut timed = crate::cardmeter::begin(list, crate::cardmeter::Kind::Sync);
                     #[cfg(feature = "diagnostics")]
-                    let shot_span = crate::shot::span_begin(list);
+                    #[allow(unused_mut)]
+                    let mut shot_span = crate::shot::span_begin(list);
                     // Where the next range lies in the landing buffer.
                     let mut at = 0u64;
                     for (shadow, ranges) in &dirty {
@@ -4253,9 +4359,57 @@ impl Host {
                             continue;
                         };
                         for &(a, b) in ranges {
-                            match &landed {
-                                Some(landing) => list.CopyBufferRegion(&shadow.buffer, a as u64, landing, at, (b - a) as u64),
-                                None => list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64),
+                            match (&landed, staging) {
+                                (Some(landing), _) => list.CopyBufferRegion(&shadow.buffer, a as u64, landing, at, (b - a) as u64),
+                                (None, Some(staging)) => list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64),
+                                // A CPU side in plain memory: its bytes into
+                                // the ring's chunks now, and from there to
+                                // the card's side.
+                                (None, None) => {
+                                    let mut from = a;
+                                    while from < b {
+                                        let placed = ring.place(self, (b - from) as u64).map_err(|()| windows::core::Error::empty())?;
+                                        let Some((chunk, offset, mapped, n)) = placed else {
+                                            // The ring is full: what was
+                                            // recorded runs, is waited for,
+                                            // and the chunks are filled again.
+                                            crate::cardmeter::end(list, timed);
+                                            #[cfg(feature = "diagnostics")]
+                                            crate::shot::span_end(list, shot_span, 0, || {
+                                                "SYNC LIST (changed bytes go up to the card's copies; a full ring of plain CPU sides)".to_string()
+                                            });
+                                            list.Close()?;
+                                            self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                                            if twin_wait.is_none() {
+                                                let fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+                                                let event = CreateEventW(None, false, false, None)?;
+                                                *twin_wait = Some((fence, event, 0));
+                                            }
+                                            let Some((fence, event, value)) = twin_wait.as_mut() else {
+                                                return Err(windows::core::Error::empty());
+                                            };
+                                            *value += 1;
+                                            self.queue.Signal(&*fence, *value)?;
+                                            fence.SetEventOnCompletion(*value, *event)?;
+                                            WaitForSingleObject(*event, INFINITE);
+                                            TWIN_RING[2].fetch_add(1, Ordering::Relaxed);
+                                            ring.rewind();
+                                            allocator.Reset()?;
+                                            list.Reset(allocator, None)?;
+                                            timed = crate::cardmeter::begin(list, crate::cardmeter::Kind::Sync);
+                                            #[cfg(feature = "diagnostics")]
+                                            {
+                                                shot_span = crate::shot::span_begin(list);
+                                            }
+                                            continue;
+                                        };
+                                        let bytes = shadow.plain_side(from, from + n as usize).unwrap_or_default();
+                                        debug_assert_eq!(bytes.len(), n as usize);
+                                        std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped, bytes.len());
+                                        list.CopyBufferRegion(&shadow.buffer, from as u64, &chunk, offset, bytes.len() as u64);
+                                        from += n as usize;
+                                    }
+                                }
                             }
                             at += (b - a) as u64;
                             crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
@@ -4320,6 +4474,7 @@ impl Host {
             sent_as,
             inflight: false,
             inflight_landed: 0,
+            _twin: ring,
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
@@ -9291,5 +9446,236 @@ void main() {
             }
         }
         drop((a, b, trial));
+    }
+}
+
+/// Where the send of plain CPU sides puts its bytes (`twin_ring_place`):
+/// every byte of every range once, no piece across a chunk's end, pieces on
+/// 256 bytes, and no more chunks than the most.
+#[cfg(test)]
+mod twin_ring_tests {
+    use super::{RingPlace, twin_ring_place};
+
+    /// Lays `ranges` into a ring as `TwinRing::place` does, without memory:
+    /// the pieces (range, offset in it, chunk, offset in the chunk, bytes)
+    /// in order, the chunks taken, and the times the ring was full.
+    fn lay(ranges: &[(u64, u64)], chunk: u64, most: usize) -> (Vec<(usize, u64, usize, u64, u64)>, usize, usize) {
+        let (mut held, mut current, mut used, mut full) = (0usize, 0usize, 0u64, 0usize);
+        let mut pieces = Vec::new();
+        for (r, &(a, b)) in ranges.iter().enumerate() {
+            let mut from = a;
+            while from < b {
+                match twin_ring_place(held, most, current, used, chunk, b - from) {
+                    RingPlace::Here { chunk: c, at, n } => {
+                        assert!(n > 0);
+                        (current, used) = (c, at + n);
+                        pieces.push((r, from - a, c, at, n));
+                        from += n;
+                    }
+                    RingPlace::Take => {
+                        if held == 0 {
+                            (current, used) = (0, 0);
+                        }
+                        held += 1;
+                    }
+                    RingPlace::Full => {
+                        full += 1;
+                        (current, used) = (0, 0);
+                    }
+                }
+            }
+        }
+        (pieces, held, full)
+    }
+
+    #[test]
+    fn every_byte_goes_once_and_no_piece_crosses_a_chunk() {
+        let chunk = 4u64 << 20;
+        let cases: [&[(u64, u64)]; 4] = [
+            &[(0, 1)],
+            &[(0, chunk)],
+            &[(100, 200), (300, 3 * chunk + 17), (5 * chunk, 5 * chunk + 4)],
+            &[(0, 10 * chunk + 1)],
+        ];
+        for most in [1usize, 2, 3, 16] {
+            for ranges in cases {
+                let (pieces, held, _) = lay(ranges, chunk, most);
+                assert!(held <= most && held >= 1, "{ranges:?} most {most}: {held} chunks");
+                for (r, &(a, b)) in ranges.iter().enumerate() {
+                    let mut at = 0;
+                    for &(_, off, _, _, n) in pieces.iter().filter(|p| p.0 == r) {
+                        assert_eq!(off, at, "{ranges:?}: a gap or overlap in range {r}");
+                        at += n;
+                    }
+                    assert_eq!(at, b - a, "{ranges:?}: range {r} not covered");
+                }
+                for &(_, _, c, at, n) in &pieces {
+                    assert!(c < held && at % 256 == 0 && at + n <= chunk, "{ranges:?}: piece {c} {at} {n}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_full_ring_comes_round_only_at_its_most() {
+        let chunk = 1u64 << 20;
+        // 5 MiB through 2 chunks: full after 2 and 4 MiB.
+        let (_, held, full) = lay(&[(0, 5 << 20)], chunk, 2);
+        assert_eq!((held, full), (2, 2));
+        // Within the most it never is.
+        let (_, held, full) = lay(&[(0, 5 << 20)], chunk, 8);
+        assert_eq!((held, full), (5, 0));
+        // Small ranges share a chunk, each on 256 bytes.
+        let (pieces, held, full) = lay(&[(0, 10), (20, 30), (1000, 1300)], chunk, 4);
+        assert_eq!((held, full), (1, 0));
+        let ats: Vec<u64> = pieces.iter().map(|p| p.3).collect();
+        assert_eq!(ats, vec![0, 256, 512]);
+        // A chunk filled to its end: the next piece goes to the next chunk.
+        assert_eq!(twin_ring_place(2, 4, 0, chunk, chunk, 8), RingPlace::Here { chunk: 1, at: 0, n: 8 });
+        assert_eq!(twin_ring_place(2, 4, 1, chunk - 100, chunk, 8), RingPlace::Take);
+        assert_eq!(twin_ring_place(4, 4, 3, chunk, chunk, 8), RingPlace::Full);
+        // Most 0 is taken as 1.
+        assert_eq!(twin_ring_place(0, 0, 0, 0, chunk, 8), RingPlace::Take);
+    }
+}
+
+/// A copy in the card's memory with its CPU side in plain memory
+/// (`crate::shadow::plain_twins`), on whatever adapter the host has: the
+/// title's bytes go up through a ring smaller than the first send (so it
+/// comes round), a shader reads them on the card and writes elsewhere in
+/// the copy, and what it wrote comes back to title memory; nothing else
+/// moves.
+#[cfg(test)]
+mod plain_twin_tests {
+    use super::*;
+
+    /// `memory[to] = memory[from] + add`.
+    const ADD: &str = r#"
+#define RS "RootConstants(num32BitConstants=3, b0), UAV(u0)"
+cbuffer What : register(b0) { uint to; uint from; uint add; };
+RWByteAddressBuffer memory : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    memory.Store(to, memory.Load(from) + add);
+}
+"#;
+
+    #[test]
+    fn plain_cpu_sides_go_up_through_the_ring_and_shader_writes_come_back() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+        let Some(host) = host() else {
+            return;
+        };
+        if !crate::shadow::cards() {
+            eprintln!("plain_twin_tests: skipped, copies in the card's memory are off (VICTORY_CARD_BUFFERS=0)");
+            return;
+        }
+        const PIECE: usize = 64 << 10;
+        // 12 MiB through a ring of one 4 MiB chunk: the first send comes
+        // round twice.
+        const LEN: usize = 12 << 20;
+        const ROUNDS: usize = 12;
+        // SAFETY: a plain allocation of our own.
+        let title = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as *mut u8;
+        assert!(!title.is_null());
+        let dword = |at: usize| unsafe { title.add(at).cast::<u32>() };
+        let pattern = |i: usize| 0x3C00_0000 ^ (i as u32).wrapping_mul(0x9E37_79B9);
+        for i in 0..LEN / 4 {
+            // SAFETY: inside the allocation.
+            unsafe { dword(i * 4).write_volatile(pattern(i)) };
+        }
+        crate::shadow::PLAIN_FORCED.store(2, Ordering::Relaxed);
+        crate::shadow::TWIN_RING_FORCED.store(SCRATCH_CHUNK, Ordering::Relaxed);
+        crate::shadow::register(0x71_7171, title as u64, LEN as u64);
+        let shadow = crate::shadow::find(title as u64, LEN as u64).expect("a host copy");
+        crate::shadow::PLAIN_FORCED.store(0, Ordering::Relaxed);
+        if !shadow.carded() {
+            crate::shadow::TWIN_RING_FORCED.store(0, Ordering::Relaxed);
+            eprintln!("plain_twin_tests: skipped, the copy is not in the card's memory (no room, or no compare shader)");
+            return;
+        }
+        assert!(
+            shadow.card_sides().is_some_and(|(cpu, _, _)| cpu.is_none()),
+            "the copy's CPU side is a buffer, not plain memory"
+        );
+        let (plain, _) = crate::shadow::plain_held();
+        assert!(plain[0] >= 1 && plain[1] >= LEN as u64, "plain memory not counted: {plain:?}");
+        let code = compile(ADD, windows::core::s!("main"), windows::core::s!("cs_5_1")).expect("the test's shader");
+        // SAFETY: the shader's own root signature; plain creation.
+        let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code).expect("a root signature");
+            let pso = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.as_ptr().cast(),
+                        BytecodeLength: code.len(),
+                    },
+                    ..Default::default()
+                })
+                .expect("a pipeline");
+            (root, pso)
+        };
+        let waits_before = TWIN_RING[2].load(Ordering::Relaxed);
+        // Round k: the title writes a dword spread over the whole copy (in
+        // each 4 MiB of it); the shader adds k and stores the sum in a
+        // declared piece near the end.
+        let from = |k: usize| (1 + k * 15) * PIECE + 4 * k + 64;
+        let to = |k: usize| (170 + k) * PIECE + 8 * k + 128;
+        let titles = |k: usize| 0x0200_0000 + 0x1000 * k as u32 + 9;
+        let mut lists = Vec::new();
+        for k in 0..ROUNDS {
+            // SAFETY: inside the allocation.
+            unsafe { dword(from(k)).write_volatile(titles(k)) };
+            let list = host.new_list().expect("a host list");
+            shadow.refresh(&list, title as u64, LEN as u64);
+            shadow.gpu_writes(&list, (title as usize + (170 + k) * PIECE) as u64, PIECE as u64);
+            // SAFETY: an open list; the copy's buffer, with unordered
+            // access; the shader's own root signature.
+            unsafe {
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetPipelineState(&pso);
+                let constants = [to(k) as u32, from(k) as u32, k as u32];
+                list.list.SetComputeRoot32BitConstants(0, 3, constants.as_ptr().cast(), 0);
+                list.list.SetComputeRootUnorderedAccessView(1, shadow.buffer.GetGPUVirtualAddress());
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.close();
+            if late() {
+                host.execute_own(&list);
+            } else {
+                host.execute(&[&list]);
+            }
+            lists.push(list);
+        }
+        settle_now(WHY_SYNC);
+        crate::shadow::TWIN_RING_FORCED.store(0, Ordering::Relaxed);
+        let waits = TWIN_RING[2].load(Ordering::Relaxed) - waits_before;
+        eprintln!("plain_twin_tests: {waits} waits for a full ring (late {}, relay {})", late(), relay());
+        assert!(waits >= 2, "the first send of 12 MiB through a 4 MiB ring did not come round: {waits} waits");
+        for k in 0..ROUNDS {
+            // SAFETY: inside the allocation.
+            let (sum, kept) = unsafe { (dword(to(k)).read_volatile(), dword(from(k)).read_volatile()) };
+            assert_eq!(kept, titles(k), "round {k}: the title's own dword changed");
+            assert_eq!(
+                sum,
+                titles(k) + k as u32,
+                "round {k}: the shader read {:#x} where the title had written {:#x}, or its write did not come back",
+                sum.wrapping_sub(k as u32),
+                titles(k)
+            );
+        }
+        let touched: std::collections::HashSet<usize> = (0..ROUNDS).flat_map(|k| [from(k), to(k)]).collect();
+        for i in (0..LEN / 4).filter(|i| !touched.contains(&(i * 4))) {
+            // SAFETY: inside the allocation.
+            let got = unsafe { dword(i * 4).read_volatile() };
+            assert_eq!(got, pattern(i), "dword {i} of title memory changed");
+        }
+        // (The title's buffer stays registered, as the other tests leave
+        // theirs, and its memory with it.)
+        drop(lists);
     }
 }
