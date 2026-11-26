@@ -269,6 +269,18 @@ Verified on a machine with 16 GB of RAM, an 8 GB card and an NVIDIA driver:
   killed). Nothing we tried tunes this away; more RAM and a larger card are
   needed.
 
+Experimental: `VICTORY_TIGHT_MEMORY=1` changes defaults for a machine short of
+memory. The layer's host copies of title memory are buffers in system memory
+that the driver pins, so they never go to swap and the title's own memory is
+swapped in their place. The mode cuts those copies (the windows outside
+buffers) on a 1 MiB grid instead of 4 MiB, puts them into the card's memory
+through GPU upload heaps while the card has room (this needs resizable BAR), and
+keeps the spare pools small. Any of its switches that you set yourself keeps
+your value (`VICTORY_WINDOW_KB`, `VICTORY_WINDOW_UPLOAD`,
+`VICTORY_CARD_WINDOWS_MB`, `VICTORY_STAGING_POOL_MB`, `VICTORY_SNAPSHOT_POOL_MB`,
+`VICTORY_TEXTURE_READ_KEEP_MB`). Every build logs a line `memory of host
+copies ...` every 10 s showing what the copies hold and where.
+
 Not tested yet (do not rely on it): `vm.swappiness`, `vm.max_map_count` effects
 beyond avoiding the limit, transparent huge pages, `zswap` instead of zram,
 `MemoryHigh` values other than the ones above, an AMD card (different memory

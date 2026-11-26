@@ -385,7 +385,9 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
 fn window_card_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
+        // (`VICTORY_TIGHT_MEMORY=1`: windows go to GPU upload heaps up to
+        // the mode's most unless this is set.)
+        crate::tight::env_number("VICTORY_CARD_WINDOWS_MB", 0, crate::tight::CARD_WINDOWS_MB) << 20
     })
 }
 
@@ -413,7 +415,8 @@ static WINDOW_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
 /// memory as before.
 fn window_upload() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_UPLOAD").is_some_and(|v| v == "1"))
+    // `VICTORY_TIGHT_MEMORY=1` turns it on unless it is set.
+    *ON.get_or_init(|| crate::tight::flag(std::env::var("VICTORY_WINDOW_UPLOAD").ok().as_deref(), crate::tight::on()))
 }
 
 /// A window's buffer in a GPU upload heap and where it is mapped, if
@@ -436,6 +439,14 @@ fn window_upload_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
 /// A buffer in the card's memory for a window of `size` bytes, if it is to
 /// be there ([`window_card_most`]).
 fn window_card_for(size: u64) -> Option<ID3D12Resource> {
+    // `VICTORY_TIGHT_MEMORY=1`: a window the upload heaps did not take
+    // stays in the PC's memory alone (`crate::tight::plain_card_windows`).
+    static PLAIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*PLAIN.get_or_init(|| {
+        crate::tight::plain_card_windows(crate::tight::on(), std::env::var_os("VICTORY_CARD_WINDOWS_MB").is_some())
+    }) {
+        return None;
+    }
     if !window_card_room(size, "on the card:") {
         return None;
     }
@@ -1307,10 +1318,9 @@ fn pooled(n: usize) -> Vec<u8> {
 fn pool_most() -> usize {
     static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_SNAPSHOT_POOL_MB")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .map_or(512 << 20, |mb| mb.saturating_mul(1 << 20))
+        // (`VICTORY_TIGHT_MEMORY=1`: the mode's most unless this is set.)
+        let mb = crate::tight::env_number("VICTORY_SNAPSHOT_POOL_MB", 512, crate::tight::SNAPSHOT_POOL_MB);
+        usize::try_from(mb).unwrap_or(usize::MAX).saturating_mul(1 << 20)
     })
 }
 
@@ -2759,6 +2769,57 @@ pub(crate) fn let_go_idle() {
         // submission is running after all.
         crate::host::retire(shadow);
     }
+}
+
+/// For the memory line of every build (`crate::tight::line`): what the
+/// windows outside buffers and the title buffers' copies hold, by where.
+pub(crate) fn held() -> crate::tight::Held {
+    let mut held = crate::tight::Held::default();
+    let mut window_bytes = 0;
+    {
+        let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        // Each copy once: a window may stand under several keys.
+        let mut seen = std::collections::HashSet::new();
+        let mut cells = std::collections::BTreeSet::new();
+        for s in loose.values() {
+            if !seen.insert(Arc::as_ptr(s) as usize) {
+                continue;
+            }
+            let first = s.start / WINDOW;
+            cells.extend(first..(s.start + s.len).div_ceil(WINDOW));
+            if s.place.is_some() {
+                continue;
+            }
+            window_bytes += s.len;
+            let kind = if s.uploaded != 0 {
+                &mut held.windows_upload
+            } else if s.card.is_some() {
+                &mut held.windows_card
+            } else {
+                &mut held.windows_pc
+            };
+            kind[0] += 1;
+            kind[1] += s.len;
+            if Arc::strong_count(s) == 1
+                && crate::host::references(&s.buffer) > 1
+                && crate::host::long_ago(s.used.load(Ordering::Relaxed), 30_000, 0)
+            {
+                held.windows_slot_idle[0] += 1;
+                held.windows_slot_idle[1] += s.len;
+            }
+        }
+        held.windows_cells = cells.len() as u64 * WINDOW;
+    }
+    let windows = held.windows_pc[0] + held.windows_upload[0] + held.windows_card[0];
+    held.buffers = [
+        LIVE[0].load(Ordering::Relaxed).saturating_sub(windows),
+        LIVE[1].load(Ordering::Relaxed).saturating_sub(window_bytes),
+    ];
+    // (Counted without taking a reference: the last one dropped here would
+    // free the buffer outside `crate::host::retire`.)
+    let carded = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|w| w.strong_count() > 0).count() as u64;
+    held.buffers_card = [carded.saturating_sub(held.windows_card[0]), CARD_BYTES[0].load(Ordering::Relaxed)];
+    held
 }
 
 /// For the memory line: host copies alive and their bytes, of them the
@@ -4303,8 +4364,9 @@ const WINDOW: u64 = 4 << 20;
 fn window() -> u64 {
     static GRID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *GRID.get_or_init(|| {
-        let kb = std::env::var("VICTORY_WINDOW_KB").ok().and_then(|v| v.trim().parse::<u64>().ok());
-        grid(kb)
+        let kb = crate::tight::number(std::env::var("VICTORY_WINDOW_KB").ok().as_deref());
+        // `VICTORY_TIGHT_MEMORY=1`: a finer grid unless this is set.
+        grid(crate::tight::window_kb(kb, crate::tight::on()))
     })
 }
 
