@@ -664,7 +664,15 @@ pub(crate) fn save(now: bool) {
             size
         }
     };
-    let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
+    // `None` when nothing in this process asked for the list (the offline
+    // tools): the list on disk is a run's and stays as it is. (Written
+    // empty, `victory warm` and `precompile-graphics` threw away the
+    // 1,715 pipelines a run had listed.)
+    let used: Option<Vec<String>> = USED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|set| set.iter().cloned().collect());
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
@@ -680,12 +688,14 @@ pub(crate) fn save(now: bool) {
             )
         });
     }
-    let written = library_written
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
+    let written = library_written.and_then(|()| match &used {
+        Some(used) => write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()),
+        None => Ok(()),
+    });
     match written {
         Ok(()) => tracing::info!(
             bytes,
-            early = used.len(),
+            early = used.as_ref().map_or(0, Vec::len),
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
