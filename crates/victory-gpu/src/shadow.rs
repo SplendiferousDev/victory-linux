@@ -1120,6 +1120,16 @@ fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, u
 }
 
 #[cfg(test)]
+mod map_tests {
+    #[test]
+    fn ranges_are_sorted_joined_and_cut() {
+        let mut out = String::new();
+        super::write_ranges(vec![(0x3000, 0x1000), (0x1000, 0x1000), (0x2000, 0x800), (0x9000, 0x10)], 2, &mut out);
+        assert_eq!(out, " 0x1000+0x1800 0x3000+0x1000 and 1 more");
+    }
+}
+
+#[cfg(test)]
 mod card_tests {
     use super::{CardSpan, PIECE, card_piece_of, card_span_of, joined, joined_piece_runs};
 
@@ -3176,8 +3186,99 @@ mod merge_tests {
 /// snapshot still holds) and the bytes of title memory they copy.
 static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// The GPU addresses of host copies let go lately, newest last: address,
+/// bytes, when ([`crate::host::now_us`]), and what (a window, a card copy's
+/// "before" hashes, a title buffer's copy). With the live ones
+/// ([`gpu_map`]), an address the card faulted on (the driver's "MMU Fault"
+/// in the kernel's log, or the host runtime's fault report with
+/// `VKD3D_CONFIG=fault`) can be told to be ours, ours and let go, or not
+/// ours at all.
+static GONE: Mutex<std::collections::VecDeque<(u64, u64, u64, &'static str)>> = Mutex::new(std::collections::VecDeque::new());
+const GONE_MOST: usize = 512;
+
+fn note_gone(gpu: u64, bytes: u64, what: &'static str) {
+    if gpu == 0 {
+        return;
+    }
+    let mut gone = GONE.lock().unwrap_or_else(|e| e.into_inner());
+    if gone.len() >= GONE_MOST {
+        gone.pop_front();
+    }
+    gone.push_back((gpu, bytes, crate::host::now_us(), what));
+}
+
+/// Writes `va+bytes` ranges, joined where they touch, at most `most`.
+fn write_ranges(mut ranges: Vec<(u64, u64)>, most: usize, out: &mut String) {
+    use std::fmt::Write;
+    ranges.sort_unstable();
+    let mut joined: Vec<(u64, u64)> = Vec::new();
+    for (va, bytes) in ranges {
+        match joined.last_mut() {
+            Some(last) if va <= last.0 + last.1 => last.1 = last.1.max(va + bytes - last.0),
+            _ => joined.push((va, bytes)),
+        }
+    }
+    for (i, (va, bytes)) in joined.iter().enumerate() {
+        if i == most {
+            let _ = write!(out, " and {} more", joined.len() - most);
+            break;
+        }
+        let _ = write!(out, " {va:#x}+{bytes:#x}");
+    }
+}
+
+/// The GPU address map of our host copies, for matching a fault address:
+/// the live windows and title buffers' copies (joined ranges), the card
+/// copies' "before" hashes, and the ranges let go lately with their age.
+/// Only tries the locks.
+pub(crate) fn gpu_map(out: &mut String) {
+    use std::fmt::Write;
+    let size = |b: &ID3D12Resource| unsafe { b.GetDesc() }.Width;
+    match LOOSE.try_lock() {
+        Ok(loose) => {
+            let ranges: Vec<(u64, u64)> = loose.values().map(|s| (s.gpu, size(&s.buffer))).collect();
+            let _ = write!(out, "windows ({}):", ranges.len());
+            write_ranges(ranges, 1024, out);
+        }
+        Err(_) => out.push_str("windows: locked (LOOSE)"),
+    }
+    match CARDED.try_lock() {
+        Ok(carded) => {
+            let live: Vec<Arc<Shadow>> = carded.iter().filter_map(std::sync::Weak::upgrade).collect();
+            let _ = write!(out, "; card copies ({}):", live.len());
+            write_ranges(live.iter().map(|s| (s.gpu, size(&s.buffer))).collect(), 512, out);
+            out.push_str("; their before-hashes:");
+            let befores: Vec<(u64, u64)> = live
+                .iter()
+                .filter_map(|s| s.card.as_ref()?.before.try_lock().ok()?.as_ref().map(|b| (unsafe { b.GetGPUVirtualAddress() }, size(b))))
+                .collect();
+            write_ranges(befores, 512, out);
+        }
+        Err(_) => out.push_str("; card copies: locked (CARDED)"),
+    }
+    let now = crate::host::now_us();
+    match GONE.try_lock() {
+        Ok(gone) => {
+            let _ = write!(out, "; let go lately ({}), newest first:", gone.len());
+            for (va, bytes, at, what) in gone.iter().rev().take(128) {
+                let _ = write!(out, " {va:#x}+{bytes:#x} {what} {:.1} s ago;", now.saturating_sub(*at) as f64 / 1e6);
+            }
+        }
+        Err(_) => out.push_str("; let go lately: locked"),
+    }
+}
+
 impl Drop for Shadow {
     fn drop(&mut self) {
+        // SAFETY: a plain query of our own buffer.
+        let bytes = unsafe { self.buffer.GetDesc() }.Width;
+        note_gone(self.gpu, bytes, if self.window { "window" } else if self.card.is_some() { "card copy" } else { "buffer copy" });
+        if let Some(card) = &mut self.card
+            && let Some(before) = card.before.get_mut().unwrap_or_else(|e| e.into_inner()).as_ref()
+        {
+            // SAFETY: plain queries of our own buffer.
+            note_gone(unsafe { before.GetGPUVirtualAddress() }, unsafe { before.GetDesc() }.Width, "before-hashes");
+        }
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
             crate::inplace::gone(self.window, self.len);
