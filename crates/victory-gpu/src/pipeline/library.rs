@@ -67,6 +67,9 @@ pub fn use_pipeline_cache(dir: PathBuf) {
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LOADED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
+/// Title pipelines on the early list as read at the start; `u64::MAX`
+/// until it is read (at the title's first pipeline).
+pub(crate) static LISTED: AtomicU64 = AtomicU64::new(u64::MAX);
 /// For the memory lines: the bytes of the library's file, kept in memory
 /// while the library lives, and the bytes the last save wrote (a buffer of
 /// that size is made, filled and written every time pipelines were added,
@@ -755,6 +758,7 @@ fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
             .unwrap_or_default();
         let set: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
         tracing::info!(pipelines = set.len(), "title pipelines to start early");
+        LISTED.store(set.len() as u64, Ordering::Relaxed);
         *used = Some(set);
     }
     used
