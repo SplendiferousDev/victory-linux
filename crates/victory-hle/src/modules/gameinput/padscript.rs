@@ -241,10 +241,13 @@ pub(super) struct Scripted {
     status: PathBuf,
     player: Player,
     looked: Option<Instant>,
+    /// While input is held back, steps are taken from the file but not
+    /// played: they start once it is released.
+    held: fn() -> bool,
 }
 
 impl Scripted {
-    pub(super) fn new(inner: Box<dyn Source>, path: PathBuf) -> Self {
+    pub(super) fn new(inner: Box<dyn Source>, path: PathBuf, held: fn() -> bool) -> Self {
         let mut status = path.clone().into_os_string();
         status.push(".status");
         let me = Self {
@@ -253,6 +256,7 @@ impl Scripted {
             status: status.into(),
             player: Player::default(),
             looked: None,
+            held,
         };
         tracing::info!(file = %me.path.display(), "scripted pad in slot 0 ({ENV})");
         me.write_status();
@@ -293,6 +297,9 @@ impl Source for Scripted {
         }
         let now = Instant::now();
         self.look(now);
+        if (self.held)() {
+            return Some(PadState::default());
+        }
         let (scripted, changed) = self.player.pad(now);
         if changed {
             self.write_status();
@@ -418,5 +425,31 @@ mod tests {
         assert_eq!(take(&path).as_deref(), Some("A\n"));
         assert!(!path.exists());
         assert_eq!(take(&path), None);
+    }
+
+    #[test]
+    fn held_steps_are_taken_but_wait_for_the_release() {
+        struct Nothing;
+        impl Source for Nothing {
+            fn pad(&mut self, _: usize) -> Option<PadState> {
+                None
+            }
+            fn keys(&mut self) -> Vec<KeyState> {
+                Vec::new()
+            }
+            fn rumble(&mut self, _: usize, _: u16, _: u16) {}
+        }
+        static HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+        let held = || HELD.load(std::sync::atomic::Ordering::Relaxed);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pad.txt");
+        let mut pad = Scripted::new(Box::new(Nothing), path.clone(), held);
+        std::fs::write(&path, "A @60000\n").unwrap();
+        assert_eq!(pad.pad(0), Some(PadState::default()));
+        // Taken from the file, queued, not playing.
+        assert!(!path.exists());
+        assert_eq!(pad.player.status(), "done=0 queued=1 playing=-\n");
+        HELD.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(pad.pad(0).map(|p| p.buttons), Some(A));
     }
 }

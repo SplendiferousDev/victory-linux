@@ -3,6 +3,10 @@
 //! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
 //! too. A poll thread turns host state into readings (a new one per change)
 //! and runs device callbacks on connect and disconnect.
+//!
+//! While the layer holds the title back (`VICTORY_PIPELINE_HOLD=1`, until
+//! the early pipelines are made), every device stays as it is but reports
+//! no buttons, sticks or keys, and scripted pad steps wait.
 #![allow(non_snake_case)]
 // Title code calls these through the objects, passing pointers the real API
 // would trust.
@@ -336,6 +340,8 @@ pub struct Hub {
     state: Mutex<State>,
     /// A device callback returned.
     returned: Condvar,
+    /// Whether input is held back now (pads at rest, no keys).
+    held: fn() -> bool,
 }
 
 fn lock<T: ?Sized>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -356,7 +362,7 @@ fn now() -> u64 {
 }
 
 impl Hub {
-    fn new(source: Box<dyn Source>) -> &'static Hub {
+    fn new(source: Box<dyn Source>, held: fn() -> bool) -> &'static Hub {
         let hub = Box::into_raw(Box::new(Hub {
             object: Object {
                 vtable: &INPUT,
@@ -371,6 +377,7 @@ impl Hub {
                 running: Vec::new(),
             }),
             returned: Condvar::new(),
+            held,
         }));
         // SAFETY: just allocated and never freed; nothing else sees it yet.
         unsafe {
@@ -383,8 +390,8 @@ impl Hub {
     }
 
     /// A hub over the host's input, polled from now on.
-    fn start(source: Box<dyn Source>) -> &'static Hub {
-        let hub = Hub::new(source);
+    fn start(source: Box<dyn Source>, held: fn() -> bool) -> &'static Hub {
+        let hub = Hub::new(source, held);
         hub.poll();
         std::thread::spawn(move || {
             loop {
@@ -401,11 +408,19 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let held = (self.held)();
+        let (mut pads, mut keys) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
             (pads, source.keys())
         };
+        if held {
+            // Connected pads stay connected, at rest.
+            for pad in pads.iter_mut().flatten() {
+                *pad = PadState::default();
+            }
+            keys.clear();
+        }
         let events = self.state().poll(&self.devices, pads, keys);
         self.deliver(events);
     }
@@ -531,12 +546,13 @@ fn host() -> Box<dyn Source> {
 }
 
 static HUB: LazyLock<&'static Hub> = LazyLock::new(|| {
+    let held = victory_gpu::pipeline::input_held;
     let source = host();
     let source = match std::env::var_os(padscript::ENV) {
-        Some(path) => Box::new(padscript::Scripted::new(source, path.into())),
+        Some(path) => Box::new(padscript::Scripted::new(source, path.into(), held)),
         None => source,
     };
-    Hub::start(source)
+    Hub::start(source, held)
 });
 
 mod padscript;
@@ -1312,7 +1328,7 @@ mod tests {
 
     fn fake() -> (&'static Hub, Arc<Mutex<FakeHost>>) {
         let host = Arc::new(Mutex::new(FakeHost::default()));
-        let hub = Hub::new(Box::new(Fake(Arc::clone(&host))));
+        let hub = Hub::new(Box::new(Fake(Arc::clone(&host))), || false);
         hub.poll();
         (hub, host)
     }
@@ -1494,6 +1510,49 @@ mod tests {
         let rest = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
         assert_eq!(pad(rest), PadState::default());
         release(rest);
+    }
+
+    #[test]
+    fn held_input_keeps_devices_connected_at_rest() {
+        static HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+        let host = Arc::new(Mutex::new(FakeHost::default()));
+        let hub = Hub::new(Box::new(Fake(Arc::clone(&host))), || HELD.load(Ordering::Relaxed));
+        let pressed = PadState {
+            buttons: A | MENU,
+            left_y: 1.0,
+            right_trigger: 1.0,
+            ..Default::default()
+        };
+        host.lock().unwrap().pads[0] = Some(pressed);
+        host.lock().unwrap().keys = vec![key(0x0D)];
+        hub.poll();
+        let log = Log::default();
+        register(hub, GAMEPAD_KIND | KEYBOARD_KIND, 2, &log);
+        // The pad and the keyboard are there; the stand-in is not (a pad is).
+        assert_eq!(
+            *log.lock().unwrap(),
+            [(0, STATUS_CONNECTED, 0), (KEYBOARD, STATUS_CONNECTED, 0)]
+        );
+        let r = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(pad(r), PadState::default());
+        release(r);
+        let r = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
+        let count = slot::<extern "system" fn(*const Reading) -> u32, _>(r, 0x70);
+        assert_eq!(count(r), 0);
+        release(r);
+
+        // Released: the buttons held all along are seen.
+        HELD.store(false, Ordering::Relaxed);
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(pad(r), pressed);
+        release(r);
+        let r = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
+        let count = slot::<extern "system" fn(*const Reading) -> u32, _>(r, 0x70);
+        assert_eq!(count(r), 1);
+        release(r);
+        // No device came or went.
+        assert_eq!(log.lock().unwrap().len(), 2);
     }
 
     #[test]

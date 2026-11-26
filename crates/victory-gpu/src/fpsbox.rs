@@ -12,6 +12,9 @@
 //! text and never written again, so a present still in the air reads what
 //! it was recorded with. On by default; `VICTORY_FPS_COUNTER=0` leaves the
 //! frame as the title drew it.
+//!
+//! While the title's input is held for the early pipelines
+//! (`VICTORY_PIPELINE_HOLD`), a second box below says how many are left.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -54,6 +57,11 @@ fn glyph(c: char) -> [u8; 7] {
         'F' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000],
         'P' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000],
         'S' => [0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110],
+        'E' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111],
+        'I' => [0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
+        'L' => [0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111],
+        'N' => [0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001],
+        'T' => [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
         _ => [0; 7],
     }
 }
@@ -61,6 +69,11 @@ fn glyph(c: char) -> [u8; 7] {
 /// The text for a frame rate in tenths.
 fn text(tenths: u32) -> String {
     format!("{}.{} FPS", tenths / 10, tenths % 10)
+}
+
+/// The text for pipelines left while the input is held.
+fn hold_text(left: u64) -> String {
+    format!("{left} PIPELINES LEFT")
 }
 
 /// Bytes a pixel of a swap chain format this layer presents in, or none.
@@ -146,57 +159,73 @@ struct Made {
 unsafe impl Send for Made {}
 
 /// The boxes made so far, by text, format and scale.
-static MADE: Mutex<Option<HashMap<(u32, i32, u32), Made>>> = Mutex::new(None);
+static MADE: Mutex<Option<HashMap<(String, i32, u32), Made>>> = Mutex::new(None);
 
 /// Copies the frame rate's box onto `back`, a back buffer of `width` by
-/// `height` pixels of `format` that `list` holds as a copy's destination.
-/// Nothing if the counter is off, no rate was measured yet, the format is
-/// not one of ours or the frame is too small for the box.
+/// `height` pixels of `format` that `list` holds as a copy's destination,
+/// and below it the box of pipelines left while the input is held.
+/// Nothing if the counter is off, the format is not one of ours or the
+/// frame is too small for a box; no rate box before the first rate.
 pub(crate) fn draw(host: &crate::host::Host, list: &ID3D12GraphicsCommandList, back: &ID3D12Resource, (width, height, format): (u32, u32, DXGI_FORMAT)) {
     if !on() {
         return;
     }
-    let tenths = TENTHS.load(Ordering::Relaxed);
-    let Some(bytes) = pixel_bytes(format).filter(|_| tenths != u32::MAX) else {
+    let Some(bytes) = pixel_bytes(format) else {
         return;
     };
+    let tenths = TENTHS.load(Ordering::Relaxed);
+    // (The pipelines left change only every ten seconds: a few dozen
+    // texts in all.)
+    let texts = [
+        (tenths != u32::MAX).then(|| text(tenths)),
+        crate::pipeline::hold_shown_left().map(hold_text),
+    ];
     // About a fortieth of the frame's height a glyph: 6 dots a pixel at
     // 2160 lines, 3 at 1080.
     let scale = (height / 360).clamp(2, 12);
+    let margin = 4 * scale;
+    let mut top = margin;
     let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
     let made = made.get_or_insert_with(HashMap::new);
-    if made.len() > 2048 {
-        // (Every text is a buffer of a few hundred KiB; a rate that wanders
-        // over thousands of values is not expected.)
-        made.clear();
-    }
-    let key = (tenths, format.0, scale);
-    if !made.contains_key(&key) {
-        let (w, h, lit) = bitmap(&text(tenths), scale);
-        let pitch = (w as usize * bytes).next_multiple_of(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT as usize);
-        let Some((buffer, data)) = host.shared_buffer((pitch * h as usize) as u64) else {
+    for text in texts.into_iter().flatten() {
+        if made.len() > 2048 {
+            // (Every text is a buffer of a few hundred KiB; a rate that wanders
+            // over thousands of values is not expected.)
+            made.clear();
+        }
+        let key = (text, format.0, scale);
+        if !made.contains_key(&key) {
+            let (w, h, lit) = bitmap(&key.0, scale);
+            let pitch = (w as usize * bytes).next_multiple_of(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT as usize);
+            let Some((buffer, data)) = host.shared_buffer((pitch * h as usize) as u64) else {
+                return;
+            };
+            // SAFETY: the buffer's own mapped bytes, `pitch * h` of them.
+            let out = unsafe { std::slice::from_raw_parts_mut(data, pitch * h as usize) };
+            for y in 0..h as usize {
+                for x in 0..w as usize {
+                    let at = y * pitch + x * bytes;
+                    pixel(format, lit[y * w as usize + x], &mut out[at..at + bytes]);
+                }
+            }
+            made.insert(key.clone(), Made { buffer, width: w, height: h, pitch: pitch as u32 });
+        }
+        let Some(m) = made.get(&key) else {
             return;
         };
-        // SAFETY: the buffer's own mapped bytes, `pitch * h` of them.
-        let out = unsafe { std::slice::from_raw_parts_mut(data, pitch * h as usize) };
-        for y in 0..h as usize {
-            for x in 0..w as usize {
-                let at = y * pitch + x * bytes;
-                pixel(format, lit[y * w as usize + x], &mut out[at..at + bytes]);
-            }
+        if m.width + 2 * margin > width || top + m.height + margin > height {
+            return;
         }
-        made.insert(key, Made { buffer, width: w, height: h, pitch: pitch as u32 });
+        copy(list, back, m, format, (margin, top));
+        top += m.height + scale;
     }
-    let Some(m) = made.get(&key) else {
-        return;
-    };
-    let margin = 4 * scale;
-    if m.width + 2 * margin > width || m.height + 2 * margin > height {
-        return;
-    }
+}
+
+/// Records the copy of box `m` onto `back` at `at`.
+fn copy(list: &ID3D12GraphicsCommandList, back: &ID3D12Resource, m: &Made, format: DXGI_FORMAT, at: (u32, u32)) {
     // SAFETY: an open list; the back buffer is a copy's destination in it
-    // and the box lies inside it; our buffer holds `pitch * height` bytes
-    // and is kept for as long as the process runs.
+    // and the box lies inside it (checked by the caller); our buffer holds
+    // `pitch * height` bytes and is kept for as long as the process runs.
     unsafe {
         let from = D3D12_TEXTURE_COPY_LOCATION {
             pResource: std::mem::transmute_copy(&m.buffer),
@@ -213,7 +242,7 @@ pub(crate) fn draw(host: &crate::host::Host, list: &ID3D12GraphicsCommandList, b
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
         };
-        list.CopyTextureRegion(&to, margin, margin, 0, &from, None);
+        list.CopyTextureRegion(&to, at.0, at.1, 0, &from, None);
     }
 }
 
@@ -243,7 +272,15 @@ mod tests {
         // A space lights nothing: glyph 4.
         assert!((0..7 * 3).all(|y| (0..5 * 3).all(|x| !at(6 + 4 * 18 + x, 6 + y))));
         // Every glyph used has at least one dot, but the space.
-        for c in "0123456789.FPS".chars() {
+        for c in "0123456789.FPSEILNT".chars() {
+            assert!(glyph(c).iter().any(|&r| r != 0), "{c}");
+        }
+    }
+
+    #[test]
+    fn the_hold_text_uses_only_glyphs_the_font_has() {
+        assert_eq!(hold_text(1234), "1234 PIPELINES LEFT");
+        for c in hold_text(1234567890).chars().filter(|&c| c != ' ') {
             assert!(glyph(c).iter().any(|&r| r != 0), "{c}");
         }
     }

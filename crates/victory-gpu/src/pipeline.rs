@@ -850,6 +850,27 @@ pub(crate) fn frame_log_counts() -> (u64, u64) {
 }
 #[cfg(windows)]
 mod make;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod hold;
+
+/// Whether the title's input is held back now, until the early pipelines
+/// are made (`VICTORY_PIPELINE_HOLD=1`; see `hold`). Called by every input
+/// poll; once released, a single atomic load.
+#[cfg(windows)]
+pub fn input_held() -> bool {
+    hold::input_held()
+}
+
+#[cfg(not(windows))]
+pub fn input_held() -> bool {
+    false
+}
+
+/// Pipelines left while the input is held (for the frame-rate box).
+#[cfg(windows)]
+pub(crate) fn hold_shown_left() -> Option<u64> {
+    hold::shown_left()
+}
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.

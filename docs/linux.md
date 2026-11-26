@@ -268,6 +268,18 @@ Verified on a machine with 16 GB of RAM, an 8 GB card and an NVIDIA driver:
   (the driver then failed system-memory allocations and the process was
   killed). Nothing we tried tunes this away; more RAM and a larger card are
   needed.
+- On a machine short of cores, the pipelines started early (the ones earlier
+  runs drew with) can take minutes to load and compile. If the world loads
+  meanwhile, its pipelines wait behind them and the picture stays black.
+  `VICTORY_PIPELINE_HOLD=1` (off by default; `run.sh` does not set it) holds
+  the title's input until they are made: pads and keyboard stay connected
+  but report no buttons, sticks or keys, so the title keeps running at its
+  first screen that waits for a button. Scripted pad steps are queued and
+  played after the hold. The hold ends when the queue is empty (log line
+  `title's input released`), or after `VICTORY_PIPELINE_HOLD_SECS` (default
+  300). Every 10 s the log says how many are left (`holding the title's
+  input: N pipelines left`), and the frame-rate box shows `N PIPELINES LEFT`
+  below the rate.
 
 Not tested yet (do not rely on it): `vm.swappiness`, `vm.max_map_count` effects
 beyond avoiding the limit, transparent huge pages, `zswap` instead of zram,
