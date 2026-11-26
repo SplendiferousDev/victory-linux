@@ -457,6 +457,21 @@ thread_local! {
     static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// The most bytes a thread's read buffer keeps between textures
+/// (`VICTORY_TEXTURE_READ_KEEP_MB`; not set: no most, as before). The
+/// buffer grows to the largest texture the thread has read and stays that
+/// size for the run, all of it resident; over this most it is freed after
+/// the read that needed it, and the next large texture allocates again.
+fn read_keep() -> usize {
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_READ_KEEP_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(usize::MAX, |mb| mb.saturating_mul(1 << 20))
+    })
+}
+
 /// Calls `f` with `size` bytes of this thread's read buffer (their
 /// contents are whatever the last texture left).
 fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
@@ -465,8 +480,17 @@ fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
         if read.len() < size {
             read.resize(size, 0);
         }
-        f(&mut read[..size])
+        let out = f(&mut read[..size]);
+        keep_at_most(&mut read, read_keep());
+        out
     })
+}
+
+/// Frees `read` if it holds more than `most` bytes.
+fn keep_at_most(read: &mut Vec<u8>, most: usize) {
+    if read.capacity() > most {
+        *read = Vec::new();
+    }
 }
 
 /// Whether a texture all of whose memory is mapped is read through the
@@ -1541,6 +1565,22 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod read_keep_tests {
+    use super::keep_at_most;
+
+    #[test]
+    fn a_read_buffer_over_the_most_is_freed() {
+        let mut read = vec![1u8; 4096];
+        keep_at_most(&mut read, 4096);
+        assert_eq!(read.len(), 4096, "at the most: kept");
+        keep_at_most(&mut read, usize::MAX);
+        assert_eq!(read.len(), 4096, "no most: kept");
+        keep_at_most(&mut read, 4095);
+        assert_eq!(read.capacity(), 0, "over it: freed");
+    }
 }
 
 #[cfg(test)]
