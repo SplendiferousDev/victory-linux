@@ -173,6 +173,8 @@ fn virtual_alloc(
     };
     if placeholder && !at.is_null() {
         RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).insert(at as usize, size);
+        // For the GPU side's sparse reads (`VICTORY_COPY_NOQUERY`).
+        victory_gpu::title_memory_placeholder(at as usize, size);
     }
     if base.is_null() {
         tracing::debug!(

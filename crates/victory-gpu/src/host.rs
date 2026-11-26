@@ -9775,7 +9775,21 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
 
 /// After a failed bulk read into host memory, skip contiguous holes. Never
 /// cache the query across copies: the title may remap the same address.
+/// With `VICTORY_COPY_NOQUERY`, by the runtime's record of its mappings
+/// where it knows the range (`crate::noquery`).
 fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
+    use crate::noquery::{N, add};
+    let started = std::time::Instant::now();
+    add(N::Sparse, 1);
+    let reads = crate::noquery::Reads { read: &|s, d, n| read(s, d, n), pieces: &|s, d, n| read_pieces(s, d, n), queried: &|s, d, n| read_queried(s, d, n) };
+    if !crate::noquery::read_sparse(src, dst, len, &reads) {
+        read_queried(src, dst, len);
+    }
+    add(N::SparseUs, started.elapsed().as_micros() as u64);
+}
+
+/// [`read_sparse`] region by region, each region asked of Windows.
+fn read_queried(src: *const u8, dst: *mut u8, len: usize) {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
     };
@@ -9787,6 +9801,7 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
         // SAFETY: the query inspects an address and fills a local structure.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         let size = unsafe { VirtualQuery(at.cast(), &mut info, size_of_val(&info)) };
+        crate::noquery::add(crate::noquery::N::Queries, 1);
         let n = (info.BaseAddress as usize).saturating_add(info.RegionSize)
             .saturating_sub(at as usize).min(remaining);
         if size != size_of_val(&info) || n == 0 {
@@ -10136,6 +10151,7 @@ impl Meter {
         crate::queue2::line(frames);
         crate::plaincopy::line(frames);
         crate::memopt::line(frames);
+        crate::noquery::line(frames);
         #[cfg(feature = "diagnostics")]
         crate::backreads::line(frames);
         crate::shadow::placed_line();
