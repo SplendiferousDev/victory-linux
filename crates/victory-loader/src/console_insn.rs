@@ -49,7 +49,7 @@ static ZEROED: AtomicU64 = AtomicU64::new(0);
 /// Exceptions taken by kind since the last line: a lone `clzero`, the 12-byte loop, the
 /// 15-byte loop taken whole, `monitorx`, `mwaitx`, everything else; and the 64-byte lines the
 /// 15-byte loops zeroed (each was an exception of its own before they were taken whole).
-static KINDS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+static KINDS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 const K_CLZERO: usize = 0;
 const K_LOOP12: usize = 1;
 const K_LOOP15: usize = 2;
@@ -57,6 +57,10 @@ const K_MONITORX: usize = 3;
 const K_MWAITX: usize = 4;
 const K_OTHER: usize = 5;
 const K_LOOP15_LINES: usize = 6;
+/// `mwaitx` that blocked ([`block`]), and exceptions on bytes we had patched meanwhile
+/// ([`is_patched`]).
+const K_MWAITX_BLOCKED: usize = 7;
+const K_PATCHED: usize = 8;
 
 /// Waits the title made with `monitorx` / `mwaitx` (it waits for a fence that way, reading
 /// the fence's value in memory: its +0x4fb0ad0) that have ended since the last line: how
@@ -70,8 +74,12 @@ static LINE_AT: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     /// The address and the value this thread last armed a monitor for (`monitorx`: rax, and
-    /// the title's wanted value in rsi).
-    static MONITOR: Cell<(usize, u64)> = const { Cell::new((0, 0)) };
+    /// the title's wanted value in rsi), and what that address held then, if it was read
+    /// ([`armed_value`]).
+    static MONITOR: Cell<(usize, u64, Option<u64>)> = const { Cell::new((0, 0, None)) };
+    /// The page this thread's last [`block`] found readable, and until when (microseconds of
+    /// [`clock_us`]) a `monitorx` may read it without asking Windows again.
+    static VERIFIED: Cell<(usize, u64)> = const { Cell::new((0, 0)) };
     /// This thread's wait under way: when it began and when its last `mwaitx` was, in
     /// microseconds, what it waits for, and its `mwaitx` count.
     static WAIT: Cell<(u64, u64, usize, u64, u32)> = const { Cell::new((0, 0, 0, 0, 0)) };
@@ -126,20 +134,159 @@ fn wait_ended(begin: u64, last: u64, address: usize, wanted: u64, spins: u32) {
 }
 
 /// A `mwaitx` of this thread at `rip`: part of the wait under way, or the first of a new one.
-fn wait_step(rip: usize) {
+/// Returns how long the wait has lasted so far, in microseconds.
+fn wait_step(rip: usize) -> u64 {
     let now = clock_us();
-    let (address, wanted) = MONITOR.with(Cell::get);
+    let (address, wanted, _) = MONITOR.with(Cell::get);
     let (begin, last, was_at, was_for, spins) = WAIT.with(Cell::get);
-    if begin != 0 && was_at == address && was_for == wanted && now.saturating_sub(last) < 2_000 {
+    if begin != 0 && was_at == address && was_for == wanted && now.saturating_sub(last) < pacing().gap_us() {
         WAIT.with(|w| w.set((begin, now, address, wanted, spins + 1)));
         waiting::note(rip, address, wanted, begin, now, spins + 1);
-        return;
+        return now - begin;
     }
     if begin != 0 {
         wait_ended(begin, last, was_at, was_for, spins);
     }
     WAIT.with(|w| w.set((now, now, address, wanted, 1)));
     waiting::note(rip, address, wanted, now, now, 1);
+    0
+}
+
+/// How an emulated `mwaitx` waits: `VICTORY_MWAITX=wait` (the default) spins as the
+/// processor's early return would for [`Pacing::spin_us`] of a wait on the same address and
+/// value, then blocks on the monitored address ([`block`]) for at most
+/// [`Pacing::timeout_us`] at a time (`VICTORY_MWAITX_SPIN_US`, `VICTORY_MWAITX_TIMEOUT_US`);
+/// `VICTORY_MWAITX=spin` takes an exception at every `mwaitx` all through the wait, as before.
+/// Under Wine an exception costs about 4 us of the waiting thread, and a long wait took
+/// 250,000 of them a second.
+///
+/// `mwaitx` may return early for any reason, and the title checks its condition again after
+/// it, so a block that ends early is what the processor may do too; one that ends late is
+/// bounded by the timeout and by the title's own timer in EBX.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Pacing {
+    block: bool,
+    spin_us: u64,
+    timeout_us: u64,
+}
+
+impl Pacing {
+    fn parse(mode: Option<&str>, spin_us: Option<&str>, timeout_us: Option<&str>) -> Pacing {
+        let number = |v: Option<&str>, default: u64, least: u64, most: u64| v.and_then(|v| v.trim().parse().ok()).unwrap_or(default).clamp(least, most);
+        Pacing {
+            block: !mode.is_some_and(|m| m.trim().eq_ignore_ascii_case("spin")),
+            spin_us: number(spin_us, 200, 0, 1_000_000),
+            timeout_us: number(timeout_us, 1_000, MIN_BLOCK_US, 100_000),
+        }
+    }
+
+    /// The longest gap between two `mwaitx` of one wait: 2 ms, longer when a block lies
+    /// between them.
+    fn gap_us(&self) -> u64 {
+        if self.block { 2_000.max(2 * self.timeout_us + 1_000) } else { 2_000 }
+    }
+
+    /// How the `mwaitx` of a wait that has lasted `waited_us` waits: None spins (one more
+    /// exception), Some blocks for that many microseconds. With ECX bit 1 the title's timer
+    /// in EBX caps it: the processor counts it at its P0 clock, taken here as
+    /// [`TICKS_PER_US`], faster than the console's or this PC's, so that it is never
+    /// overslept; a timer too short to block for spins.
+    fn plan(&self, waited_us: u64, ecx: u64, ebx: u64) -> Option<u64> {
+        if !self.block || waited_us < self.spin_us {
+            return None;
+        }
+        let mut timeout = self.timeout_us;
+        if ecx & 2 != 0 {
+            timeout = timeout.min((ebx & 0xFFFF_FFFF) / TICKS_PER_US);
+        }
+        (timeout >= MIN_BLOCK_US).then_some(timeout)
+    }
+}
+
+/// Timer ticks of `mwaitx` (EBX) a microsecond: a 4 GHz clock.
+const TICKS_PER_US: u64 = 4_000;
+/// The shortest block: below it a block costs more than the exceptions it saves.
+const MIN_BLOCK_US: u64 = 20;
+
+fn pacing() -> &'static Pacing {
+    static PACING: std::sync::OnceLock<Pacing> = std::sync::OnceLock::new();
+    PACING.get_or_init(|| {
+        let var = |name: &str| std::env::var(name).ok();
+        let p = Pacing::parse(var("VICTORY_MWAITX").as_deref(), var("VICTORY_MWAITX_SPIN_US").as_deref(), var("VICTORY_MWAITX_TIMEOUT_US").as_deref());
+        tracing::info!(
+            "mwaitx: {} (VICTORY_MWAITX=wait|spin; spin {} us, then blocks of at most {} us: VICTORY_MWAITX_SPIN_US, VICTORY_MWAITX_TIMEOUT_US)",
+            if p.block { "spins, then blocks on the monitored address" } else { "spins" },
+            p.spin_us,
+            p.timeout_us
+        );
+        p
+    })
+}
+
+/// The size a block compares at `address`: 8 bytes, or 4 at an address of 4 only; None at
+/// any other (spun).
+fn wait_size(address: usize) -> Option<usize> {
+    match address & 7 {
+        0 => Some(8),
+        4 => Some(4),
+        _ => None,
+    }
+}
+
+/// What `size` bytes at `address` hold.
+///
+/// # Safety
+/// They are readable.
+unsafe fn read_value(address: usize, size: usize) -> u64 {
+    // SAFETY: readable, as the caller says; aligned to their size ([`wait_size`]).
+    unsafe {
+        if size == 8 {
+            std::ptr::read_volatile(address as *const u64)
+        } else {
+            u64::from(std::ptr::read_volatile(address as *const u32))
+        }
+    }
+}
+
+/// What the address a `monitorx` arms holds now, read only in the page this thread's last
+/// [`block`] found readable, a moment ago: so that a write between the `monitorx` and the
+/// `mwaitx` ends the block at once, as it ends the processor's wait. Elsewhere None: the
+/// block reads the value itself, and a write just before it costs up to its timeout.
+///
+/// shortcut: a page freed within a block's timeout of being found readable faults here,
+/// inside the handler; the title reads the same address right after its `monitorx`, so it
+/// would fault there all the same.
+fn armed_value(address: usize, now: u64) -> Option<u64> {
+    let size = wait_size(address)?;
+    let (page, until) = VERIFIED.with(Cell::get);
+    if page == 0 || address & !0xFFF != page || now >= until {
+        return None;
+    }
+    // SAFETY: in the page found readable a moment ago; aligned, so inside it.
+    Some(unsafe { read_value(address, size) })
+}
+
+/// Blocks this thread's `mwaitx` on the address its `monitorx` armed for at most
+/// `timeout_us`, until the value there differs from the one armed (or read now) or the
+/// runtime's write wakes it (`victory_core::wake::written`). False when it did not block:
+/// an address it cannot compare, or memory not readable (the `mwaitx` spins).
+fn block(timeout_us: u64) -> bool {
+    let (address, _, armed) = MONITOR.with(Cell::get);
+    let Some(size) = wait_size(address) else { return false };
+    if !readable(address, size) {
+        VERIFIED.with(|v| v.set((0, 0)));
+        return false;
+    }
+    let now = clock_us();
+    VERIFIED.with(|v| v.set((address & !0xFFF, now + 2 * timeout_us + 1_000)));
+    // SAFETY: committed and readable, just asked.
+    let current = armed.unwrap_or_else(|| unsafe { read_value(address, size) });
+    KINDS[K_MWAITX_BLOCKED].fetch_add(1, Relaxed);
+    waiting::blocked();
+    // SAFETY: readable, just asked (the title waits there for a value: it is not freed
+    // while it waits).
+    unsafe { victory_core::wake::wait(address, current, size, timeout_us) };
+    true
 }
 
 /// The waits of the title's threads, readable from another thread: a table
@@ -166,6 +313,8 @@ mod waiting {
         pub(super) begin: AtomicU64,
         pub(super) last: AtomicU64,
         pub(super) spins: AtomicU64,
+        /// How many of its `mwaitx` blocked ([`super::block`]).
+        pub(super) blocked: AtomicU64,
     }
 
     pub(super) static TABLE: [Slot; SLOTS] = [const {
@@ -177,6 +326,7 @@ mod waiting {
             begin: AtomicU64::new(0),
             last: AtomicU64::new(0),
             spins: AtomicU64::new(0),
+            blocked: AtomicU64::new(0),
         }
     }; SLOTS];
 
@@ -207,9 +357,17 @@ mod waiting {
             slot.address.store(address as u64, Relaxed);
             slot.wanted.store(wanted, Relaxed);
             slot.begin.store(begin, Relaxed);
+            slot.blocked.store(0, Relaxed);
         }
         slot.last.store(last, Relaxed);
         slot.spins.store(u64::from(spins), Relaxed);
+    }
+
+    /// This thread's newest `mwaitx` blocks.
+    pub(super) fn blocked() {
+        if let Some(slot) = mine() {
+            slot.blocked.fetch_add(1, Relaxed);
+        }
     }
 }
 
@@ -224,6 +382,7 @@ struct Waiting {
     begin: u64,
     last: u64,
     spins: u64,
+    blocked: u64,
 }
 
 /// The waits still under way at `now` (a `mwaitx` in the last two seconds),
@@ -238,7 +397,7 @@ fn describe_waits(waits: &[Waiting], now: u64, read: impl Fn(usize) -> Option<u6
         let seconds = w.last.saturating_sub(w.begin) as f64 / 1e6;
         let _ = write!(
             out,
-            "; thread {} at {} waits {seconds:.1} s for the value at {:#x} (wants {:#x}, holds {}), {} mwaitx ({:.0} a second)",
+            "; thread {} at {} waits {seconds:.1} s for the value at {:#x} (wants {:#x}, holds {}), {} mwaitx ({:.0} a second{})",
             w.thread,
             place(w.rip),
             w.address,
@@ -246,6 +405,7 @@ fn describe_waits(waits: &[Waiting], now: u64, read: impl Fn(usize) -> Option<u6
             read(w.address).map_or_else(|| "not readable".to_owned(), |v| format!("{v:#x}")),
             w.spins,
             if seconds > 0.0 { w.spins as f64 / seconds } else { 0.0 },
+            if w.blocked > 0 { format!(", {} of them blocked", w.blocked) } else { String::new() },
         );
     }
 }
@@ -265,6 +425,7 @@ pub fn stall_report(out: &mut String) {
             begin: s.begin.load(Relaxed),
             last: s.last.load(Relaxed),
             spins: s.spins.load(Relaxed),
+            blocked: s.blocked.load(Relaxed),
         })
         .collect();
     let read = |address: usize| -> Option<u64> {
@@ -289,9 +450,10 @@ pub fn stall_report(out: &mut String) {
     describe_waits(&waits, clock_us(), read, place, out);
     let _ = write!(
         out,
-        "; since the last exceptions line: monitorx {}, mwaitx {}, clzero loops {}; emulated since the start {}",
+        "; since the last exceptions line: monitorx {}, mwaitx {} ({} blocked), clzero loops {}; emulated since the start {}",
         KINDS[K_MONITORX].load(Relaxed),
         KINDS[K_MWAITX].load(Relaxed),
+        KINDS[K_MWAITX_BLOCKED].load(Relaxed),
         KINDS[K_LOOP12].load(Relaxed) + KINDS[K_LOOP15].load(Relaxed) + KINDS[K_CLZERO].load(Relaxed),
         EMULATED.load(Relaxed),
     );
@@ -310,10 +472,15 @@ fn line() {
     let seconds = (now - last) as f64 / 1e3;
     let k: Vec<f64> = KINDS.iter().map(|k| k.swap(0, Relaxed) as f64 / seconds).collect();
     let w: Vec<f64> = WAITS.iter().map(|w| w.swap(0, Relaxed) as f64).collect();
+    // The blocks' ends and the runtime's wakes, a second (counted since the start there).
+    static WAKES_AT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    let (woken, timed_out, wakes) = victory_core::wake::counts();
+    let b: Vec<f64> = [woken, timed_out, wakes].iter().zip(&WAKES_AT).map(|(&n, at)| n.saturating_sub(at.swap(n, Relaxed)) as f64 / seconds).collect();
     tracing::info!(
         "console CPU instructions, exceptions a second: clzero alone {:.0}, its 12-byte loop {:.0}, its 15-byte loop taken whole {:.0} ({:.0} lines a second, each an exception \
          before; VICTORY_CLZERO_LOOP15=0: again), monitorx {:.0}, mwaitx {:.0}, others {:.0} | mwaitx waits ended a second: {:.0}, {:.1} ms of thread time a second; of 1 ms and \
-         more {:.1} ({:.1} ms), of 5 ms and more {:.1} ({:.1} ms), of 20 ms and more {:.1} ({:.1} ms)",
+         more {:.1} ({:.1} ms), of 5 ms and more {:.1} ({:.1} ms), of 20 ms and more {:.1} ({:.1} ms) | mwaitx blocked {:.0} a second (woken or changed {:.0}, timed \
+         out {:.0}; VICTORY_MWAITX=spin: none), wakes sent {:.0}, patched bytes met {:.0}",
         k[K_CLZERO],
         k[K_LOOP12],
         k[K_LOOP15],
@@ -329,6 +496,11 @@ fn line() {
         w[5] / seconds / 1e3,
         w[6] / seconds,
         w[7] / seconds / 1e3,
+        k[K_MWAITX_BLOCKED],
+        b[0],
+        b[1],
+        b[2],
+        k[K_PATCHED],
     );
 }
 
@@ -470,6 +642,81 @@ unsafe fn clzero_loop15(ctx: &mut CONTEXT, rip: usize, ptr_reg: u8, end_reg: u8)
     Some(true)
 }
 
+/// One NOP instruction of each length from 1 to 9 bytes, as AMD's and Intel's manuals
+/// recommend them: what [`patch_nop`] writes over an instruction of that length.
+const NOPS: [&[u8]; 9] = [
+    &[0x90],
+    &[0x66, 0x90],
+    &[0x0F, 0x1F, 0x00],
+    &[0x0F, 0x1F, 0x40, 0x00],
+    &[0x0F, 0x1F, 0x44, 0x00, 0x00],
+    &[0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00],
+    &[0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00],
+    &[0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+    &[0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+];
+
+/// Whether `code`, the bytes at an illegal instruction's address, now begin with a NOP that
+/// [`patch_nop`] writes: another thread patched the instruction after this one faulted on
+/// it. A NOP never faults, so the bytes there changed since the fault.
+fn is_patched(code: &[u8]) -> bool {
+    NOPS.iter().any(|nop| code.starts_with(nop))
+}
+
+/// Where the instruction `bytes` at `rip` can be patched with one store: the aligned
+/// 8-byte word that holds all of it, and its offset there. None for one across two words
+/// or longer than the NOPs: another thread could run half old, half new bytes.
+fn patch_word(rip: usize, len: usize) -> Option<(usize, usize)> {
+    let word = rip & !7;
+    ((1..=NOPS.len()).contains(&len) && rip + len <= word + 8).then_some((word, rip - word))
+}
+
+/// The word `before` with its `len` bytes from `offset` replaced by the NOP of that length.
+fn with_nop(before: u64, offset: usize, len: usize) -> u64 {
+    let mut bytes = before.to_le_bytes();
+    bytes[offset..offset + len].copy_from_slice(NOPS[len - 1]);
+    u64::from_le_bytes(bytes)
+}
+
+/// Replaces the instruction `old` at `rip` with one NOP of the same length ([`NOPS`]), in a
+/// single 8-byte store, so that another thread runs either the old instruction (and faults,
+/// which [`is_patched`] then steps) or the NOP, never a mix. The page is writable only around
+/// the store, one patch at a time (two at once would restore each other's protection); an
+/// instruction that cannot be patched so, or one met while another is patched, is stepped
+/// over as before, at an exception each time.
+///
+/// # Safety
+/// `old` are the bytes just read at `rip`, inside the instruction's own page.
+unsafe fn patch_nop(rip: usize, old: &[u8]) -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering::{Acquire, Release, SeqCst}};
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    static PATCHING: AtomicBool = AtomicBool::new(false);
+    let Some((word, offset)) = patch_word(rip, old.len()) else { return false };
+    if PATCHING.swap(true, Acquire) {
+        return false;
+    }
+    let mut done = false;
+    let mut was = 0u32;
+    // SAFETY: the instruction's own word (aligned, so in its page), writable around the store
+    // and restored; the store is atomic, so no thread fetches a torn instruction.
+    unsafe {
+        if VirtualProtect(word as *const _, 8, PAGE_EXECUTE_READWRITE, &mut was) != 0 {
+            let cell = AtomicU64::from_ptr(word as *mut u64);
+            let before = cell.load(SeqCst);
+            // Only if the bytes are still the instruction decoded (not patched meanwhile).
+            if before.to_le_bytes()[offset..offset + old.len()] == *old {
+                done = cell.compare_exchange(before, with_nop(before, offset, old.len()), SeqCst, SeqCst).is_ok();
+            }
+            VirtualProtect(word as *const _, 8, was, &mut was);
+            FlushInstructionCache(GetCurrentProcess(), rip as *const _, old.len());
+        }
+    }
+    PATCHING.store(false, Release);
+    done
+}
+
 /// An illegal instruction at `ctx.Rip`: a console-only one is emulated and stepped over
 /// (`CONTINUE_EXECUTION`); anything else returns 0 (the crash report and the title's handlers
 /// see it).
@@ -498,7 +745,15 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
     };
     // SAFETY: `n` bytes at `rip` are readable.
     let code = unsafe { std::slice::from_raw_parts(rip as *const u8, n) };
-    let Some((what, len)) = decode::decode(code) else { return 0 };
+    let Some((what, len)) = decode::decode(code) else {
+        if is_patched(code) {
+            // Patched by another thread after this one faulted on the instruction: it runs
+            // the bytes there now (a NOP never faults, so this cannot come back).
+            KINDS[K_PATCHED].fetch_add(1, Relaxed);
+            return CONTINUE_EXECUTION;
+        }
+        return 0;
+    };
     static SEEN: std::sync::Mutex<Vec<std::mem::Discriminant<ConsoleOnly>>> = std::sync::Mutex::new(Vec::new());
     if let Ok(mut seen) = SEEN.lock()
         && !seen.contains(&std::mem::discriminant(&what))
@@ -511,25 +766,35 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
     match what {
         ConsoleOnly::Ud2 => return 0,
         ConsoleOnly::Clwb => {
-            // nothing to write back on the PC: patched to NOPs, no exception next time
-            use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
-            let mut old = 0u32;
-            // SAFETY: the instruction's own bytes, made writable for the patch and restored.
-            unsafe {
-                if VirtualProtect(rip as *const _, len, PAGE_EXECUTE_READWRITE, &mut old) != 0 {
-                    std::slice::from_raw_parts_mut(rip as *mut u8, len).fill(0x90);
-                    VirtualProtect(rip as *const _, len, old, &mut old);
-                }
-            }
+            // nothing to write back on the PC: patched to a NOP, no exception next time
+            // SAFETY: `code` holds the `len` bytes of the instruction at `rip`.
+            unsafe { patch_nop(rip, &code[..len]) };
         }
         ConsoleOnly::Monitorx => {
             KINDS[K_MONITORX].fetch_add(1, Relaxed);
-            MONITOR.with(|m| m.set((ctx.Rax as usize, ctx.Rsi)));
+            let address = ctx.Rax as usize;
+            let armed = if pacing().block { armed_value(address, clock_us()) } else { None };
+            MONITOR.with(|m| m.set((address, ctx.Rsi, armed)));
         }
         ConsoleOnly::Mwaitx => {
             KINDS[K_MWAITX].fetch_add(1, Relaxed);
-            wait_step(rip);
-            std::hint::spin_loop()
+            let waited = wait_step(rip);
+            let plan = pacing().plan(waited, ctx.Rcx, ctx.Rbx);
+            if waited >= pacing().spin_us && ctx.Rcx & 2 != 0 {
+                static SAID: AtomicU64 = AtomicU64::new(0);
+                if SAID.fetch_add(1, Relaxed) < 4 {
+                    tracing::info!(
+                        "mwaitx: the title's timer is on (ecx {:#x}): ebx {:#x} ticks, {} us at 4 GHz; {}",
+                        ctx.Rcx as u32,
+                        ctx.Rbx as u32,
+                        (ctx.Rbx & 0xFFFF_FFFF) / TICKS_PER_US,
+                        plan.map_or_else(|| "spun".to_owned(), |t| format!("blocks {t} us"))
+                    );
+                }
+            }
+            if !plan.is_some_and(block) {
+                std::hint::spin_loop()
+            }
         }
         ConsoleOnly::Clzero | ConsoleOnly::ClzeroStep { .. } => {
             // The loop `mov rax, ptr; add ptr, 0x40; clzero; cmp ptr, end; jb` (the title's
@@ -671,7 +936,7 @@ mod tests {
 
     #[test]
     fn the_report_names_the_waits_under_way_longest_first() {
-        let w = |thread, address, begin, last, spins| Waiting { thread, rip: 0x5000, address, wanted: 7, begin, last, spins };
+        let w = |thread, address, begin, last, spins| Waiting { thread, rip: 0x5000, address, wanted: 7, begin, last, spins, blocked: if thread == 12 { 990 } else { 0 } };
         let waits = [
             w(0, 0, 0, 0, 0),
             // ended long ago
@@ -687,7 +952,7 @@ mod tests {
             out,
             "2 title threads in an emulated mwaitx wait now (3 ever used it); \
              thread 13 at 0x5000 waits 40.0 s for the value at 0x300 (wants 0x7, holds 0x6), 10000000 mwaitx (250000 a second); \
-             thread 12 at 0x5000 waits 9.5 s for the value at 0x200 (wants 0x7, holds not readable), 1000 mwaitx (105 a second)"
+             thread 12 at 0x5000 waits 9.5 s for the value at 0x200 (wants 0x7, holds not readable), 1000 mwaitx (105 a second, 990 of them blocked)"
         );
     }
 
@@ -706,6 +971,214 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    #[test]
+    fn mwaitx_spins_first_then_blocks_within_the_title_s_timer() {
+        let p = Pacing::parse(None, None, None);
+        assert_eq!(p, Pacing { block: true, spin_us: 200, timeout_us: 1_000 }, "the defaults");
+        assert_eq!(Pacing::parse(Some("spin"), None, None).plan(10_000_000, 0, 0), None, "VICTORY_MWAITX=spin");
+        assert_eq!(Pacing::parse(Some("wait"), Some("50"), Some("300")), Pacing { block: true, spin_us: 50, timeout_us: 300 });
+        assert_eq!(Pacing::parse(None, Some("x"), Some("1")).timeout_us, MIN_BLOCK_US, "nonsense and too small");
+        // the spin phase, then blocks of the timeout
+        assert_eq!(p.plan(0, 0, 0), None);
+        assert_eq!(p.plan(199, 0, 0), None);
+        assert_eq!(p.plan(200, 0, 0), Some(1_000));
+        assert_eq!(p.plan(5_000_000, 0, 0), Some(1_000));
+        // EBX without ECX bit 1 is no timer
+        assert_eq!(p.plan(500, 1, 4_000), Some(1_000));
+        // the title's timer: 400,000 ticks are 100 us at 4 GHz; a long one is capped
+        assert_eq!(p.plan(500, 2, 400_000), Some(100));
+        assert_eq!(p.plan(500, 3, 0xFFFF_FFFF), Some(1_000));
+        assert_eq!(p.plan(500, 2, 0x1_0000_0000 + 400_000), Some(100), "EBX is 32 bits");
+        // too short to block: spun
+        assert_eq!(p.plan(500, 2, 4_000 * (MIN_BLOCK_US - 1)), None);
+        assert_eq!(p.plan(500, 2, 0), None);
+        // a wait goes on across a block
+        assert!(p.gap_us() > p.timeout_us && p.gap_us() >= 2_000);
+        assert_eq!(Pacing::parse(None, None, Some("10000")).gap_us(), 21_000);
+        assert_eq!(Pacing::parse(Some("spin"), None, Some("10000")).gap_us(), 2_000, "as before");
+        assert_eq!((wait_size(0x1000), wait_size(0x1004), wait_size(0x1002), wait_size(0x1001)), (Some(8), Some(4), None, None));
+    }
+
+    /// The emulated `monitorx` / `mwaitx` pair on `value`, as the title runs it: `(rip after,
+    /// microseconds the mwaitx took)`.
+    fn monitor_and_wait(value: &AtomicU64, ecx: u64, ebx: u64) -> (u64, u64) {
+        let (monitorx, mwaitx) = ([0x0Fu8, 0x01, 0xFA, 0x90], [0x0Fu8, 0x01, 0xFB, 0x90]);
+        // SAFETY: plain data.
+        let mut ctx: CONTEXT = unsafe { std::mem::zeroed() };
+        ctx.Rip = monitorx.as_ptr() as u64;
+        ctx.Rax = value.as_ptr() as u64;
+        ctx.Rsi = 1;
+        // SAFETY: the context points at the code above.
+        assert_eq!(unsafe { emulate(&mut ctx) }, CONTINUE_EXECUTION);
+        assert_eq!(ctx.Rip, monitorx.as_ptr() as u64 + 3);
+        ctx.Rip = mwaitx.as_ptr() as u64;
+        (ctx.Rcx, ctx.Rbx) = (ecx, ebx);
+        let start = clock_us();
+        // SAFETY: as above.
+        assert_eq!(unsafe { emulate(&mut ctx) }, CONTINUE_EXECUTION);
+        (ctx.Rip - mwaitx.as_ptr() as u64, clock_us() - start)
+    }
+
+    fn my_slot() -> &'static waiting::Slot {
+        // SAFETY: no preconditions.
+        let me = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+        waiting::TABLE.iter().find(|s| s.thread.load(Relaxed) == me).expect("a slot")
+    }
+
+    #[test]
+    fn a_long_mwaitx_wait_blocks_and_its_timeout_ends_each_block() {
+        std::thread::spawn(|| {
+            let value = AtomicU64::new(0);
+            let start = clock_us();
+            // the spin phase: no block
+            let (step, _) = monitor_and_wait(&value, 0, 0);
+            assert_eq!(step, 3, "stepped over");
+            assert_eq!(my_slot().blocked.load(Relaxed), 0);
+            while clock_us() - start < pacing().spin_us + 50 {
+                monitor_and_wait(&value, 0, 0);
+            }
+            assert!(my_slot().spins.load(Relaxed) >= 2, "one wait");
+            // then blocks of the timeout, the value unchanged (on a loaded machine a block may
+            // overrun the gap that keeps a wait one wait: it begins anew, spins, blocks again)
+            let mut blocks = 0;
+            while blocks == 0 && clock_us() - start < 5_000_000 {
+                let blocked = my_slot().blocked.load(Relaxed);
+                let (step, took) = monitor_and_wait(&value, 0, 0);
+                assert_eq!(step, 3);
+                if my_slot().blocked.load(Relaxed) == blocked + 1 {
+                    blocks += 1;
+                    assert!(took >= pacing().timeout_us / 2, "until the timeout: {took} us");
+                    assert!(took < 1_000_000, "{took} us");
+                }
+            }
+            assert_eq!(blocks, 1, "it blocked");
+            // the title's timer caps the next at 100 us (`plan`; the clock here is too coarse
+            // to tell 100 from 1,000 us on a loaded machine)
+            let (_, took) = monitor_and_wait(&value, 2, 400_000);
+            assert!(took < 1_000_000, "the title's timer: {took} us");
+            // the wait, in the stall report's table
+            assert_eq!(my_slot().address.load(Relaxed), value.as_ptr() as u64);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn a_value_changed_after_monitorx_ends_the_block_at_once() {
+        std::thread::spawn(|| {
+            let value = AtomicU64::new(0);
+            let start = clock_us();
+            // into the wait phase (a block has found the page readable)
+            while my_slot_blocked() == 0 && clock_us() - start < 5_000_000 {
+                monitor_and_wait(&value, 0, 0);
+            }
+            assert!(my_slot_blocked() > 0);
+            // monitorx reads 0; the value moves before the mwaitx: no wait at all
+            let (monitorx, mwaitx) = ([0x0Fu8, 0x01, 0xFA], [0x0Fu8, 0x01, 0xFB]);
+            // SAFETY: plain data.
+            let mut ctx: CONTEXT = unsafe { std::mem::zeroed() };
+            ctx.Rip = monitorx.as_ptr() as u64;
+            ctx.Rax = value.as_ptr() as u64;
+            ctx.Rsi = 1;
+            // SAFETY: the context points at the code above.
+            assert_eq!(unsafe { emulate(&mut ctx) }, CONTINUE_EXECUTION);
+            value.store(1, Relaxed);
+            ctx.Rip = mwaitx.as_ptr() as u64;
+            let (woken, _, _) = victory_core::wake::counts();
+            let at = clock_us();
+            // SAFETY: as above.
+            assert_eq!(unsafe { emulate(&mut ctx) }, CONTINUE_EXECUTION);
+            let took = clock_us() - at;
+            assert!(victory_core::wake::counts().0 > woken, "ended as changed");
+            assert!(took < pacing().timeout_us, "{took} us");
+        })
+        .join()
+        .unwrap();
+    }
+
+    fn my_slot_blocked() -> u64 {
+        // SAFETY: no preconditions.
+        let me = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+        waiting::TABLE.iter().find(|s| s.thread.load(Relaxed) == me).map_or(0, |s| s.blocked.load(Relaxed))
+    }
+
+    #[test]
+    fn a_waiter_blocked_in_mwaitx_goes_on_once_the_runtime_writes() {
+        use std::sync::Arc;
+        let value = Arc::new(AtomicU64::new(0));
+        let waiter = {
+            let value = Arc::clone(&value);
+            std::thread::spawn(move || {
+                let start = clock_us();
+                // as the title: wait while the value is 0, at most 10 s
+                let mut blocks = 0u64;
+                while value.load(Relaxed) == 0 && clock_us() - start < 10_000_000 {
+                    monitor_and_wait(&value, 0, 0);
+                    blocks = my_slot_blocked();
+                }
+                (clock_us() - start, blocks)
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // the runtime's write and wake, as a fence's
+        value.store(5, Relaxed);
+        victory_core::wake::written(value.as_ptr() as usize, 8);
+        let (took, blocks) = waiter.join().unwrap();
+        assert!(blocks > 0, "it blocked");
+        assert!(took < 5_000_000, "released: {took} us");
+    }
+
+    #[test]
+    fn an_instruction_patched_by_another_thread_runs_again_as_patched() {
+        for (len, nop) in NOPS.iter().enumerate() {
+            assert_eq!(nop.len(), len + 1);
+            assert_eq!(decode::decode(nop), None, "{nop:02x?} is no console instruction");
+            assert!(is_patched(nop));
+        }
+        assert!(!is_patched(&[0x66, 0x0F, 0xAE, 0x30]), "clwb [rax]");
+        assert!(!is_patched(&[0x0F, 0x01, 0xFB]));
+        assert!(!is_patched(&[0x0F, 0x1F]), "a NOP cut short");
+        assert_eq!(patch_word(0x1000, 4), Some((0x1000, 0)));
+        assert_eq!(patch_word(0x1003, 5), Some((0x1000, 3)));
+        assert_eq!(patch_word(0x1005, 4), None, "across two words");
+        assert_eq!(patch_word(0x1000, 10), None);
+        assert_eq!(with_nop(0x1122_3344_5566_7788, 2, 4), u64::from_le_bytes([0x88, 0x77, 0x0F, 0x1F, 0x40, 0x00, 0x22, 0x11]));
+
+        // clwb [rax] in a word of its own: emulated, patched, stepped over
+        #[repr(align(8))]
+        struct Code([u8; 24]);
+        let mut code = Code([0xCC; 24]);
+        code.0[8..12].copy_from_slice(&[0x66, 0x0F, 0xAE, 0x30]);
+        let at = code.0.as_mut_ptr() as u64 + 8;
+        // SAFETY: plain data.
+        let mut ctx: CONTEXT = unsafe { std::mem::zeroed() };
+        ctx.Rip = at;
+        ctx.Rax = at;
+        // SAFETY: the context points at the code above.
+        assert_eq!(unsafe { emulate(&mut ctx) }, CONTINUE_EXECUTION);
+        assert_eq!(ctx.Rip, at + 4);
+        // SAFETY: our own bytes, written by the patch.
+        let now = unsafe { std::ptr::read_volatile(&raw const code.0) };
+        assert_eq!(&now[8..12], NOPS[3], "one 4-byte NOP");
+        assert_eq!((&now[..8], &now[12..]), (&[0xCC; 8][..], &[0xCC; 12][..]), "nothing else");
+        // another thread that faulted on it before the patch: it runs the NOP, unstepped
+        ctx.Rip = at;
+        // SAFETY: as above.
+        assert_eq!(unsafe { emulate(&mut ctx) }, CONTINUE_EXECUTION);
+        assert_eq!(ctx.Rip, at, "not stepped");
+        // a clwb across two words is stepped over, not patched
+        let mut code = Code([0xCC; 24]);
+        code.0[6..10].copy_from_slice(&[0x66, 0x0F, 0xAE, 0x30]);
+        let at = code.0.as_mut_ptr() as u64 + 6;
+        ctx.Rip = at;
+        // SAFETY: as above.
+        assert_eq!(unsafe { emulate(&mut ctx) }, CONTINUE_EXECUTION);
+        assert_eq!(ctx.Rip, at + 4);
+        // SAFETY: our own bytes.
+        let now = unsafe { std::ptr::read_volatile(&raw const code.0) };
+        assert_eq!(&now[6..10], &[0x66, 0x0F, 0xAE, 0x30], "left as it was");
     }
 
     #[test]

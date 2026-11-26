@@ -123,6 +123,9 @@ pub(crate) fn set(this: This, value: u64) {
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     fence.value.store(value, Ordering::Release);
+    // The title reads the value at the fence's GPU address, and may wait there in an
+    // emulated `mwaitx` (`VICTORY_MWAITX=wait`).
+    victory_core::wake::written(fence.value.as_ptr() as usize, 8);
     #[cfg(all(windows, feature = "diagnostics"))]
     pace::reached(this, &fence.asked, value);
     waiters.retain(|&(wanted, event)| {

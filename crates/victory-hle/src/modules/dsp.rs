@@ -219,6 +219,8 @@ pub extern "system" fn XDspSubmitCommand(
         std::ptr::write_volatile(&mut status.result, S_OK);
         std::ptr::write_volatile(&mut status.completed, next);
     }
+    // Title code on another thread may wait for it in an emulated `mwaitx`.
+    victory_core::wake::written((&raw const status.completed) as usize, size_of_val(&status.completed));
     if !ticket.is_null() {
         // SAFETY: optional out parameter.
         unsafe { ticket.write(next) };
