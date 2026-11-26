@@ -35,6 +35,10 @@ pub(crate) struct Shadow {
     /// Per page of title memory from `start`'s on: the write-watch asking
     /// after which it was last copied (0: never).
     copied: Mutex<Vec<u64>>,
+    /// `VICTORY_MEM_SUBPAGE`: per page held only in part by refreshes, the
+    /// byte ranges taken and their askings ([`crate::memopt::gaps`]).
+    /// Locked after `copied`.
+    parts: Mutex<std::collections::HashMap<usize, crate::memopt::Parts>>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
@@ -3871,6 +3875,7 @@ impl Shadow {
             start,
             len,
             copied: Mutex::new(vec![0; pages as usize]),
+            parts: Mutex::default(),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             flights: Mutex::default(),
@@ -4627,6 +4632,7 @@ impl Shadow {
         if from >= to {
             return 0;
         }
+        crate::memopt::add(crate::memopt::K::Calls, 1);
         let mut busy: Vec<(usize, usize)> = self
             .pending
             .lock()
@@ -4709,6 +4715,10 @@ impl Shadow {
                 return copied;
             }
             self.watched.store(NOT_WATCHED, Ordering::Relaxed);
+        }
+        crate::memopt::add(crate::memopt::K::Unwatched, (to - from) as u64);
+        if self.card.is_some() {
+            crate::memopt::add(crate::memopt::K::Card, (to - from) as u64);
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
@@ -4810,11 +4820,20 @@ impl Shadow {
     /// the 4 KiB pages its last asking found and the asking before that which found the page written. A copy that
     /// took the page at or after that earlier asking copies only those 4 KiB pages: the others have not been written
     /// since it took them (`crate::watch::dirty4k`).
+    ///
+    /// `VICTORY_MEM_SUBPAGE` ([`crate::memopt`]): a page the range holds only
+    /// in part keeps the byte ranges taken of it, and copies only what is
+    /// not held by one taken at or after its last write.
     fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)], subs: &[(usize, u64, u64, u16)]) -> usize {
+        use crate::memopt::{K, add};
         const KERNEL_PAGE: usize = 4096;
         let narrow = !subs.is_empty() && crate::watch::dirty4k();
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        // Locked after `copied`; only while the switch is on.
+        let mut parts = crate::memopt::subpage_on().then(|| self.parts.lock().unwrap_or_else(|e| e.into_inner()));
+        // Bytes copied on pages held whole, held in part; left out as held.
+        let (mut whole_bytes, mut part_bytes, mut saved) = (0usize, 0usize, 0usize);
         let mut writes = written.iter().peekable();
         let mut subs = subs.iter().peekable();
         let (mut bytes, mut run): (_, Option<usize>) = (0, None);
@@ -4836,10 +4855,16 @@ impl Shadow {
             if *at == 0 || write > *at {
                 let taken = *at;
                 // A page only partly in the range is copied in part: it
-                // stays stale for the rest.
+                // stays stale for the rest (unless its parts are kept).
                 let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                let whole = (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to;
+                let (lo, hi) = ((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
+                if whole {
                     *at = now;
+                    // Taken whole: its ranges say nothing more.
+                    if let Some(parts) = parts.as_mut() {
+                        parts.remove(&page);
+                    }
                 }
                 // Only the 4 KiB pages written since the copy took the page: the asking before the last one that
                 // found it written came no later than the copy's taking.
@@ -4847,6 +4872,22 @@ impl Shadow {
                 if crate::watch::dirty4k_kept() {
                     crate::watch::dirty4k_count(found, narrow && found.is_some());
                 }
+                if !whole && let Some(parts) = parts.as_mut() {
+                    if let Some(first) = run.take() {
+                        bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                    }
+                    let kept = parts.entry(page).or_default();
+                    let (pieces, held) = crate::memopt::pieces(kept, page * PAGE, lo, hi, write, now, found.filter(|_| narrow));
+                    for (a, e) in pieces {
+                        let n = self.copy(a, e);
+                        bytes += n;
+                        part_bytes += n;
+                    }
+                    saved += held;
+                    continue;
+                }
+                // What the page gives the counters: bytes read of it.
+                let kind = if whole { &mut whole_bytes } else { &mut part_bytes };
                 if narrow && let Some(bits) = found {
                     if let Some(first) = run.take() {
                         bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
@@ -4863,11 +4904,14 @@ impl Shadow {
                         }
                         let (lo, hi) = ((page * PAGE + a * KERNEL_PAGE).max(from), (page * PAGE + k * KERNEL_PAGE).min(to));
                         if lo < hi {
-                            bytes += self.copy(lo, hi);
+                            let n = self.copy(lo, hi);
+                            bytes += n;
+                            *kind += n;
                         }
                     }
                     continue;
                 }
+                *kind += hi - lo;
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {
                 bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
@@ -4876,6 +4920,12 @@ impl Shadow {
         // Cut to the range: next to it shaders may be writing the copy.
         if let Some(first) = run {
             bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+        }
+        add(K::Whole, whole_bytes as u64);
+        add(K::Part, part_bytes as u64);
+        add(K::SubpageSaved, saved as u64);
+        if self.card.is_some() {
+            add(K::Card, bytes as u64);
         }
         bytes
     }

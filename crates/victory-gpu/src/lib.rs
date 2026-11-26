@@ -16,6 +16,8 @@
 //! `present` (swap chain).
 
 #[cfg(windows)]
+mod alt;
+#[cfg(windows)]
 mod ambient;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod backreads;
@@ -65,6 +67,8 @@ mod over;
 pub mod pipeline;
 #[cfg(windows)]
 mod plaincopy;
+#[cfg(windows)]
+mod memopt;
 #[cfg(windows)]
 mod primitive;
 #[cfg(all(windows, feature = "diagnostics"))]

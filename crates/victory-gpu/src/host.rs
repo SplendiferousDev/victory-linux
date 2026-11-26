@@ -10135,6 +10135,7 @@ impl Meter {
         card_clock_line(frames, ms);
         crate::queue2::line(frames);
         crate::plaincopy::line(frames);
+        crate::memopt::line(frames);
         #[cfg(feature = "diagnostics")]
         crate::backreads::line(frames);
         crate::shadow::placed_line();
