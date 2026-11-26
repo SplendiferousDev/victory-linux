@@ -149,6 +149,14 @@ pub(crate) struct HostHeap {
     /// 2 = CBV, 3 = buffer UAV, 0 = other/non-null) so `VICTORY_SYNC_NULL_SKIP`
     /// avoids recreating an identical null view.
     nulls: Vec<std::sync::atomic::AtomicU8>,
+    /// View heaps: per slot (the dynamic ones too), what was written there
+    /// last: 0 nothing yet, [`SLOT_CONSTANT`] a constant buffer view (or its
+    /// null), [`SLOT_OTHER`] any other view (or its null). A shader that
+    /// reads a slot as a constant buffer view while it holds another kind
+    /// makes NVIDIA's constant cache read an address decoded from that
+    /// view's bits: `Xid 31 ... GPCCLIENT_GCC ... FAULT_PDE` at a fixed
+    /// address (`crate::gpuwatch::slot_kind_changed`).
+    kinds: Vec<std::sync::atomic::AtomicU8>,
     /// The title memory each placed texture view of this heap describes,
     /// by slot and by address ([`Spans`]): which slots a newer view of
     /// other memory there makes stale, and which to look at again when the
@@ -1159,6 +1167,9 @@ impl HostHeap {
             tabled_buffers: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
+            kinds: (0..if sampler { 0 } else { count + extra })
+                .map(|_| std::sync::atomic::AtomicU8::new(0))
+                .collect(),
             nulls: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU8::new(0))
                 .collect(),
@@ -1635,6 +1646,7 @@ impl HostHeap {
                 continue;
             };
             if let Some(kept) = make(&view, self.cpu(slot)) {
+                self.wrote(slot, is_constant(&view));
                 self.keep(slot, kept);
                 remade += 1;
             }
@@ -1684,8 +1696,14 @@ impl HostHeap {
             return;
         }
         match view_at(key as u32, (key >> 32) as u32) {
-            Some(view) => null_for(&view, self.cpu(index)),
-            None => null_view(self.cpu(index)),
+            Some(view) => {
+                null_for(&view, self.cpu(index));
+                self.wrote(index, is_constant(&view));
+            }
+            None => {
+                null_view(self.cpu(index));
+                self.wrote(index, false);
+            }
         }
         self.keep(index, None);
     }
@@ -1903,6 +1921,7 @@ impl HostHeap {
         if kept.is_none() {
             null_for(view, self.cpu(index));
         }
+        self.wrote(index, is_constant(view));
         self.keep(index, kept.flatten());
     }
 
@@ -1912,6 +1931,7 @@ impl HostHeap {
             self.null_sampler(index);
         } else {
             null_view(self.cpu(index));
+            self.wrote(index, false);
         }
         self.keep(index, None);
     }
@@ -1980,6 +2000,7 @@ impl HostHeap {
             host.device
                 .CreateShaderResourceView(buffer, Some(&desc), self.cpu(index))
         };
+        self.wrote(index, false);
         self.keep(index, Some(buffer.clone()));
     }
 
@@ -1987,6 +2008,7 @@ impl HostHeap {
     /// zeros.
     pub(crate) fn null_raw_at(&self, index: u32) {
         null_buffer_view(self.cpu(index));
+        self.wrote(index, false);
         self.keep(index, None);
     }
 
@@ -2019,6 +2041,7 @@ impl HostHeap {
                 self.cpu(index),
             )
         };
+        self.wrote(index, false);
         self.keep(index, Some(buffer.clone()));
     }
 
@@ -2047,6 +2070,7 @@ impl HostHeap {
                 self.cpu(index),
             )
         };
+        self.wrote(index, false);
     }
 
     /// The shader-visible handle of slot `index`.
@@ -2072,6 +2096,21 @@ impl HostHeap {
             host.device
                 .CreateConstantBufferView(Some(&desc), self.cpu(index))
         };
+        self.wrote(index, true);
+    }
+
+    /// Notes what kind of view slot `index` now holds ([`HostHeap::kinds`]):
+    /// a constant buffer view (`constant`) or another. A change between the
+    /// two while submissions are in flight is said (`crate::gpuwatch`).
+    fn wrote(&self, index: u32, constant: bool) {
+        let Some(kind) = self.kinds.get(index as usize) else {
+            return;
+        };
+        let now = if constant { SLOT_CONSTANT } else { SLOT_OTHER };
+        let was = kind.swap(now, std::sync::atomic::Ordering::Relaxed);
+        if was != 0 && was != now {
+            crate::gpuwatch::slot_kind_changed(index, index >= self.count, constant, crate::host::submissions_in_flight());
+        }
     }
 
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
@@ -2365,7 +2404,11 @@ impl HostHeap {
             let kept = if later {
                 None
             } else {
-                make(&view, self.cpu(index))
+                let kept = make(&view, self.cpu(index));
+                if kept.is_some() {
+                    self.wrote(index, is_constant(&view));
+                }
+                kept
             };
             if kept.is_none() && !self.sampler {
                 let kind = null_kind(&view);
@@ -2376,6 +2419,7 @@ impl HostHeap {
                     && null.is_some_and(|n| n.load(std::sync::atomic::Ordering::Relaxed) == kind);
                 if !same_null {
                     null_for(&view, self.cpu(index));
+                    self.wrote(index, is_constant(&view));
                     self.keep(index, None);
                     if let Some(null) = null {
                         null.store(kind, std::sync::atomic::Ordering::Relaxed);
@@ -3153,6 +3197,16 @@ fn twin_uav(
     Some(desc)
 }
 
+/// [`HostHeap::kinds`]: a constant buffer view (or its null) last written.
+const SLOT_CONSTANT: u8 = 1;
+/// [`HostHeap::kinds`]: another view (or its null) last written.
+const SLOT_OTHER: u8 = 2;
+
+/// Whether `view` is made as a constant buffer view (or its null).
+fn is_constant(view: &View) -> bool {
+    matches!(view, View::Constant(..))
+}
+
 /// The size of a constant buffer view the host takes: 256-byte steps, and
 /// at most 4,096 vectors (65,536 bytes, `D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT`).
 /// The title names constant views of more (one of 1,306,368 bytes, in the
@@ -3196,6 +3250,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 BufferLocation: gpu,
                 SizeInBytes: constant_view_size(size),
             };
+            // The view rounded up to 256 bytes may reach past the copy's end
+            // (the constant cache then reads memory not the copy's).
+            crate::gpuwatch::view_past_end("constant buffer view", address, shadow.left(address), desc.SizeInBytes.into());
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
             Some(Some(shadow.buffer.clone()))

@@ -3778,7 +3778,13 @@ unsafe impl Sync for Shadow {}
 impl Shadow {
     /// The host GPU address of a title address inside the buffer.
     pub(crate) fn gpu(&self, address: u64) -> u64 {
-        self.gpu + (address - self.start)
+        if self.offset_in(address).is_none() {
+            // A host address outside the copy: past its end, or (with the
+            // subtraction wrapping) far below it. The card would read
+            // memory that is not this copy's (`crate::gpuwatch`).
+            crate::gpuwatch::outside(address, self.start, self.len, self.gpu);
+        }
+        self.gpu.wrapping_add(address.wrapping_sub(self.start))
     }
 
     /// The title memory the copy is of: its start and length.
