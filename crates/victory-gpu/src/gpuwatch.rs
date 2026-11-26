@@ -205,6 +205,7 @@ pub(crate) fn slot_kind_changed(index: u32, dynamic: bool, constant: bool, in_fl
         usize::from(dynamic)
     };
     let n = KIND_CHANGES[i].fetch_add(1, Ordering::Relaxed);
+    crate::slotkind::changed(dynamic, in_flight);
     if in_flight > 0 && n < 16 {
         tracing::warn!(
             index,
@@ -270,6 +271,7 @@ pub(crate) fn roots_section(out: &mut String) {
         KIND_CHANGES[1].load(Ordering::Relaxed),
         KIND_CHANGES[2].load(Ordering::Relaxed)
     );
+    crate::slotkind::section(out);
     let [objects, bytes, ever] = held();
     let _ = write!(
         out,

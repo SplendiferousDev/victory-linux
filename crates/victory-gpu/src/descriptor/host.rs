@@ -1879,10 +1879,7 @@ impl HostHeap {
                 null_for(&view, self.cpu(index));
                 self.wrote(index, is_constant(&view));
             }
-            None => {
-                null_view(self.cpu(index));
-                self.wrote(index, false);
-            }
+            None => self.null_keeping(index),
         }
         self.keep(index, None);
     }
@@ -2111,12 +2108,12 @@ impl HostHeap {
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
+    /// A title slot keeps the kind it held ([`HostHeap::null_keeping`]).
     pub(crate) fn make_null(&self, index: u32) {
         if self.sampler {
             self.null_sampler(index);
         } else {
-            null_view(self.cpu(index));
-            self.wrote(index, false);
+            self.null_keeping(index);
         }
         self.keep(index, None);
     }
@@ -2314,6 +2311,51 @@ impl HostHeap {
         if was != 0 && was != now {
             crate::gpuwatch::slot_kind_changed(index, index >= self.count, constant, crate::host::submissions_in_flight());
         }
+    }
+
+    /// Before title slot `index` is written with a view that is a constant
+    /// buffer view (`constant`) or not: a change of kind waits for the
+    /// submissions in flight to land (`crate::slotkind`).
+    fn gate(&self, index: u32, constant: bool) {
+        let Some(kind) = self.kinds.get(index as usize) else {
+            return;
+        };
+        let now = if constant { SLOT_CONSTANT } else { SLOT_OTHER };
+        crate::slotkind::gate(index, index >= self.count, kind.load(std::sync::atomic::Ordering::Relaxed), now);
+    }
+
+    /// Makes slot `index` read nothing, keeping its kind if it is a title
+    /// slot: a null constant buffer view where it held a constant buffer
+    /// view, else a null texture view. A list in flight that reads the slot
+    /// as it was then reads zeros instead of decoding an address from
+    /// another kind of view (`crate::slotkind`); nothing new reads a slot
+    /// without a view.
+    fn null_keeping(&self, index: u32) {
+        let constant = index < self.count
+            && self
+                .kinds
+                .get(index as usize)
+                .is_some_and(|k| k.load(std::sync::atomic::Ordering::Relaxed) == SLOT_CONSTANT);
+        if constant {
+            null_constant(self.cpu(index));
+        } else {
+            null_view(self.cpu(index));
+        }
+        self.wrote(index, constant);
+    }
+
+    /// Makes slot `index` (a dynamic one, a table entry a shader reads as
+    /// a constant buffer) a constant buffer view that reads zeros.
+    pub(crate) fn null_constant_at(&self, index: u32) {
+        self.keep(index, None);
+        null_constant(self.cpu(index));
+        self.wrote(index, true);
+    }
+
+    /// What slot `index` holds ([`HostHeap::kinds`]).
+    #[cfg(test)]
+    pub(crate) fn kind_of(&self, index: u32) -> u8 {
+        self.kinds.get(index as usize).map_or(0, |k| k.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
@@ -2551,10 +2593,19 @@ impl HostHeap {
             mirror_how(MIRROR_FAST);
             return Some(view);
         }
+        let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
+        // A view that is written now (not left for a draw or its texture,
+        // as below) and changes the slot's kind waits for the submissions
+        // in flight first (`crate::slotkind`), outside the slots' lock.
+        // (A slot without a view keeps its kind: `null_keeping`.)
+        if let Some(view) = &view
+            && (for_draw || !(view.is_buffer() || view.waiting_texture().is_some()))
+        {
+            self.gate(index, is_constant(view));
+        }
         let mut made = locked(&self.made, 4);
         #[cfg(feature = "diagnostics")]
         let held = Held::start(for_draw);
-        let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
@@ -3713,9 +3764,9 @@ fn twin_uav(
 }
 
 /// [`HostHeap::kinds`]: a constant buffer view (or its null) last written.
-const SLOT_CONSTANT: u8 = 1;
+const SLOT_CONSTANT: u8 = crate::slotkind::CONSTANT;
 /// [`HostHeap::kinds`]: another view (or its null) last written.
-const SLOT_OTHER: u8 = 2;
+const SLOT_OTHER: u8 = crate::slotkind::OTHER;
 
 /// Whether `view` is made as a constant buffer view (or its null).
 fn is_constant(view: &View) -> bool {
@@ -3753,6 +3804,27 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     match view {
         &View::Constant(address, size) => {
             let shadow = crate::shadow::find(address, u64::from(size))?;
+            let bytes = constant_view_size(size);
+            // The view rounded up to 256 bytes may reach past the end of
+            // the copy's host buffer (a view at the end of a buffer whose
+            // length is not a multiple of 256: run qA-s1 had 560 bytes left
+            // for a view of 768, and 32 for one of 256), and the constant
+            // cache would read memory that is not the buffer's, unmapped
+            // where the buffer ends a page. Such a view is made on a copy
+            // of its own bytes, whose buffer is rounded up to 256 bytes
+            // (`crate::shadow::exact`); past the copy but inside its buffer
+            // it reads that buffer's bytes, as before.
+            let shadow = if room(&shadow, address) < u64::from(bytes) {
+                crate::gpuwatch::view_past_end(
+                    "constant buffer view (past its buffer; made on a copy of its own bytes)",
+                    address,
+                    shadow.left(address),
+                    bytes.into(),
+                );
+                crate::shadow::exact(address, u64::from(size))?
+            } else {
+                shadow
+            };
             let gpu = shadow.gpu(address);
             if gpu % 256 != 0 {
                 once!(
@@ -3763,11 +3835,8 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
-                SizeInBytes: constant_view_size(size),
+                SizeInBytes: bytes,
             };
-            // The view rounded up to 256 bytes may reach past the copy's end
-            // (the constant cache then reads memory not the copy's).
-            crate::gpuwatch::view_past_end("constant buffer view", address, shadow.left(address), desc.SizeInBytes.into());
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
             Some(Some(shadow.buffer.clone()))
@@ -4137,6 +4206,26 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         host.device
             .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
     };
+}
+
+/// Bytes of `shadow`'s host buffer from the host address of title
+/// `address` on: where a view made there may read without leaving the
+/// buffer (a copy's buffer may be longer than the copy).
+fn room(shadow: &crate::shadow::Shadow, address: u64) -> u64 {
+    // SAFETY: plain queries of a live buffer.
+    let (base, width) = unsafe { (shadow.buffer.GetGPUVirtualAddress(), shadow.buffer.GetDesc().Width) };
+    let Some(at) = shadow.offset_in(address) else {
+        return 0;
+    };
+    (base + width).saturating_sub(shadow.gpu(shadow.span().0) + at)
+}
+
+/// A constant buffer view that reads zeros.
+fn null_constant(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    let Some(host) = host() else { return };
+    let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
+    // SAFETY: a slot of our heap; a zero location makes a null view.
+    unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
 }
 
 /// A view that reads zeros, for slots whose view the host cannot make.
@@ -5022,6 +5111,30 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!(heap.dynamic(6), Some(4 + 10));
         // And nothing is found where nothing is.
         assert_eq!(heap.dynamic(1), None);
+    }
+
+    /// A title slot made null keeps the kind it held: a list in flight that
+    /// reads it as a constant buffer reads zeros through a null constant
+    /// buffer view, not an address decoded from a null texture view
+    /// (`crate::slotkind`). Our per-draw slots get the null texture view as
+    /// before; their lists hold them until they have landed.
+    #[test]
+    fn a_title_slot_made_null_keeps_its_kind() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        heap.constant_at(2, 0, 256);
+        assert_eq!(heap.kind_of(2), SLOT_CONSTANT);
+        heap.make_null(2);
+        assert_eq!(heap.kind_of(2), SLOT_CONSTANT, "a title slot keeps its kind");
+        heap.make_null(3);
+        assert_eq!(heap.kind_of(3), SLOT_OTHER, "a slot that never held a constant view");
+        let dynamic = heap.dynamic(1).unwrap();
+        heap.constant_at(dynamic, 0, 256);
+        heap.make_null(dynamic);
+        assert_eq!(heap.kind_of(dynamic), SLOT_OTHER, "a per-draw slot");
+        heap.null_constant_at(dynamic);
+        assert_eq!(heap.kind_of(dynamic), SLOT_CONSTANT);
     }
 
     #[test]

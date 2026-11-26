@@ -19,8 +19,11 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
 mod card_merge;
+mod slot_wait;
 mod stall_report;
 mod twin_ring;
+
+pub(crate) use slot_wait::land_started;
 
 #[cfg(test)]
 pub(crate) use card_merge::CARD_MERGE;
@@ -971,10 +974,25 @@ fn removal_memory() -> String {
 /// Says [`removal_context`] in the log, once: called by whoever finds the
 /// host device removed.
 pub(crate) fn log_removal_context() {
-    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !(trail_on() || dred_any()) || SAID.swap(true, Ordering::Relaxed) {
+    // 0 not said, 1 being said, 2 said. A second finder (the thread that
+    // ends the run) waits for the first to finish: run qA-s1 ended while
+    // another thread was still writing it, and the log had none of it.
+    static SAID: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    if !(trail_on() || dred_any()) {
         return;
     }
+    if SAID.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        let begun = std::time::Instant::now();
+        while SAID.load(Ordering::Acquire) == 1 && begun.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        return;
+    }
+    log_removal_context_once();
+    SAID.store(2, Ordering::Release);
+}
+
+fn log_removal_context_once() {
     if trail_on() {
         tracing::error!("when the host device went: {}", removal_context());
     }
@@ -10111,6 +10129,7 @@ impl Meter {
             );
         }
         crate::shadow::exact_line(frames);
+        crate::slotkind::line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
         card_clock_line(frames, ms);

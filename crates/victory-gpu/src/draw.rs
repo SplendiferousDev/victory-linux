@@ -4169,10 +4169,39 @@ impl State {
             for k in 0..n {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
+                let view = crate::descriptor::view(table + u64::from(k) * 32);
+                // An entry the shader reads as a constant buffer is made a
+                // constant buffer view whatever it holds: read through a
+                // slot of another kind (a null texture view where it holds
+                // no view, the title's buffer or texture view), NVIDIA's
+                // constant cache reads an address decoded from that view's
+                // bits and faults (`crate::slotkind`). A buffer view gives
+                // its bytes, as the console's descriptor would.
+                let view = match view {
+                    Some(View::Constant(..)) => view,
+                    _ if !used.is_some_and(|u| u.kind == ResourceType::Cbv) => view,
+                    Some(other) => match crate::descriptor::host::buffer_range(&other) {
+                        Some((address, len)) if len > 0 => {
+                            crate::slotkind::table_constant(crate::slotkind::TableEntry::BufferView);
+                            Some(View::Constant(address, len.min(1 << 16) as u32))
+                        }
+                        _ => {
+                            crate::slotkind::table_constant(crate::slotkind::TableEntry::OtherView);
+                            host.null_constant_at(index);
+                            continue;
+                        }
+                    },
+                    None => {
+                        crate::slotkind::table_constant(crate::slotkind::TableEntry::NoView);
+                        host.null_constant_at(index);
+                        continue;
+                    }
+                };
+                match view {
                     Some(View::Constant(address, size)) => {
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
-                            host.make_null(index);
+                            crate::slotkind::table_constant(crate::slotkind::TableEntry::NoRoom);
+                            host.null_constant_at(index);
                             continue;
                         };
                         list.defer_fill(to, address as *const u8, size as usize);
