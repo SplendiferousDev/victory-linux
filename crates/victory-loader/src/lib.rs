@@ -40,6 +40,8 @@ mod tls;
 mod windows;
 
 #[cfg(windows)]
+pub use console_insn::stall_report as mwait_stall_report;
+#[cfg(windows)]
 pub use crash::{
     locate, log_crash, log_crashes_to, note_title_output, report_crashes, report_unhandled,
 };

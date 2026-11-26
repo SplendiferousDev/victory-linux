@@ -743,10 +743,13 @@ pub(crate) fn before_sync() {
     }
 }
 
+/// One caller of [`release_held_now`] at a time, so a queue's submissions
+/// keep their order.
+#[cfg(windows)]
+static RELEASING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(windows)]
 fn release_held_now(all: bool) {
-    // One caller at a time, so a queue's submissions keep their order.
-    static RELEASING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     if lock(&WAITING).is_empty() {
         return;
     }
@@ -957,6 +960,79 @@ fn value_met(wait: &crate::list::ValueWait) -> bool {
     wait.met() || (crate::host::late() && crate::host::late_met(wait))
 }
 
+/// The stall report's section of the queues (`crate::stall`): for each
+/// queue that holds anything, what stands at the head of its line and what
+/// waits behind it; and whether a thread is inside [`release_held_now`].
+/// Only tries the locks.
+#[cfg(windows)]
+pub(crate) fn stall_section(out: &mut String) {
+    use crate::stall::HeldView;
+    use std::fmt::Write;
+    let _ = write!(
+        out,
+        "running the lines: {}; presents held in a line {}; ",
+        match RELEASING.try_lock() {
+            Ok(_) => "nobody",
+            Err(std::sync::TryLockError::WouldBlock) => "a thread is inside (lock RELEASING held)",
+            Err(_) => "nobody (lock poisoned)",
+        },
+        PRESENTS_HELD.load(Ordering::Relaxed)
+    );
+    let queues = match WAITING.try_lock() {
+        Ok(w) => w.clone(),
+        Err(_) => {
+            out.push_str("the list of waiting queues is locked (lock WAITING)");
+            return;
+        }
+    };
+    if queues.is_empty() {
+        out.push_str("no queue holds anything");
+        return;
+    }
+    let _ = write!(out, "{} queues hold something", queues.len());
+    for q in queues {
+        // SAFETY: a live queue: one released is taken off the list (its
+        // address may be stale if it went since the copy; only its lock and
+        // line are read, as `release_held_now` reads them).
+        let queue = unsafe { &*(q as *const Queue) };
+        let _ = write!(out, "; queue {q:#x} (kind {}): ", queue.kind);
+        let views: Vec<HeldView> = match queue.held.try_lock() {
+            Ok(held) => held
+                .iter()
+                .take(256)
+                .map(|h| match h {
+                    Held::Wait(fence, value) => {
+                        HeldView::Fence { fence: *fence, wanted: *value, now: crate::fence::completed(*fence as This) }
+                    }
+                    Held::Value(wait) => {
+                        let (address, bytes) = wait.place();
+                        let mut raw = [0u8; 8];
+                        let now = crate::host::peek(address as *const u8, &mut raw[..bytes]).then(|| u64::from_le_bytes(raw));
+                        HeldView::Value {
+                            address,
+                            wait: format!("{wait:?}"),
+                            now,
+                            met: now.is_some_and(|v| wait.holds_for(v)),
+                            flight_writes: crate::host::late_met_tried(wait),
+                        }
+                    }
+                    Held::Run(_, order) => HeldView::Run { lists: order.len() },
+                    Held::Signal(fence, value) => {
+                        HeldView::Signal { fence: *fence, value: *value, now: crate::fence::completed(*fence as This) }
+                    }
+                    Held::Running => HeldView::Running,
+                    Held::Present(_, _, frame, _) => HeldView::Present { frame: *frame },
+                })
+                .collect(),
+            Err(_) => {
+                out.push_str("its line is locked (the queue's lock `held`)");
+                continue;
+            }
+        };
+        crate::stall::describe_line(&views, out);
+    }
+}
+
 fn queue<'a>(this: This) -> &'a Queue {
     // SAFETY: called from queue methods only.
     unsafe { &*this.cast::<Queue>() }
@@ -1040,6 +1116,7 @@ extern "system" fn release(this: This) -> u32 {
 /// Runs the lists' host lists and waits for them (decision 0007). A queue
 /// that waits for a fence keeps them until the fence is reached.
 extern "system" fn execute(this: This, count: u32, lists: *const This) {
+    crate::stall::submitted();
     #[cfg(windows)]
     let started = std::time::Instant::now();
     execute_now(this, count, lists);
@@ -1307,6 +1384,7 @@ extern "system" fn present(
     {
         crate::framelog::add(crate::framelog::T::PresentUs, presenting.elapsed().as_micros() as u64);
         crate::framelog::frame();
+        crate::stall::presented();
         #[cfg(feature = "diagnostics")]
         crate::fence::pace::frame();
     }

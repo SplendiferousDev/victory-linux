@@ -728,6 +728,42 @@ fn staging_bytes(request: &Request) -> u64 {
 
 /// Ends a queue: what was not started is dropped, and this waits for the
 /// reads already running (they write title memory).
+/// The stall report's section (`victory_gpu::stall`): per queue that has
+/// anything, its requests not submitted, held, submitted and not started,
+/// running, and status entries not written; and the staging in use. Only
+/// tries the lock.
+pub(crate) fn stall_report(out: &mut String) {
+    use std::fmt::Write;
+    let Some(scheduler) = scheduler() else {
+        out.push_str("no scheduler");
+        return;
+    };
+    let Ok(lanes) = scheduler.lanes.try_lock() else {
+        out.push_str("locked (the scheduler's lock `lanes`)");
+        return;
+    };
+    let _ = write!(out, "staging {} of {} KiB in use{}", lanes.staged >> 10, lanes.staging >> 10, if lanes.starved { ", a start waited for it" } else { "" });
+    let busy: Vec<(&u64, &Lane)> = lanes
+        .lanes
+        .iter()
+        .filter(|(_, l)| !(l.unsubmitted.is_empty() && l.held.is_empty() && l.reads.is_empty() && l.statuses.is_empty() && l.running.is_empty()))
+        .collect();
+    let _ = write!(out, "; {} queues, {} with requests", lanes.lanes.len(), busy.len());
+    for (id, l) in busy.iter().take(16) {
+        let _ = write!(
+            out,
+            "; queue {id} (class {}): {} not submitted, {} held for the title's submit, {} reads not started, {} running, {} status entries not written{}",
+            l.class,
+            l.unsubmitted.len(),
+            l.held.len(),
+            l.reads.len(),
+            l.running.len(),
+            l.statuses.len(),
+            if l.closed { ", closed" } else { "" }
+        );
+    }
+}
+
 fn close_lane(id: u64) {
     let Some(scheduler) = scheduler() else {
         return;

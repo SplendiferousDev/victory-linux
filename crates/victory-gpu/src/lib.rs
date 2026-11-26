@@ -65,6 +65,7 @@ mod primitive;
 mod profile;
 pub mod query;
 pub mod queue;
+pub mod stall;
 #[cfg(windows)]
 mod queue2;
 pub mod resource;
