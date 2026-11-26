@@ -152,6 +152,201 @@ fn watch(seconds: u64) {
     }
 }
 
+/// What the thread preparing or settling a submission does now, finer than
+/// its phase ([`doing`]). A run froze with the submitting thread "preparing
+/// a submission" for minutes and nothing said where inside that it stood.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum Doing {
+    /// Nothing marked since the last submission ended.
+    Nothing = 0,
+    /// Waiting for flights in the air to be settled (detail: the `WHY_`
+    /// place), on this thread.
+    Settle,
+    /// Waiting for the thread that lands flights (detail: the `WHY_` place).
+    RelayWait,
+    /// Descriptors the title copied into placed heaps.
+    SyncHeaps,
+    /// The sweep of host copies held by nothing.
+    Sweep,
+    /// Slots that waited for a texture's host copy.
+    MakeWaiting,
+    /// The one write-watch asking of the submission's refreshes.
+    AskOnce,
+    /// A copy of title memory a list recorded (address, bytes).
+    Copy,
+    /// A fill of upload memory from title memory (source address, bytes).
+    Fill,
+    /// Work a list left for submission time.
+    Run,
+    /// The snapshot of a range shaders may write (address, bytes).
+    GpuWrite,
+    /// A texture's host copy refreshed.
+    Texture,
+    /// The refreshes of host copies the lists read, all at once.
+    Flush,
+    /// The snapshots left for after the refreshes.
+    Snapshots,
+    /// Copies in the card's memory: what changed goes up first.
+    CardBefore,
+    /// Handing the lists to the host queue.
+    Execute,
+}
+
+const DOING_NAMES: [&str; 16] = [
+    "nothing marked",
+    "settling flights in the air itself",
+    "waiting for the thread that lands flights",
+    "syncing descriptor heaps",
+    "the sweep",
+    "making slots that waited for textures",
+    "asking the write watch once",
+    "copying title memory",
+    "filling upload memory from title memory",
+    "running work a list left",
+    "snapshotting a range shaders may write",
+    "refreshing a texture's host copy",
+    "refreshing host copies (the batch)",
+    "taking snapshots",
+    "sending changes up to copies in the card's memory",
+    "handing the lists to the host queue",
+];
+
+/// [`Doing`], its detail, address and bytes, since when, and the Windows
+/// thread that marked it.
+static DOING_NOW: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// Marks what this thread does now inside a submission ([`Doing`]): a few
+/// relaxed stores, read only by the report.
+#[cfg(windows)]
+pub(crate) fn doing(what: Doing, detail: u64, address: usize, bytes: usize) {
+    // SAFETY: a plain query of the calling thread.
+    let thread = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+    DOING_NOW[1].store(detail, Ordering::Relaxed);
+    DOING_NOW[2].store(address as u64, Ordering::Relaxed);
+    DOING_NOW[3].store(bytes as u64, Ordering::Relaxed);
+    DOING_NOW[4].store(crate::host::now_us(), Ordering::Relaxed);
+    DOING_NOW[5].store(u64::from(thread), Ordering::Relaxed);
+    DOING_NOW[0].store(what as u64, Ordering::Relaxed);
+}
+
+/// The report's words for the last [`doing`] mark.
+#[cfg(windows)]
+fn describe_doing(now: u64, out: &mut String) {
+    let what = DOING_NOW[0].load(Ordering::Relaxed) as usize;
+    let _ = write!(
+        out,
+        "{} (detail {}, at {:#x}, {} bytes) for {:.1} ms, marked by thread {}",
+        DOING_NAMES.get(what).copied().unwrap_or("?"),
+        DOING_NOW[1].load(Ordering::Relaxed),
+        DOING_NOW[2].load(Ordering::Relaxed),
+        DOING_NOW[3].load(Ordering::Relaxed),
+        now.saturating_sub(DOING_NOW[4].load(Ordering::Relaxed)) as f64 / 1e3,
+        DOING_NOW[5].load(Ordering::Relaxed),
+    );
+}
+
+/// One thread of the process as Linux sees it: its id, name, state letter
+/// and the kernel function it sleeps in (`wchan`; "0" when running).
+#[derive(Debug, Clone, PartialEq)]
+struct KernelThread {
+    tid: u32,
+    comm: String,
+    state: char,
+    wchan: String,
+}
+
+/// The name and state from a `/proc/<pid>/task/<tid>/stat` line.
+fn parse_stat(line: &str) -> Option<(String, char)> {
+    let open = line.find('(')?;
+    let close = line.rfind(')')?;
+    let comm = line.get(open + 1..close)?.to_owned();
+    let state = line.get(close + 1..)?.trim_start().chars().next()?;
+    Some((comm, state))
+}
+
+/// Whether a thread's name is one of ours or the host's graphics stack's,
+/// said in the report whatever its state.
+fn named_ours(comm: &str) -> bool {
+    ["victory", "vkd3d", "dstorage", "card accounting"].iter().any(|p| comm.starts_with(p))
+}
+
+/// The kernel section's words: threads by state, every thread in an
+/// uninterruptible wait (`D`: the kernel, usually disk I/O, writeback or
+/// memory reclaim, holds it) with where it waits, then our own threads.
+fn describe_threads(threads: &[KernelThread], out: &mut String) {
+    let mut states: Vec<(char, usize)> = Vec::new();
+    for t in threads {
+        match states.iter_mut().find(|s| s.0 == t.state) {
+            Some(s) => s.1 += 1,
+            None => states.push((t.state, 1)),
+        }
+    }
+    states.sort();
+    let _ = write!(out, "{} threads (", threads.len());
+    for (i, (state, n)) in states.iter().enumerate() {
+        let _ = write!(out, "{}{state} {n}", if i > 0 { ", " } else { "" });
+    }
+    out.push_str("); in an uninterruptible wait (D): ");
+    let d: Vec<String> =
+        threads.iter().filter(|t| t.state == 'D').map(|t| format!("{} '{}' in {}", t.tid, t.comm, t.wchan)).collect();
+    out.push_str(if d.is_empty() { "none" } else { "" });
+    out.push_str(&d.join(", "));
+    let ours: Vec<String> =
+        threads.iter().filter(|t| named_ours(&t.comm)).map(|t| format!("'{}' {} {}", t.comm, t.state, t.wchan)).collect();
+    let _ = write!(out, "; ours: {}", ours.join(", "));
+}
+
+/// The process's Linux id, under Wine (`ProcessWineUnixPid`), else None.
+#[cfg(windows)]
+fn unix_pid() -> Option<u32> {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    /// Wine's information class for the process's Linux id.
+    const PROCESS_WINE_UNIX_PID: u32 = 1101;
+    type Query = unsafe extern "system" fn(isize, u32, *mut core::ffi::c_void, u32, *mut u32) -> i32;
+    // SAFETY: a lookup in ntdll, always loaded; the routine has this type,
+    // and Wine fills an int for this class (other hosts refuse the class).
+    unsafe {
+        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+        if ntdll.is_null() {
+            return None;
+        }
+        let query: Query = std::mem::transmute(GetProcAddress(ntdll, c"NtQueryInformationProcess".as_ptr().cast())?);
+        let mut pid: i32 = 0;
+        let status = query(-1, PROCESS_WINE_UNIX_PID, (&raw mut pid).cast(), 4, std::ptr::null_mut());
+        (status == 0 && pid > 0).then_some(pid as u32)
+    }
+}
+
+/// The report's kernel section: what Linux says of each of the process's
+/// threads (under Wine, through the `Z:` drive; nothing elsewhere).
+#[cfg(windows)]
+fn kernel_section(out: &mut String) {
+    let Some(pid) = unix_pid() else {
+        out.push_str("not under Wine");
+        return;
+    };
+    let dir = format!("Z:\\proc\\{pid}\\task");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        let _ = write!(out, "{dir} not readable");
+        return;
+    };
+    let mut threads = Vec::new();
+    for entry in entries.flatten() {
+        let Some(tid) = entry.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        let read = |what: &str| std::fs::read_to_string(format!("{dir}\\{tid}\\{what}")).unwrap_or_default();
+        let Some((comm, state)) = parse_stat(&read("stat")) else {
+            continue;
+        };
+        let wchan = read("wchan").trim().to_owned();
+        threads.push(KernelThread { tid, comm, state, wchan: if wchan.is_empty() { "?".to_owned() } else { wchan } });
+    }
+    threads.sort_by_key(|t| t.tid);
+    describe_threads(&threads, out);
+}
+
 /// Seconds from `at` to `now` (or "never").
 fn ago(now: u64, at: u64) -> String {
     if at == 0 { "never".to_owned() } else { format!("{:.1} s ago", now.saturating_sub(at) as f64 / 1e6) }
@@ -176,6 +371,9 @@ fn report(now: u64) -> String {
     };
     section("queues", &crate::queue::stall_section);
     section("flights", &crate::host::stall_section);
+    section("inside the submission", &|out: &mut String| describe_doing(now, out));
+    section("copy queues", &crate::queue2::stall_section);
+    section("kernel", &kernel_section);
     section("pipelines", &|out: &mut String| {
         let _ = write!(
             out,
@@ -354,6 +552,53 @@ mod tests {
         assert_eq!(out.matches("; then ").count(), 6);
         assert!(out.contains("; and 3 more waits and signals"), "{out}");
         assert!(out.ends_with("10 things in all"), "{out}");
+    }
+
+    #[test]
+    fn a_thread_stat_line_gives_its_name_and_state() {
+        assert_eq!(parse_stat("4242 (victory-submit) D 1 2 3"), Some(("victory-submit".to_owned(), 'D')));
+        // A name may hold spaces and parentheses: the last ')' ends it.
+        assert_eq!(parse_stat("7 (card (x) y) S 1"), Some(("card (x) y".to_owned(), 'S')));
+        assert_eq!(parse_stat("garbage"), None);
+    }
+
+    #[test]
+    fn threads_in_the_kernel_and_ours_are_named() {
+        let t = |tid, comm: &str, state, wchan: &str| KernelThread { tid, comm: comm.to_owned(), state, wchan: wchan.to_owned() };
+        let threads = [
+            t(1, "title", 'S', "futex_wait_queue"),
+            t(2, "victory-submit", 'D', "folio_wait_bit_common"),
+            t(3, "vkd3d_queue", 'S', "futex_wait_queue"),
+            t(4, "title", 'R', "0"),
+        ];
+        let mut out = String::new();
+        describe_threads(&threads, &mut out);
+        assert!(out.starts_with("4 threads (D 1, R 1, S 2)"), "{out}");
+        assert!(out.contains("2 'victory-submit' in folio_wait_bit_common"), "{out}");
+        assert!(out.contains("'vkd3d_queue' S futex_wait_queue"), "{out}");
+        assert!(!out.contains("'title'"), "{out}");
+        let mut none = String::new();
+        describe_threads(&threads[..1], &mut none);
+        assert!(none.contains("(D): none"), "{none}");
+    }
+
+    /// Under Wine the section reads this process's threads from Linux;
+    /// elsewhere it says it is not under Wine.
+    #[cfg(windows)]
+    #[test]
+    fn the_kernel_section_reads_this_process() {
+        let mut out = String::new();
+        kernel_section(&mut out);
+        if unix_pid().is_some() {
+            assert!(out.contains(" threads ("), "{out}");
+            assert!(!out.contains("(D 0"), "{out}");
+        } else {
+            assert_eq!(out, "not under Wine");
+        }
+        let mut mark = String::new();
+        doing(Doing::Copy, 1, 0x1000, 64);
+        describe_doing(crate::host::now_us(), &mut mark);
+        assert!(mark.starts_with("copying title memory (detail 1, at 0x1000, 64 bytes)"), "{mark}");
     }
 
     #[test]

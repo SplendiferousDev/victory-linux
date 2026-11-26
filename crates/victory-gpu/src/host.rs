@@ -303,6 +303,9 @@ fn submitting(phase: u64, lists: usize) {
     SUBMITTING[1].store(lists as u64, Ordering::Relaxed);
     SUBMITTING[2].store(now_us(), Ordering::Relaxed);
     SUBMITTING[0].store(phase, Ordering::Relaxed);
+    if phase == 0 {
+        crate::stall::doing(crate::stall::Doing::Nothing, 0, 0, 0);
+    }
 }
 
 /// What was going on when the host device went: whether a submission was
@@ -3561,6 +3564,7 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     }
     LATE_STATS[1].fetch_add(1, Ordering::Relaxed);
     LATE_STATS[why].fetch_add(1, Ordering::Relaxed);
+    crate::stall::doing(crate::stall::Doing::RelayWait, why as u64, 0, 0);
     let was_working = working(false);
     let waiting = std::time::Instant::now();
     while !done(&line) {
@@ -5627,6 +5631,7 @@ impl Host {
             relay_wait(why, |line| line.line.is_empty() && !line.settling);
             return;
         }
+        crate::stall::doing(crate::stall::Doing::Settle, why as u64, 0, 0);
         let was_working = working(true);
         let mut counted = false;
         loop {
@@ -5786,6 +5791,7 @@ impl Host {
         }
         // Descriptors the title copied into placed heaps directly, before
         // command lists that index those slots are submitted.
+        crate::stall::doing(crate::stall::Doing::SyncHeaps, 0, 0, 0);
         crate::descriptor::sync_heaps();
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
@@ -5794,18 +5800,21 @@ impl Host {
         // one at every present).
         static SWEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if !behind {
+            crate::stall::doing(crate::stall::Doing::Sweep, 0, 0, 0);
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
             // With the present sent ahead nothing else brings a moment
             // with nothing in the air: one is made for the sweep.
             self.settle(&mut submitted, WHY_SYNC);
+            crate::stall::doing(crate::stall::Doing::Sweep, 0, 0, 0);
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
         let behind = late && flying();
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
+        crate::stall::doing(crate::stall::Doing::MakeWaiting, 0, 0, 0);
         crate::descriptor::make_waiting();
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
@@ -5840,6 +5849,7 @@ impl Host {
                 }
             }
             let ranges: Vec<(usize, usize)> = spans.into_values().collect();
+            crate::stall::doing(crate::stall::Doing::AskOnce, ranges.len() as u64, 0, 0);
             crate::watch::ask_once(&ranges);
             // Behind flights: the title wrote memory that a flight's shaders
             // may write too, and this submission refreshes it. The flights
@@ -5864,8 +5874,10 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
+        crate::stall::doing(crate::stall::Doing::Flush, 0, 0, 0);
         batch.flush();
         crate::watch::ask_once_end();
+        crate::stall::doing(crate::stall::Doing::Snapshots, 0, 0, 0);
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
@@ -5885,11 +5897,13 @@ impl Host {
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
         }
+        crate::stall::doing(crate::stall::Doing::CardBefore, 0, 0, 0);
         let card = self.card_before(runs, flown, *submitted);
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
         let prepared = std::time::Instant::now();
+        crate::stall::doing(crate::stall::Doing::Execute, lists.len() as u64, 0, 0);
         if late {
             *submitted += 1;
             // SAFETY: closed lists; the fence is ours.
@@ -7412,6 +7426,7 @@ impl HostList {
             let started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
+                    crate::stall::doing(crate::stall::Doing::Copy, dst as u64, src, len);
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
@@ -7428,6 +7443,7 @@ impl HostList {
                     len
                 }
                 &Step::Fill(dst, src, len) => {
+                    crate::stall::doing(crate::stall::Doing::Fill, dst as u64, src, len);
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
@@ -7452,6 +7468,7 @@ impl HostList {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
                     }
+                    crate::stall::doing(crate::stall::Doing::Run, 0, 0, 0);
                     work();
                     // It wrote title memory, where is not known here: the
                     // submission's one asking ends, later refreshes ask anew.
@@ -7471,6 +7488,7 @@ impl HostList {
                     // the next flush of all (flushing all of them at every
                     // range a dispatch writes made thousands of write-watch
                     // askings a frame).
+                    crate::stall::doing(crate::stall::Doing::GpuWrite, 0, *address, *len);
                     batch.flush_one(shadow);
                     #[cfg(feature = "diagnostics")]
                     let snapshot = std::time::Instant::now();
@@ -7484,6 +7502,7 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
+                        crate::stall::doing(crate::stall::Doing::Texture, 0, 0, 0);
                         staging.refresh();
                     }
                     continue;

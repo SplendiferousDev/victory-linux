@@ -466,6 +466,7 @@ impl Second {
             let _ = direct.Signal(&self.reached, holds.0);
             direct.Wait(&self.up.fence, job)?;
         }
+        LAST_HOLD_JOB.store(job, Ordering::Relaxed);
         self.held[0].fetch_add(1, Ordering::Relaxed);
         if let Some(clock) = &holds.1 {
             let _ = clock.send((holds.0, job));
@@ -503,6 +504,54 @@ impl Second {
             self.held[2].fetch_add(standing.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
     }
+}
+
+/// The up-lane job the direct queue was last made to wait for
+/// ([`Second::hold`]), for the stall report.
+static LAST_HOLD_JOB: AtomicU64 = AtomicU64::new(0);
+
+impl Lane {
+    /// The stall report's words for the lane: jobs sent against those the
+    /// card ran (the sent count only if its lock is free).
+    fn describe(&self, name: &str, out: &mut String) {
+        use std::fmt::Write;
+        // SAFETY: a plain query.
+        let done = unsafe { self.fence.GetCompletedValue() };
+        let sent = match self.state.try_lock() {
+            Ok(s) => s.sent.to_string(),
+            Err(_) => "? (its lock is held)".to_owned(),
+        };
+        let _ = write!(out, "{name}: jobs sent {sent}, the card ran up to {done}; ");
+    }
+}
+
+/// The stall report's section of the copy queues: each lane's jobs sent and
+/// run, and where the direct queue stands at its waits for the up lane (a
+/// direct queue held at a wait for a job the card has not run stops every
+/// flight behind it).
+pub(crate) fn stall_section(out: &mut String) {
+    use std::fmt::Write;
+    if bits() == 0 {
+        out.push_str("off");
+        return;
+    }
+    let Some(second) = second() else {
+        out.push_str("not made");
+        return;
+    };
+    second.down.describe("fetches", out);
+    second.up.describe("sends up", out);
+    // SAFETY: plain queries.
+    let (reached, order) = unsafe { (second.reached.GetCompletedValue(), second.order.GetCompletedValue()) };
+    let holds = match second.holds.try_lock() {
+        Ok(h) => h.0.to_string(),
+        Err(_) => "? (locked)".to_owned(),
+    };
+    let _ = write!(
+        out,
+        "the direct queue's waits for the up lane: {holds} made, it reached {reached}, the last made waits for job {}; sends of title bytes done up to {order}",
+        LAST_HOLD_JOB.load(Ordering::Relaxed)
+    );
 }
 
 /// The copy queues, made at the first ask if [`bits`] says so; `None` when
