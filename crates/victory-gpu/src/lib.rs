@@ -73,6 +73,8 @@ pub mod query;
 pub mod queue;
 pub mod stall;
 #[cfg(windows)]
+mod hostq;
+#[cfg(windows)]
 mod queue2;
 pub mod resource;
 pub mod root;

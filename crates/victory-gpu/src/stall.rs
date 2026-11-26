@@ -373,6 +373,9 @@ fn report(now: u64) -> String {
     section("flights", &crate::host::stall_section);
     section("inside the submission", &|out: &mut String| describe_doing(now, out));
     section("copy queues", &crate::queue2::stall_section);
+    section("host queues", &crate::hostq::stall_section);
+    section("host device", &crate::host::device_section);
+    section("GPU addresses of our host copies", &crate::shadow::gpu_map);
     section("kernel", &kernel_section);
     section("pipelines", &|out: &mut String| {
         let _ = write!(

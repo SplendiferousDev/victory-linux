@@ -175,6 +175,7 @@ impl Lane {
                 ..Default::default()
             })?;
             let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+            crate::hostq::name(&queue, Box::leak(format!("copy {name}").into_boxed_str()));
             let wide: Vec<u16> = format!("victory copy queue ({name})").encode_utf16().chain([0]).collect();
             let _ = queue.SetName(windows::core::PCWSTR(wide.as_ptr()));
             Ok(Lane {
@@ -260,13 +261,13 @@ impl Lane {
                 // (A fence is at 0 before anything is signalled on it:
                 // nothing to wait for.)
                 if value != 0 {
-                    self.queue.Wait(fence, value)?;
+                    crate::hostq::wait(&self.queue, fence, value)?;
                 }
             }
-            self.queue.ExecuteCommandLists(&lists);
+            crate::hostq::execute(&self.queue, &lists);
             state.sent += 1;
             let job = state.sent;
-            self.queue.Signal(&self.fence, job)?;
+            crate::hostq::signal(&self.queue, &self.fence, job)?;
             state.spare.push((job, list));
             if let Some(clock) = &state.clock {
                 let _ = clock.send((job, Instant::now()));
@@ -290,6 +291,7 @@ impl Lane {
         unsafe {
             if self.fence.GetCompletedValue() < job {
                 self.fence.SetEventOnCompletion(job, event)?;
+                let _waiting = crate::hostq::mark("a wait on the CPU for a copy queue", "copy", || format!("lane fence to {job}"));
                 WaitForSingleObject(event, INFINITE);
             }
         }
@@ -444,7 +446,7 @@ impl Second {
     /// signalled behind it.
     pub(crate) fn sent_up(&self, direct: &ID3D12CommandQueue, number: u64) {
         // SAFETY: a live queue and our fence.
-        let _ = unsafe { direct.Signal(&self.order, number) };
+        let _ = crate::hostq::signal(direct, &self.order, number);
     }
 
     /// The last numbered send of title bytes the card has finished: every
@@ -460,12 +462,9 @@ impl Second {
     pub(crate) fn hold(&self, direct: &ID3D12CommandQueue, job: u64) -> windows::core::Result<()> {
         let mut holds = lock(&self.holds);
         holds.0 += 1;
-        // SAFETY: a live queue and our fences.
-        unsafe {
-            // For the clock only: the moment the queue gets to the wait.
-            let _ = direct.Signal(&self.reached, holds.0);
-            direct.Wait(&self.up.fence, job)?;
-        }
+        // For the clock only: the moment the queue gets to the wait.
+        let _ = crate::hostq::signal(direct, &self.reached, holds.0);
+        crate::hostq::wait(direct, &self.up.fence, job)?;
         LAST_HOLD_JOB.store(job, Ordering::Relaxed);
         self.held[0].fetch_add(1, Ordering::Relaxed);
         if let Some(clock) = &holds.1 {

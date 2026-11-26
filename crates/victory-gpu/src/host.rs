@@ -360,6 +360,13 @@ pub(crate) fn removal_context() -> String {
     for (at, thread, what) in trail.iter() {
         let _ = write!(text, "\n  {:.1} ms before, thread {thread}: {what}", ms(*at));
     }
+    drop(trail);
+    // For matching the address of a fault the host runtime reports
+    // (`VKD3D_CONFIG=fault`) against our copies, live and let go.
+    text.push_str("\n  host queues: ");
+    crate::hostq::stall_section(&mut text);
+    text.push_str("\n  GPU addresses of our host copies: ");
+    crate::shadow::gpu_map(&mut text);
     text
 }
 
@@ -904,6 +911,7 @@ fn create() -> windows::core::Result<Host> {
             Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
             ..Default::default()
         })?;
+        crate::hostq::name(&queue, "direct (ours)");
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = CreateEventW(None, false, false, None)?;
         let rtvs: ID3D12DescriptorHeap =
@@ -4124,6 +4132,25 @@ pub(crate) fn stall_section(out: &mut String) {
     }
 }
 
+/// The stall report's section of the host device: whether it is removed
+/// and why. A card that stopped on a fault of its own (the driver's "MMU
+/// Fault" in the kernel's log) may leave the device unremoved and the fence
+/// standing for good; `VKD3D_CONFIG=fault` makes the host's runtime give up
+/// on such a wait after 5 s and say what faulted.
+pub(crate) fn device_section(out: &mut String) {
+    use std::fmt::Write;
+    let Some(host) = host() else {
+        out.push_str("none");
+        return;
+    };
+    // SAFETY: a plain query of a free-threaded device.
+    let removed = unsafe { host.device.GetDeviceRemovedReason() };
+    let _ = match removed {
+        Ok(()) => write!(out, "not removed (a card stopped by a fault may still say so: look for \"NVRM: Xid\" in the kernel's log at this time)"),
+        Err(e) => write!(out, "REMOVED: {e}"),
+    };
+}
+
 /// Settles the flights in the air, if any ([`Host::settle`]), for reason
 /// `why` (one of the `WHY_` places). Not from inside a submission.
 pub(crate) fn settle_now(why: usize) {
@@ -4210,6 +4237,7 @@ fn late_helper() {
         // SAFETY: our fence and event.
         unsafe {
             if host.fence.SetEventOnCompletion(target, event).is_ok() {
+                let _waiting = crate::hostq::mark("a wait on the CPU for the card", "direct (ours)", || format!("our fence to {target}"));
                 WaitForSingleObject(event, INFINITE);
             }
         }
@@ -4376,6 +4404,7 @@ fn relay_worker() {
                 // SAFETY: the host's fence and this thread's event.
                 let waited = unsafe {
                     host.fence.SetEventOnCompletion(target, event).map(|()| {
+                        let _waiting = crate::hostq::mark("a wait on the CPU for the card", "direct (ours)", || format!("our fence to {target}"));
                         WaitForSingleObject(event, INFINITE);
                     })
                 };
@@ -4991,7 +5020,7 @@ impl Host {
         let mut state = clock.state.lock().unwrap_or_else(|e| e.into_inner());
         state.0 += 1;
         // SAFETY: our queue and the clock's fence.
-        let _ = unsafe { self.queue.Signal(&clock.fence, state.0) };
+        let _ = crate::hostq::signal(&self.queue, &clock.fence, state.0);
         if let Some((since, worked_then)) = state.1.take() {
             card_clock_us(0, since.elapsed().as_micros() as u64);
             card_clock_us(1, worked().saturating_sub(worked_then));
@@ -5610,7 +5639,7 @@ impl Host {
                                                 "SYNC LIST (changed bytes go up to the card's copies; a full ring of plain CPU sides)".to_string()
                                             });
                                             list.Close()?;
-                                            self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                                            crate::hostq::execute(&self.queue, &[Some(list.cast()?)]);
                                             if twin_wait.is_none() {
                                                 let fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
                                                 let event = CreateEventW(None, false, false, None)?;
@@ -5620,7 +5649,7 @@ impl Host {
                                                 return Err(windows::core::Error::empty());
                                             };
                                             *value += 1;
-                                            self.queue.Signal(&*fence, *value)?;
+                                            crate::hostq::signal(&self.queue, &*fence, *value)?;
                                             fence.SetEventOnCompletion(*value, *event)?;
                                             WaitForSingleObject(*event, INFINITE);
                                             TWIN_RING[2].fetch_add(1, Ordering::Relaxed);
@@ -5707,7 +5736,7 @@ impl Host {
                     #[cfg(feature = "diagnostics")]
                     crate::shot::span_end(list, shot_span, 0, || "SYNC LIST (changed bytes go up to the card's copies and are hashed)".to_string());
                     list.Close()?;
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    crate::hostq::execute(&self.queue, &[Some(list.cast()?)]);
                     Ok(())
                 })()
             };
@@ -6081,13 +6110,16 @@ impl Host {
                 // In the order of the queue: the sends of title bytes so
                 // far are ahead of this fetch, every later one behind it.
                 let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
-                self.queue.ExecuteCommandLists(&lists);
+                crate::hostq::execute(&self.queue, &lists);
                 let after = *order;
                 drop(order);
                 self.card_sent();
-                self.queue.Signal(&fence, sent)?;
+                crate::hostq::signal(&self.queue, &fence, sent)?;
                 fence.SetEventOnCompletion(sent, event)?;
-                WaitForSingleObject(event, INFINITE);
+                {
+                    let _waiting = crate::hostq::mark("a wait on the CPU for a fetch", "direct (ours)", || format!("relay fence to {sent}"));
+                    WaitForSingleObject(event, INFINITE);
+                }
                 Ok(after)
             })()
         };
@@ -6486,10 +6518,10 @@ impl Host {
                         list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
                     list.Close()?;
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    crate::hostq::execute(&self.queue, &[Some(list.cast()?)]);
                     self.card_sent();
                     *submitted += 1;
-                    self.queue.Signal(&self.fence, *submitted)?;
+                    crate::hostq::signal(&self.queue, &self.fence, *submitted)?;
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
                     WaitForSingleObject(self.event, INFINITE);
@@ -6740,6 +6772,7 @@ impl Host {
                     match self.fence.SetEventOnCompletion(*submitted, self.event) {
                         Ok(()) => {
                             working(false);
+                            let _waiting = crate::hostq::mark("a wait on the CPU for the card (a settle)", "direct (ours)", || format!("our fence to {}", *submitted));
                             WaitForSingleObject(self.event, INFINITE);
                             stood(waiting);
                             working(true);
@@ -6994,10 +7027,8 @@ impl Host {
         if late {
             *submitted += 1;
             // SAFETY: closed lists; the fence is ours.
-            let signalled = unsafe {
-                self.queue.ExecuteCommandLists(&lists);
-                self.queue.Signal(&self.fence, *submitted)
-            };
+            crate::hostq::execute(&self.queue, &lists);
+            let signalled = crate::hostq::signal(&self.queue, &self.fence, *submitted);
             self.card_sent();
             prep_part(5, prepared);
             if let Err(e) = signalled {
@@ -7042,11 +7073,9 @@ impl Host {
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
-                self.queue.ExecuteCommandLists(group);
+                crate::hostq::execute(&self.queue, group);
                 self.card_sent();
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
+                let waited = crate::hostq::signal(&self.queue, &self.fence, *submitted)
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
                     Ok(()) => {
