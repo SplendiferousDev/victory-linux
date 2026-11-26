@@ -146,6 +146,19 @@ service (an editor, an agent runner, a terminal slice) is under that service's
 limit, not the scope's, unless the scope is made from a different slice; check
 `systemctl --user status` if the title dies early.
 
+### Pipeline caches
+
+Pipelines are kept in three places: the runtime's pipeline library and early
+list (`pipelines/` beside the shader cache), vkd3d-proton's cache
+(`VKD3D_SHADER_CACHE_PATH`) and, on NVIDIA, the driver's own disk cache
+(`~/.cache/nvidia/GLCache`). The driver's cache holds 256 MiB unless
+`__GL_SHADER_DISK_CACHE_SIZE` says more, and the title's pipelines need several
+times that; when it is full every pipeline is compiled again, library or not.
+The launcher sets 12 GB (`__GL_SHADER_DISK_CACHE_SIZE`) and turns the driver's
+clean-up off (`__GL_SHADER_DISK_CACHE_SKIP_CLEANUP=1`); set them yourself when
+starting wine another way, including for `victory warm` and
+`victory precompile-graphics`.
+
 ### Scripted pad
 
 For unattended runs, `VICTORY_PAD_FILE` names a file that is read as a list of

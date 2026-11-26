@@ -173,6 +173,13 @@ export VICTORY_LOG=${VICTORY_LOG:-info}
 # vkd3d-proton's logging on.
 export VKD3D_DEBUG=${VKD3D_DEBUG:-none}
 export VKD3D_SHADER_DEBUG=${VKD3D_SHADER_DEBUG:-none}
+# NVIDIA's driver keeps compiled pipelines in a disk cache of 256 MiB unless
+# told otherwise. The title's pipelines need several times that: once the cache
+# is full, older entries are thrown out and every pipeline, even one loaded from
+# the pipeline library, is compiled again (1 to 7 s each instead of
+# milliseconds).
+export __GL_SHADER_DISK_CACHE_SIZE=${__GL_SHADER_DISK_CACHE_SIZE:-12000000000}
+export __GL_SHADER_DISK_CACHE_SKIP_CLEANUP=${__GL_SHADER_DISK_CACHE_SKIP_CLEANUP:-1}
 # Any other VICTORY_* or VKD3D_* variable is already in the environment and is
 # inherited as it is.
 
