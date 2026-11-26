@@ -1509,6 +1509,41 @@ pub(crate) fn wide_back() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK").is_none_or(|v| v != "0"))
 }
 
+/// The threads kept for [`wide`] (besides the one that hands out the
+/// work): a quarter of the hardware threads, 2 to 6, unless
+/// `VICTORY_WIDE_THREADS` says how many (1 to 32).
+pub(crate) fn wide_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        let hardware = std::thread::available_parallelism().map_or(16, |n| n.get());
+        threads_for(hardware, std::env::var("VICTORY_WIDE_THREADS").ok().as_deref())
+    })
+}
+
+/// [`wide_threads`] for `hardware` threads and the switch's text.
+fn threads_for(hardware: usize, asked: Option<&str>) -> usize {
+    match asked.and_then(|v| v.trim().parse::<usize>().ok()) {
+        Some(n) => n.clamp(1, 32),
+        None => (hardware / 4).clamp(2, 6),
+    }
+}
+
+#[cfg(test)]
+mod wide_threads_tests {
+    use super::threads_for;
+
+    #[test]
+    fn a_quarter_of_the_hardware_unless_asked() {
+        assert_eq!(threads_for(12, None), 3);
+        assert_eq!(threads_for(4, None), 2);
+        assert_eq!(threads_for(64, None), 6);
+        assert_eq!(threads_for(12, Some("bad")), 3);
+        assert_eq!(threads_for(12, Some(" 5 ")), 5);
+        assert_eq!(threads_for(12, Some("0")), 1);
+        assert_eq!(threads_for(12, Some("100")), 32);
+    }
+}
+
 type Job = Box<dyn FnOnce() + Send>;
 
 /// Threads kept for [`wide`]: what they are to do, and the word that there
@@ -1526,8 +1561,7 @@ fn workers() -> &'static Workers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
-        for i in 0..n {
+        for i in 0..wide_threads() {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 let workers = WORKERS.get().expect("made above");
                 loop {
