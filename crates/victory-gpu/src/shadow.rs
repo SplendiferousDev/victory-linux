@@ -1863,6 +1863,34 @@ mod wide_tests {
     }
 }
 
+/// Makes scratch `v` `n` bytes long for a use that writes all of them
+/// before it reads any: the bytes it holds already are left as they are
+/// and only those it gains are zeroed (it was emptied and zeroed whole, up
+/// to 64 KiB each time, just before a read wrote over it).
+fn read_room(v: &mut Vec<u8>, n: usize) {
+    if v.len() >= n {
+        v.truncate(n);
+    } else {
+        v.resize(n, 0);
+    }
+}
+
+#[cfg(test)]
+mod read_room_tests {
+    use super::read_room;
+
+    #[test]
+    fn read_room_sizes_without_zeroing_what_is_there() {
+        let mut v = vec![7u8; 8];
+        read_room(&mut v, 5);
+        assert_eq!(v, [7; 5], "shorter: the bytes there stay");
+        read_room(&mut v, 9);
+        assert_eq!(v, [7, 7, 7, 7, 7, 0, 0, 0, 0], "longer: only the new ones zeroed");
+        read_room(&mut v, 0);
+        assert!(v.is_empty());
+    }
+}
+
 /// What [`Shadow::copy_back`] does with a piece that differs from the
 /// snapshot: `host` is the copy's bytes there, `old` the snapshot's. From
 /// the first byte that differs to the last, title memory is read into
@@ -1891,8 +1919,7 @@ fn back_piece(
     let last = last_difference(host, old).unwrap_or(first);
     let n = last + 1 - first;
     let (host, old) = (&mut host[first..=last], &old[first..=last]);
-    title.clear();
-    title.resize(n, 0);
+    read_room(title, n);
     if !read(first, title) {
         return None;
     }
@@ -1907,8 +1934,7 @@ fn back_piece(
     // data (one cleared a bit of a record the title had already replaced,
     // and copying it back broke the title's object: an access violation
     // through 0xffffffff00000000; PalmVIDev e0b70476, VIctory f39c6c2).
-    mask.clear();
-    mask.resize(n, 0);
+    read_room(mask, n);
     let mut differs = 0u8;
     for (((t, h), o), m) in title.iter_mut().zip(host.iter_mut()).zip(old).zip(mask.iter_mut()) {
         let gpu = if (*h != *o) & (*t == *o) { 0xffu8 } else { 0 };
@@ -3100,8 +3126,7 @@ impl Shadow {
         let last = last_difference(now, held).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (now, held) = (&now[first..=last], &mut held[first..=last]);
-        title.clear();
-        title.resize(n, 0);
+        read_room(title, n);
         // Who touched the page since its last store is looked at before our
         // own read of it (`VICTORY_BACK_READS`): counted only.
         #[cfg(feature = "diagnostics")]
@@ -3890,8 +3915,7 @@ impl Shadow {
         let last = last_difference(gpu, old).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, old) = (&gpu[first..=last], &mut old[first..=last]);
-        title.clear();
-        title.resize(n, 0);
+        read_room(title, n);
         let mut written = 0;
         if crate::host::read_into((start + at) as *const u8, title) {
             // The stretch as read: what the card did not change is the
@@ -3972,8 +3996,7 @@ impl Shadow {
                 .filter(|&(a, b)| a < at + n && b > at)
                 .collect()
         };
-        title.clear();
-        title.resize(n, 0);
+        read_room(title, n);
         // Who touched the page since its last store is looked at before our
         // own read of it (`VICTORY_BACK_READS`): counted only.
         #[cfg(feature = "diagnostics")]
