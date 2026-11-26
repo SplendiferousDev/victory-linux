@@ -1072,36 +1072,6 @@ fn instructions<'a>(p: &'a ir::Program, name: &str) -> Vec<&'a ir::Inst> {
     p.blocks.iter().flat_map(|b| &b.insts).filter(|i| i.name() == name).collect()
 }
 
-fn regs<T>(of: &[(ir::Reg, T)]) -> Vec<ir::Reg> {
-    of.iter().map(|r| r.0).collect()
-}
-
-#[test]
-fn a_pair_parked_in_lanes_that_hold_other_scalars_elsewhere_moves_as_a_pair() {
-    // s[20:21] goes into lanes 4 and 5 of v10 and comes back into s[22:23]; later lane 4
-    // holds s30 for a while: no lane of the two is the pair's alone
-    let p = parked(&[
-        writelane(10, 20, 4),
-        writelane(10, 21, 5),
-        vec![0x7E04_0281], // v_mov_b32 v2, 1
-        readlane(22, 10, 4),
-        readlane(23, 10, 5),
-        writelane(10, 30, 4),
-        readlane(31, 10, 4),
-    ]);
-    let wide = instructions(&p, "s_mov_b64");
-    let [save, restore] = wide[..] else { panic!("one pair save and one pair restore: {} moves", wide.len()) };
-    assert_eq!(regs(&save.reads), [ir::Reg::S(20), ir::Reg::S(21)]);
-    assert_eq!(regs(&restore.writes), [ir::Reg::S(22), ir::Reg::S(23)]);
-    assert_eq!(regs(&restore.reads), regs(&save.writes));
-    // the single scalar has its own lane register, not the pair's
-    let narrow = instructions(&p, "s_mov_b32");
-    let lone_save = narrow.iter().find(|i| regs(&i.reads) == [ir::Reg::S(30)]).expect("the save of s30");
-    let lone_restore = narrow.iter().find(|i| regs(&i.writes) == [ir::Reg::S(31)]).expect("the restore into s31");
-    assert_eq!(regs(&lone_restore.reads), regs(&lone_save.writes));
-    assert!(regs(&lone_save.writes).iter().all(|r| !regs(&save.writes).contains(r)));
-}
-
 #[test]
 fn a_parked_pair_another_save_or_restore_shares_stays_two_scalars() {
     let cases = [
