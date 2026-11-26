@@ -164,7 +164,8 @@ fn staging_pool() -> bool {
 fn spare_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_STAGING_POOL_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(SPARE_MOST.0, |mb| mb << 20)
+        // (`VICTORY_TIGHT_MEMORY=1`: the mode's most unless this is set.)
+        crate::tight::env_number("VICTORY_STAGING_POOL_MB", SPARE_MOST.0 >> 20, crate::tight::STAGING_SPARE_MB) << 20
     })
 }
 
@@ -465,10 +466,12 @@ thread_local! {
 pub(crate) fn read_keep() -> usize {
     static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_TEXTURE_READ_KEEP_MB")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .map_or(usize::MAX, |mb| mb.saturating_mul(1 << 20))
+        // (`VICTORY_TIGHT_MEMORY=1`: the mode's most unless this is set.)
+        let set = crate::tight::number(std::env::var("VICTORY_TEXTURE_READ_KEEP_MB").ok().as_deref());
+        match set.or(crate::tight::on().then_some(crate::tight::TEXTURE_READ_KEEP_MB)) {
+            Some(mb) => usize::try_from(mb).unwrap_or(usize::MAX).saturating_mul(1 << 20),
+            None => usize::MAX,
+        }
     })
 }
 
@@ -536,6 +539,16 @@ impl Drop for Staging {
             }
         }
     }
+}
+
+/// For the memory line of every build: the bytes of staging buffers alive.
+pub(crate) fn staged_bytes() -> u64 {
+    STAGED[1].load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// For the memory line of every build: the bytes of spare staging buffers.
+pub(crate) fn spare_bytes() -> u64 {
+    SPARE.lock().unwrap_or_else(|e| e.into_inner()).1
 }
 
 /// For the memory line: staging buffers alive, their bytes, and how many
