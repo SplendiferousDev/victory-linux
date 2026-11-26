@@ -1295,7 +1295,22 @@ void main() {
     /// also where both dispatches of a stretch cut in two meet.
     #[test]
     fn warp_card_merge_changes_the_masked_bytes_and_no_other() {
-        use crate::shadow::{MASK_BLOCK, mask_fill, mask_stretches};
+        card_merge_on_warp(false);
+    }
+
+    /// The same with the CPU side in plain memory (`crate::shadow::plain_twins`):
+    /// the title's bytes are laid out behind the masks in their buffer
+    /// (`crate::shadow::mask_title_fill`), as `Host::card_before` lays them,
+    /// and read from there.
+    #[test]
+    fn warp_card_merge_reads_a_plain_sides_bytes_behind_the_masks() {
+        card_merge_on_warp(true);
+    }
+
+    /// [`warp_card_merge_changes_the_masked_bytes_and_no_other`], the CPU
+    /// side a buffer or (`plain`) plain memory.
+    fn card_merge_on_warp(plain: bool) {
+        use crate::shadow::{MASK_BLOCK, mask_fill, mask_stretches, mask_title_fill};
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
@@ -1346,24 +1361,32 @@ void main() {
             stretches.iter().map(|s| (s.at / MASK_BLOCK, s.bytes / MASK_BLOCK)).collect::<Vec<_>>(),
             [(1, 2), (4, 1), (6, 1)]
         );
-        let (_mask, mask_ptr, mask_gpu) = warp.shared_buffer(mask_end as u64 + 4096);
+        // A plain side's bytes behind the masks, from a multiple of 256.
+        let title_base = mask_end.next_multiple_of(256);
+        let laid: usize = stretches.iter().map(|s| s.bytes).sum();
+        let mask_len = if plain { title_base + laid + 4096 } else { mask_end + 4096 };
+        let (_mask, mask_ptr, mask_gpu) = warp.shared_buffer(mask_len as u64);
         // SAFETY: the mappings hold what is written.
         unsafe {
             std::ptr::copy_nonoverlapping(was.as_ptr(), card_ptr, size);
             std::ptr::copy_nonoverlapping(title.as_ptr(), title_ptr, size);
-            let mask = std::slice::from_raw_parts_mut(mask_ptr, mask_end + 4096);
+            let mask = std::slice::from_raw_parts_mut(mask_ptr, mask_len);
             mask.fill(0xff);
             mask_fill(&mut mask[..mask_end], &stretches, &blocks);
             assert!(mask[..MASK_AT].iter().all(|&b| b == 0xff));
+            if plain {
+                assert!(mask_title_fill(&mut mask[title_base..], &stretches, &blocks, &title) > 0);
+            }
         }
         // SAFETY: our open list, live buffers, the merge's own root
         // signature; the mappings hold what is read and written.
         unsafe {
             warp.list.SetComputeRootSignature(&merge.root);
             warp.list.SetPipelineState(&merge.pso);
-            warp.list.SetComputeRootShaderResourceView(1, title_gpu);
+            warp.list.SetComputeRootShaderResourceView(1, if plain { mask_gpu } else { title_gpu });
             warp.list.SetComputeRootShaderResourceView(2, mask_gpu);
             warp.list.SetComputeRootUnorderedAccessView(3, card_gpu);
+            let mut laid_at = 0;
             for stretch in &stretches {
                 // In two dispatches where the stretch has two blocks, as
                 // `Host::card_before` cuts the long ones.
@@ -1371,11 +1394,13 @@ void main() {
                 while done < stretch.bytes {
                     let n = (stretch.bytes - done).min(MASK_BLOCK);
                     let words = (n / 32) as u32;
-                    let constants = [(stretch.at + done) as u32, (stretch.mask_at + done / 8) as u32, words];
-                    warp.list.SetComputeRoot32BitConstants(0, 3, constants.as_ptr().cast(), 0);
+                    let title_at = if plain { title_base + laid_at + done } else { stretch.at + done };
+                    let constants = [(stretch.at + done) as u32, (stretch.mask_at + done / 8) as u32, words, title_at as u32];
+                    warp.list.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
                     warp.list.Dispatch(words.div_ceil(64), 1, 1);
                     done += n;
                 }
+                laid_at += stretch.bytes;
             }
         }
         warp.submit_and_wait();

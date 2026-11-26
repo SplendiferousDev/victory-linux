@@ -430,6 +430,13 @@ pub(crate) fn mask_runs(blocks: &MaskBlocks) -> Vec<(usize, usize)> {
 /// the card's side holds afterwards is what the copies of the runs would
 /// have left; the CPU's side is written as before.
 ///
+/// A CPU side in plain memory ([`plain_twins`]) is no buffer the pass can
+/// read: the masked bytes are copied from it into the masks' buffer, behind
+/// the masks ([`mask_title_fill`], 32 bytes for every mask dword that is
+/// not zero), and read from there; past `VICTORY_CARD_TWIN_RING_MB` of
+/// masks and bytes in one submission a copy's bytes go up as copies of the
+/// runs through the upload chunks, as without the switch.
+///
 /// `VICTORY_MERGE_ON_CARD=alt`: twenty seconds with, twenty without, in
 /// turn, each change said in the log: one run then measures both on the
 /// same scene (the frame log, and the settles of the frame-rate lines).
@@ -519,6 +526,58 @@ pub(crate) fn mask_fill(mask: &mut [u8], stretches: &[MaskStretch], blocks: &Mas
         let to = stretches[k].mask_at + (at - stretches[k].at) / 8;
         mask[to..to + MASK_BLOCK / 8].copy_from_slice(bits);
     }
+}
+
+/// For a copy whose CPU side is plain memory ([`plain_twins`]), which the
+/// merge on the card cannot read as a buffer: the bytes of `side` (the
+/// CPU side from the copy's first byte on) that the masks of `blocks` take,
+/// into `out`, where `stretches` (as [`mask_stretches`] gives them for these
+/// blocks) follow one another from `out`'s first byte, byte `i` of a
+/// stretch at `i` of its place. Of each 32 bytes (one mask dword,
+/// `crate::host::CARD_MERGE`'s thread) only those whose dword is not zero
+/// are written: the merge reads no others. Returns the bytes written.
+///
+/// What the relay's merge writes into the CPU side meanwhile
+/// (`Shadow::card_merge_relay`) lies outside the masked bytes, so what is
+/// read beside them is never used.
+pub(crate) fn mask_title_fill(out: &mut [u8], stretches: &[MaskStretch], blocks: &MaskBlocks, side: &[u8]) -> usize {
+    let mut placed = Vec::with_capacity(stretches.len());
+    let mut at = 0;
+    for stretch in stretches {
+        placed.push(at);
+        at += stretch.bytes;
+    }
+    let (mut k, mut written) = (0, 0);
+    let mut put = |from: usize, to: usize, into: usize| {
+        let to = to.min(side.len());
+        if from < to {
+            out[into..into + (to - from)].copy_from_slice(&side[from..to]);
+            written += to - from;
+        }
+    };
+    for (&block, bits) in blocks {
+        let at = block * MASK_BLOCK;
+        while stretches[k].at + stretches[k].bytes <= at {
+            k += 1;
+        }
+        let into = placed[k] + (at - stretches[k].at);
+        // Runs of dwords that are not zero, each one copy.
+        let mut run: Option<usize> = None;
+        for (w, dword) in bits.chunks_exact(4).enumerate() {
+            match (dword != [0u8; 4], run) {
+                (true, None) => run = Some(w),
+                (false, Some(first)) => {
+                    put(at + first * 32, at + w * 32, into + first * 32);
+                    run = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(first) = run {
+            put(at + first * 32, at + MASK_BLOCK, into + first * 32);
+        }
+    }
+    written
 }
 
 /// With [`merge_on_card`]: the title's bytes put in under flights' shader
@@ -1315,6 +1374,52 @@ mod card_tests {
             }
         }
         assert_eq!(mask_stretches(&Default::default(), 7), (Vec::new(), 7));
+    }
+
+    /// The title bytes of a plain CPU side laid out for the merge on the
+    /// card (`mask_title_fill`): every masked byte is the side's at its
+    /// place (stretch after stretch), every 32 bytes with no bit are left
+    /// as they were, nothing is written past the stretches, and a side
+    /// shorter than the stretches' last block is read only as far as it
+    /// goes.
+    #[test]
+    fn plain_title_bytes_lie_where_the_merge_reads_them() {
+        use super::{MASK_BLOCK, MaskBlocks, mask_stretches, mask_title_fill};
+        const B: usize = MASK_BLOCK;
+        let side: Vec<u8> = (0..6 * B - 100).map(|i| (i * 7 + i / 251) as u8).collect();
+        let mut blocks = MaskBlocks::new();
+        let mut set = |i: usize| blocks.entry(i / B).or_insert_with(|| vec![0u8; B / 8].into_boxed_slice())[i % B / 8] |= 1 << (i % 8);
+        // Blocks 1 and 2 touch (one stretch), 4, and 5 past the side's end.
+        for i in [B + 3, B + 31, B + 32, 2 * B - 1, 2 * B, 2 * B + 700, 4 * B + 64 * 32 + 5, 6 * B - 120, 6 * B - 2] {
+            set(i);
+        }
+        let (stretches, _) = mask_stretches(&blocks, 0);
+        assert_eq!(stretches.iter().map(|s| (s.at / B, s.bytes / B)).collect::<Vec<_>>(), [(1, 2), (4, 2)]);
+        let total: usize = stretches.iter().map(|s| s.bytes).sum();
+        let mut out = vec![0xeeu8; total + 64];
+        let written = mask_title_fill(&mut out, &stretches, &blocks, &side);
+        let mut place = 0;
+        let mut expected = 0;
+        for stretch in &stretches {
+            for g in (0..stretch.bytes).step_by(32) {
+                let at = stretch.at + g;
+                let w = (at % B) / 32;
+                let has = blocks.get(&(at / B)).is_some_and(|m| m[w * 4..w * 4 + 4] != [0u8; 4]);
+                for i in 0..32 {
+                    let got = out[place + g + i];
+                    match (has, side.get(at + i)) {
+                        (true, Some(&byte)) => {
+                            assert_eq!(got, byte, "byte {:#x} of the copy", at + i);
+                            expected += 1;
+                        }
+                        _ => assert_eq!(got, 0xee, "byte {:#x} of the copy was written", at + i),
+                    }
+                }
+            }
+            place += stretch.bytes;
+        }
+        assert_eq!(written, expected);
+        assert!(out[total..].iter().all(|&b| b == 0xee), "written past the stretches");
     }
 
     /// The runs of differing bytes of `pages`, counted byte by byte.

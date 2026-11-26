@@ -2054,12 +2054,19 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
 /// zero reads and writes nothing else, and no two threads write the same
 /// dword of the copy. The stretch starts at a multiple of 4 (of 64 KiB, as
 /// `shadow::mask_stretches` lays them out).
+///
+/// The title's byte for byte `i` of the stretch is byte `title_at + i` of
+/// `title`: the CPU side itself (`title_at` = `at`) where it is a buffer,
+/// or the stretch's bytes laid out after the masks
+/// (`shadow::mask_title_fill`) where the CPU side is plain memory
+/// (`shadow::plain_twins`). `title_at` is a multiple of 4.
 pub(crate) const CARD_MERGE: &str = r#"
-#define RS "RootConstants(num32BitConstants=3, b0), SRV(t0), SRV(t1), UAV(u0)"
+#define RS "RootConstants(num32BitConstants=4, b0), SRV(t0), SRV(t1), UAV(u0)"
 cbuffer Stretch : register(b0) {
     uint at;       // the stretch's first byte in the copy
     uint mask_at;  // its first byte of mask
     uint words;    // its dwords of mask
+    uint title_at; // its first byte in `title`
 };
 ByteAddressBuffer title : register(t0);
 ByteAddressBuffer mask : register(t1);
@@ -2071,6 +2078,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     uint bits = mask.Load(mask_at + id.x * 4u);
     if (bits == 0u) return;
     uint from = at + id.x * 32u;
+    uint from_title = title_at + id.x * 32u;
     [loop]
     for (uint k = 0u; k < 8u; k++) {
         uint four = (bits >> (k * 4u)) & 15u;
@@ -2078,7 +2086,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         // 0xff in each byte whose bit is set.
         uint bytes = ((four & 1u) | ((four & 2u) << 7) | ((four & 4u) << 14) | ((four & 8u) << 21)) * 255u;
         uint to = from + k * 4u;
-        card.Store(to, (card.Load(to) & ~bytes) | (title.Load(to) & bytes));
+        card.Store(to, (card.Load(to) & ~bytes) | (title.Load(from_title + k * 4u) & bytes));
     }
 }
 "#;
@@ -2089,9 +2097,22 @@ void main(uint3 id : SV_DispatchThreadID) {
 const CARD_MERGE_MOST: usize = 64 << 20;
 
 /// Since the last frame-rate line, of the merge on the card: submissions
-/// that had one, its dispatches, the bytes of mask sent up, and the
-/// submissions whose bytes went up as copies for want of a mask buffer.
-static CARD_MERGES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// that had one, its dispatches, the bytes of mask sent up, the
+/// submissions whose bytes went up as copies for want of a mask buffer;
+/// with plain CPU sides (`crate::shadow::plain_twins`) the title's bytes
+/// sent up beside the masks, and the copies whose bytes went up as copies
+/// because a submission's masks and bytes would have passed
+/// [`card_merge_most`].
+static CARD_MERGES: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// The most bytes of masks and of plain CPU sides' title bytes one
+/// submission's merges on the card take in PC memory: the
+/// [`crate::shadow::twin_ring_most`] of the upload chunks plain CPU sides
+/// go up through otherwise (`VICTORY_CARD_TWIN_RING_MB`, 64). Past it a
+/// plain side's bytes go up as copies of the runs, through those chunks.
+fn card_merge_most() -> usize {
+    crate::shadow::twin_ring_most() as usize
+}
 
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in runs of pieces that touch, each piece
@@ -3547,6 +3568,27 @@ pub(crate) fn stall_section(out: &mut String) {
         "; lines run because a held head was met by memory alone (VICTORY_HELD_POLL_MS): {} times",
         HELD_POLLED.load(Ordering::Relaxed)
     );
+    // The merge on the card (`crate::shadow::merge_on_card`) never waits:
+    // a submission that finds no mask buffer free sends its bytes up as
+    // copies. Said so that a line held behind our sync lists can be read.
+    if crate::shadow::merge_on_card_wanted() {
+        match CARD_WORK.try_lock() {
+            Ok(work) => match work.as_ref().and_then(|w| w.merge.as_ref()) {
+                Some(merge) => {
+                    let busy = merge.masks.iter().filter(|m| m.3 > completed).count();
+                    let _ = write!(
+                        out,
+                        "; the merge on the card: {} mask buffers ({} MB), {busy} read by submissions the card has not run (of {} at most)",
+                        merge.masks.len(),
+                        merge.masks.iter().map(|m| m.2).sum::<u64>() >> 20,
+                        CardMerge::MOST
+                    );
+                }
+                None => out.push_str("; the merge on the card: not made"),
+            },
+            Err(_) => out.push_str("; the merge on the card: locked (lock CARD_WORK: copies in the card's memory being brought up to date)"),
+        }
+    }
     let _ = write!(
         out,
         "; objects kept until a submission finishes: {}",
@@ -3964,11 +4006,14 @@ fn late_line(frames: f64) {
             bytes / (1 << 20) as f64
         );
         if crate::shadow::merge_on_card_wanted() {
-            let [submissions, dispatches, mask, copies] = [0, 1, 2, 3].map(|i| CARD_MERGES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            let [submissions, dispatches, mask, copies, plain, past] =
+                [0, 1, 2, 3, 4, 5].map(|i| CARD_MERGES[i].swap(0, Ordering::Relaxed) as f64 / frames);
             tracing::info!(
                 "of them through the merge on the card per frame (VICTORY_MERGE_ON_CARD=0 turns it off): {submissions:.1} submissions with \
-                 {dispatches:.1} dispatches and {:.0} KiB of masks; {copies:.1} submissions sent theirs up as copies",
-                mask / 1024.0
+                 {dispatches:.1} dispatches and {:.0} KiB of masks; {copies:.1} submissions sent theirs up as copies; plain CPU sides \
+                 (VICTORY_CARD_TWIN_PLAIN): {:.0} KiB of title bytes beside the masks, {past:.1} copies sent as copies (past the most a submission)",
+                mask / 1024.0,
+                plain / 1024.0
             );
         }
     }
@@ -4532,6 +4577,13 @@ impl Host {
                     "title bytes put in under flights' shader writes reach copies in the card's memory through a merge on the card \
                      (VICTORY_MERGE_ON_CARD=0: as copies of the changed runs)"
                 );
+                if crate::shadow::plain_twins() {
+                    tracing::info!(
+                        "the merge on the card with plain CPU sides (VICTORY_CARD_TWIN_PLAIN): the title's bytes go up beside the masks, \
+                         at most {} MB of both a submission (VICTORY_CARD_TWIN_RING_MB); past that as copies of the runs",
+                        card_merge_most() >> 20
+                    );
+                }
                 Some(merge)
             }
             Err(e) => {
@@ -4551,7 +4603,12 @@ impl Host {
             merge.masks[at].3 = until;
             return Some((merge.masks[at].0.clone(), merge.masks[at].1));
         }
-        if merge.masks.len() >= CardMerge::MOST {
+        // With plain CPU sides (`crate::shadow::plain_twins`, the mode for
+        // little memory) the buffers also hold the title's bytes, up to
+        // [`card_merge_most`] each: free ones too small for this asking
+        // are given back before a bigger one is made, so that PC memory
+        // pinned for the merge stays near what the flights in the air use.
+        if merge.masks.len() >= CardMerge::MOST || crate::shadow::plain_twins() {
             // Free ones that are too small make room.
             merge.masks.retain(|m| m.3 > completed);
             if merge.masks.len() >= CardMerge::MOST {
@@ -4720,34 +4777,48 @@ impl Host {
         // copy whose bytes cannot go that way (no shader, no mask buffer
         // free, a buffer that is not whole blocks) gets them as copies of
         // the runs, as without the switch.
-        let mut merges: Vec<(Arc<crate::shadow::Shadow>, Vec<crate::shadow::MaskStretch>)> = Vec::new();
+        // A copy whose CPU side is plain memory (`crate::shadow::plain_twins`)
+        // has its title bytes laid out in the same buffer behind the masks,
+        // where the merge reads them: (the offset there, from `title_base`).
+        let mut merges: Vec<(Arc<crate::shadow::Shadow>, Vec<crate::shadow::MaskStretch>, Option<usize>)> = Vec::new();
         let mut mask: Option<ID3D12Resource> = None;
         if !masked.is_empty() {
-            // (Not for a CPU side in plain memory, `crate::shadow::plain_twins`:
-            // the merge reads the title's bytes from the CPU side as a buffer.)
-            let whole_blocks = |shadow: &crate::shadow::Shadow| {
-                shadow
-                    .card_sides()
-                    .is_some_and(|(cpu, _, size)| cpu.is_some() && size % crate::shadow::MASK_BLOCK as u64 == 0)
-            };
             let mut bytes = 0usize;
-            let laid: Vec<Vec<crate::shadow::MaskStretch>> = masked
+            let mut plain_bytes = 0usize;
+            let most = card_merge_most();
+            let laid: Vec<(Vec<crate::shadow::MaskStretch>, Option<usize>)> = masked
                 .iter()
                 .map(|(shadow, blocks)| {
-                    if !whole_blocks(shadow) {
-                        return Vec::new();
+                    let Some((cpu, _, size)) = shadow.card_sides() else {
+                        return (Vec::new(), None);
+                    };
+                    if size % crate::shadow::MASK_BLOCK as u64 != 0 {
+                        return (Vec::new(), None);
                     }
                     let (stretches, end) = crate::shadow::mask_stretches(blocks, bytes);
+                    if cpu.is_some() {
+                        bytes = end;
+                        return (stretches, None);
+                    }
+                    let need: usize = stretches.iter().map(|s| s.bytes).sum();
+                    if end.next_multiple_of(256) + plain_bytes + need > most {
+                        CARD_MERGES[5].fetch_add(1, Ordering::Relaxed);
+                        return (Vec::new(), None);
+                    }
                     bytes = end;
-                    stretches
+                    plain_bytes += need;
+                    (stretches, Some(plain_bytes - need))
                 })
                 .collect();
+            // The title bytes of plain CPU sides start here, behind the masks.
+            let title_base = bytes.next_multiple_of(256);
+            let total = if plain_bytes > 0 { title_base + plain_bytes } else { bytes };
             // SAFETY: a plain query.
             let completed = unsafe { self.fence.GetCompletedValue() };
             // Held until the card has passed this submission's signal: the
             // merges run ahead of that.
             let buffer = match work.merge.as_mut() {
-                Some(merge) if bytes > 0 => self.card_mask(merge, bytes as u64, completed, sent + 1),
+                Some(merge) if bytes > 0 => self.card_mask(merge, total as u64, completed, sent + 1),
                 _ => None,
             };
             if buffer.is_none() {
@@ -4756,17 +4827,25 @@ impl Host {
                 CARD_MERGES[0].fetch_add(1, Ordering::Relaxed);
                 CARD_MERGES[2].fetch_add(bytes as u64, Ordering::Relaxed);
             }
-            for ((shadow, blocks), stretches) in masked.into_iter().zip(laid) {
+            for ((shadow, blocks), (stretches, title)) in masked.into_iter().zip(laid) {
                 match &buffer {
                     Some((_, data)) if !stretches.is_empty() => {
-                        // SAFETY: the mapping holds `bytes` bytes and more,
+                        // SAFETY: the mapping holds `total` bytes and more,
                         // and nothing on the card reads it (`card_mask`).
-                        let all = unsafe { std::slice::from_raw_parts_mut(*data as *mut u8, bytes) };
-                        crate::shadow::mask_fill(all, &stretches, &blocks);
+                        let all = unsafe { std::slice::from_raw_parts_mut(*data as *mut u8, total) };
+                        crate::shadow::mask_fill(&mut all[..bytes], &stretches, &blocks);
+                        let title = title.map(|at| title_base + at);
+                        if let Some(at) = title {
+                            // The CPU side's bytes the masks take, now: the
+                            // submitting thread is the one that writes them.
+                            let side = shadow.plain_side(0, usize::MAX).unwrap_or_default();
+                            let copied = crate::shadow::mask_title_fill(&mut all[at..], &stretches, &blocks, side);
+                            CARD_MERGES[4].fetch_add(copied as u64, Ordering::Relaxed);
+                        }
                         if !dirty.iter().any(|(s, _)| Arc::ptr_eq(s, &shadow)) {
                             dirty.push((shadow.clone(), Vec::new()));
                         }
-                        merges.push((shadow, stretches));
+                        merges.push((shadow, stretches, title));
                     }
                     _ => {
                         let runs = crate::shadow::mask_runs(&blocks);
@@ -4932,9 +5011,10 @@ impl Host {
                         }
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
                         // The merge on the card, behind the copies: both
-                        // take their bytes from the CPU's side.
-                        let merged = match (merges.iter().find(|(s, _)| Arc::ptr_eq(s, shadow)), &work.merge, &mask, staging) {
-                            (Some((_, stretches)), Some(merge), Some(mask), Some(staging)) => {
+                        // take their bytes from the CPU's side (a plain one's
+                        // through the mask buffer, `title`).
+                        let merged = match (merges.iter().find(|(s, _, _)| Arc::ptr_eq(s, shadow)), &work.merge, &mask) {
+                            (Some((_, stretches, title)), Some(merge), Some(mask)) if staging.is_some() || title.is_some() => {
                                 if !ranges.is_empty() {
                                     list.ResourceBarrier(&[transition(
                                         &shadow.buffer,
@@ -4944,20 +5024,34 @@ impl Host {
                                 }
                                 list.SetComputeRootSignature(&merge.root);
                                 list.SetPipelineState(&merge.pso);
-                                list.SetComputeRootShaderResourceView(1, staging.GetGPUVirtualAddress());
+                                let source = match (title, staging) {
+                                    (Some(_), _) => mask,
+                                    (None, Some(staging)) => staging,
+                                    (None, None) => unreachable!("guarded above"),
+                                };
+                                list.SetComputeRootShaderResourceView(1, source.GetGPUVirtualAddress());
                                 list.SetComputeRootShaderResourceView(2, mask.GetGPUVirtualAddress());
                                 list.SetComputeRootUnorderedAccessView(3, shadow.buffer.GetGPUVirtualAddress());
+                                // Where the next stretch's bytes are in a plain
+                                // side's title bytes (`shadow::mask_title_fill`).
+                                let mut laid_at = 0usize;
                                 for stretch in stretches {
                                     let mut done = 0;
                                     while done < stretch.bytes {
                                         let n = (stretch.bytes - done).min(CARD_MERGE_MOST);
                                         let words = (n / 32) as u32;
-                                        let constants = [(stretch.at + done) as u32, (stretch.mask_at + done / 8) as u32, words];
-                                        list.SetComputeRoot32BitConstants(0, 3, constants.as_ptr().cast(), 0);
+                                        let title_at = match title {
+                                            Some(at) => at + laid_at + done,
+                                            None => stretch.at + done,
+                                        };
+                                        let constants =
+                                            [(stretch.at + done) as u32, (stretch.mask_at + done / 8) as u32, words, title_at as u32];
+                                        list.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
                                         list.Dispatch(words.div_ceil(64), 1, 1);
                                         CARD_MERGES[1].fetch_add(1, Ordering::Relaxed);
                                         done += n;
                                     }
+                                    laid_at += stretch.bytes;
                                 }
                                 Some(stretches)
                             }
