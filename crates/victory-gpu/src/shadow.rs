@@ -1466,7 +1466,7 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
     let threads = (len / PER_THREAD).clamp(1, 6);
     if threads == 1 {
         // SAFETY: the caller's.
-        unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
+        unsafe { crate::fastcopy::copy(src, dst, len) };
         return;
     }
     let (src, dst, each) = (src as usize, dst as usize, len.div_ceil(threads));
@@ -1476,7 +1476,7 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
             let n = each.min(len - at);
             s.spawn(move || {
                 // SAFETY: a part of the caller's ranges.
-                unsafe { std::ptr::copy_nonoverlapping((src + at) as *const u8, (dst + at) as *mut u8, n) };
+                unsafe { crate::fastcopy::copy((src + at) as *const u8, (dst + at) as *mut u8, n) };
             });
         }
     });
@@ -1624,7 +1624,7 @@ fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
                 for (src, dst, len) in group {
                     // SAFETY: the caller's ranges: a host copy's mapping and
                     // its snapshot, which do not overlap.
-                    unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
+                    unsafe { crate::fastcopy::copy(src as *const u8, dst as *mut u8, len) };
                 }
             }));
         }
@@ -2947,7 +2947,7 @@ impl Shadow {
                     let (lo, hi) = (lo.max(from), hi.min(to));
                     // SAFETY: as below; `hi <= total`.
                     unsafe {
-                        std::ptr::copy_nonoverlapping(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
+                        crate::fastcopy::copy(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
                     }
                     kept.0[piece] = whole;
                 }
@@ -3745,7 +3745,7 @@ impl Shadow {
             let mut sent = 0;
             for &(at, len) in &stretches {
                 // SAFETY: as above; the stretch lies inside both.
-                unsafe { std::ptr::copy_nonoverlapping(now.as_ptr().add(at), self.data.add(from - start + at), len) };
+                unsafe { crate::fastcopy::copy(now.as_ptr().add(at), self.data.add(from - start + at), len) };
                 // After the bytes are in: a snapshot taken meanwhile is not current.
                 self.changed(from - start + at, from - start + at + len);
                 self.card_changed(from - start + at, from - start + at + len);
