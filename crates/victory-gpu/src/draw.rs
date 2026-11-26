@@ -1656,6 +1656,7 @@ impl State {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            crate::gpuwatch::view_past_end("vertex buffer view", v.address, shadow.left(v.address), u64::from(v.size));
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -1674,6 +1675,7 @@ impl State {
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            crate::gpuwatch::view_past_end("index buffer view", v.address, shadow.left(v.address), u64::from(v.size));
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
