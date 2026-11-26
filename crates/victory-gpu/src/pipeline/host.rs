@@ -119,11 +119,34 @@ fn integer_format(f: DXGI_FORMAT) -> bool {
     )
 }
 
-/// The title's blend state as the host takes it: blending off on integer
-/// render targets. The console ignores blending there, and titles leave it
-/// on (the world sets it on an `R8_UINT` target), but D3D12 does not allow
-/// it and refuses such a pipeline with `E_INVALIDARG`. With one description
-/// for every target, each target gets its own copy so the others keep theirs.
+/// Whether a target's blending reads the pixel shader's second colour
+/// (`SV_Target1`): dual-source blending, which D3D12 allows on target 0 only.
+fn dual_source(t: &D3D12_RENDER_TARGET_BLEND_DESC) -> bool {
+    let second = |b: D3D12_BLEND| {
+        matches!(
+            b,
+            D3D12_BLEND_SRC1_COLOR
+                | D3D12_BLEND_INV_SRC1_COLOR
+                | D3D12_BLEND_SRC1_ALPHA
+                | D3D12_BLEND_INV_SRC1_ALPHA
+        )
+    };
+    t.BlendEnable.as_bool()
+        && t.RenderTargetWriteMask != 0
+        && [t.SrcBlend, t.DestBlend, t.SrcBlendAlpha, t.DestBlendAlpha].into_iter().any(second)
+}
+
+/// The title's blend state as the host takes it:
+/// - blending off on integer render targets. The console ignores blending
+///   there, and titles leave it on (the world sets it on an `R8_UINT`
+///   target), but D3D12 does not allow it and refuses such a pipeline with
+///   `E_INVALIDARG`. With one description for every target, each target
+///   gets its own copy so the others keep theirs.
+/// - blending off on targets 1 to 7 while target 0 blends with the second
+///   colour. Those targets are unbound then (the second colour is the
+///   shader's output 1), but the title's per-target descriptions leave
+///   blending on in them, which D3D12 refuses (`E_INVALIDARG`, on Windows
+///   as under vkd3d-proton: its `test_dual_source_blending`).
 fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D12_BLEND_DESC {
     let count = (targets.NumRenderTargets as usize).min(8);
     let per_target = blend.IndependentBlendEnable.as_bool();
@@ -132,7 +155,11 @@ fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D1
             .BlendEnable
             .as_bool()
     };
-    if !(0..count).any(|i| integer_format(targets.RTFormats[i]) && blends(i)) {
+    let integer = (0..count).any(|i| integer_format(targets.RTFormats[i]) && blends(i));
+    let dual = per_target
+        && dual_source(&blend.RenderTarget[0])
+        && blend.RenderTarget[1..].iter().any(|t| t.BlendEnable.as_bool());
+    if !integer && !dual {
         return *blend;
     }
     let mut host = *blend;
@@ -143,6 +170,11 @@ fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D1
     for i in 0..count {
         if integer_format(targets.RTFormats[i]) {
             host.RenderTarget[i].BlendEnable = false.into();
+        }
+    }
+    if dual {
+        for t in &mut host.RenderTarget[1..] {
+            t.BlendEnable = false.into();
         }
     }
     host
@@ -1516,5 +1548,43 @@ mod tests {
         let mut t = blend_targets(&[DXGI_FORMAT_R8G8B8A8_UNORM]);
         t.RTFormats[1] = DXGI_FORMAT_R8_UINT;
         assert_eq!(host_blend(&blending(false), &t), blending(false));
+    }
+
+    /// Target 0 blending with the shader's second colour, the others
+    /// blending too (per target).
+    fn dual_source_blending(independent: bool) -> D3D12_BLEND_DESC {
+        let mut b = blending(independent);
+        b.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC1_ALPHA;
+        b
+    }
+
+    #[test]
+    fn dual_source_blending_leaves_the_other_targets_unblended() {
+        let t = blend_targets(&[DXGI_FORMAT_R8G8B8A8_UNORM]);
+        let host = host_blend(&dual_source_blending(true), &t);
+        assert!(host.IndependentBlendEnable.as_bool());
+        assert!(host.RenderTarget[0].BlendEnable.as_bool());
+        assert_eq!(host.RenderTarget[0].DestBlend, D3D12_BLEND_INV_SRC1_ALPHA);
+        assert!(host.RenderTarget[1..].iter().all(|t| !t.BlendEnable.as_bool()));
+        // The other fields are kept.
+        assert_eq!(host.RenderTarget[1].SrcBlend, D3D12_BLEND_SRC_ALPHA);
+    }
+
+    #[test]
+    fn dual_source_blending_without_per_target_state_is_kept() {
+        // One description for every target: the others are not read.
+        let b = dual_source_blending(false);
+        let t = blend_targets(&[DXGI_FORMAT_R8G8B8A8_UNORM]);
+        assert_eq!(host_blend(&b, &t), b);
+        // Per target, with the others already off.
+        let mut b = dual_source_blending(true);
+        for t in &mut b.RenderTarget[1..] {
+            t.BlendEnable = false.into();
+        }
+        assert_eq!(host_blend(&b, &t), b);
+        // A target 0 that writes nothing does not blend with the second colour.
+        let mut b = dual_source_blending(true);
+        b.RenderTarget[0].RenderTargetWriteMask = 0;
+        assert_eq!(host_blend(&b, &t), b);
     }
 }
