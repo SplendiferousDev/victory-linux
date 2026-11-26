@@ -1298,11 +1298,53 @@ fn pooled(n: usize) -> Vec<u8> {
     v
 }
 
-/// Returns a snapshot buffer to the pool: at most 8 kept, the largest, and
-/// of those the largest one and the next ones up to `KEPT` bytes in all.
+/// The most bytes of snapshot buffers [`give_back`] keeps in the pool
+/// (`VICTORY_SNAPSHOT_POOL_MB`, 512 unless set). The largest buffer is kept
+/// whatever its size unless this is 0, which keeps none: every snapshot is
+/// then new memory, freed when it is done with. The pool is resident
+/// memory (its pages were all written), which a PC short of memory may
+/// want back.
+fn pool_most() -> usize {
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_SNAPSHOT_POOL_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(512 << 20, |mb| mb.saturating_mul(1 << 20))
+    })
+}
+
+/// Says once the values in force of the switches for the PC's memory and
+/// for large copies.
+pub(crate) fn say_memory_switches() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let read_keep = crate::texture::read_keep();
+        tracing::info!(
+            "memory switches: VICTORY_SNAPSHOT_POOL_MB={} VICTORY_TEXTURE_READ_KEEP_MB={} \
+             VICTORY_WIDE_THREADS={} VICTORY_FAST_COPY={}",
+            pool_most() >> 20,
+            if read_keep == usize::MAX { "none".to_string() } else { (read_keep >> 20).to_string() },
+            wide_threads(),
+            if crate::fastcopy::on() { "on" } else { "off" },
+        );
+    });
+}
+
+/// Returns a snapshot buffer to the pool.
 fn give_back(v: Vec<u8>) {
-    const KEPT: usize = 512 << 20;
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    keep_in_pool(&mut pool, v, pool_most());
+}
+
+/// Puts `v` in `pool` and keeps at most 8 buffers, the largest: of those
+/// the largest one (unless `most` is 0) and the next ones up to `most`
+/// bytes in all.
+fn keep_in_pool(pool: &mut Vec<Vec<u8>>, v: Vec<u8>, most: usize) {
+    if most == 0 {
+        pool.clear();
+        return;
+    }
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
     pool.truncate(8);
@@ -1310,8 +1352,46 @@ fn give_back(v: Vec<u8>) {
     pool.retain(|v| {
         seen += 1;
         total = total.saturating_add(v.capacity());
-        seen == 1 || total <= KEPT
+        seen == 1 || total <= most
     });
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::keep_in_pool;
+
+    fn caps(pool: &[Vec<u8>]) -> Vec<usize> {
+        pool.iter().map(Vec::capacity).collect()
+    }
+
+    #[test]
+    fn the_pool_keeps_the_largest_and_the_next_up_to_its_most() {
+        let mut pool = Vec::new();
+        for n in [100, 400, 300, 200] {
+            keep_in_pool(&mut pool, Vec::with_capacity(n), 700);
+        }
+        assert_eq!(caps(&pool), [400, 300]);
+        // The largest stays even over the most.
+        keep_in_pool(&mut pool, Vec::with_capacity(5000), 700);
+        assert_eq!(caps(&pool), [5000]);
+    }
+
+    #[test]
+    fn the_pool_keeps_at_most_eight() {
+        let mut pool = Vec::new();
+        for n in 1..=10 {
+            keep_in_pool(&mut pool, Vec::with_capacity(n), usize::MAX);
+        }
+        assert_eq!(caps(&pool), [10, 9, 8, 7, 6, 5, 4, 3]);
+    }
+
+    #[test]
+    fn a_most_of_zero_keeps_nothing() {
+        let mut pool = Vec::new();
+        keep_in_pool(&mut pool, Vec::with_capacity(64), 0);
+        keep_in_pool(&mut pool, Vec::new(), 0);
+        assert!(pool.is_empty());
+    }
 }
 
 const NOT_WATCHED: u8 = 2;
@@ -1403,7 +1483,7 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
     let threads = (len / PER_THREAD).clamp(1, 6);
     if threads == 1 {
         // SAFETY: the caller's.
-        unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
+        unsafe { crate::fastcopy::copy(src, dst, len) };
         return;
     }
     let (src, dst, each) = (src as usize, dst as usize, len.div_ceil(threads));
@@ -1413,7 +1493,7 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
             let n = each.min(len - at);
             s.spawn(move || {
                 // SAFETY: a part of the caller's ranges.
-                unsafe { std::ptr::copy_nonoverlapping((src + at) as *const u8, (dst + at) as *mut u8, n) };
+                unsafe { crate::fastcopy::copy((src + at) as *const u8, (dst + at) as *mut u8, n) };
             });
         }
     });
@@ -1446,6 +1526,41 @@ pub(crate) fn wide_back() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK").is_none_or(|v| v != "0"))
 }
 
+/// The threads kept for [`wide`] (besides the one that hands out the
+/// work): a quarter of the hardware threads, 2 to 6, unless
+/// `VICTORY_WIDE_THREADS` says how many (1 to 32).
+pub(crate) fn wide_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        let hardware = std::thread::available_parallelism().map_or(16, |n| n.get());
+        threads_for(hardware, std::env::var("VICTORY_WIDE_THREADS").ok().as_deref())
+    })
+}
+
+/// [`wide_threads`] for `hardware` threads and the switch's text.
+fn threads_for(hardware: usize, asked: Option<&str>) -> usize {
+    match asked.and_then(|v| v.trim().parse::<usize>().ok()) {
+        Some(n) => n.clamp(1, 32),
+        None => (hardware / 4).clamp(2, 6),
+    }
+}
+
+#[cfg(test)]
+mod wide_threads_tests {
+    use super::threads_for;
+
+    #[test]
+    fn a_quarter_of_the_hardware_unless_asked() {
+        assert_eq!(threads_for(12, None), 3);
+        assert_eq!(threads_for(4, None), 2);
+        assert_eq!(threads_for(64, None), 6);
+        assert_eq!(threads_for(12, Some("bad")), 3);
+        assert_eq!(threads_for(12, Some(" 5 ")), 5);
+        assert_eq!(threads_for(12, Some("0")), 1);
+        assert_eq!(threads_for(12, Some("100")), 32);
+    }
+}
+
 type Job = Box<dyn FnOnce() + Send>;
 
 /// Threads kept for [`wide`]: what they are to do, and the word that there
@@ -1463,8 +1578,7 @@ fn workers() -> &'static Workers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
-        for i in 0..n {
+        for i in 0..wide_threads() {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 let workers = WORKERS.get().expect("made above");
                 loop {
@@ -1561,7 +1675,7 @@ fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
                 for (src, dst, len) in group {
                     // SAFETY: the caller's ranges: a host copy's mapping and
                     // its snapshot, which do not overlap.
-                    unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
+                    unsafe { crate::fastcopy::copy(src as *const u8, dst as *mut u8, len) };
                 }
             }));
         }
@@ -1800,6 +1914,34 @@ mod wide_tests {
     }
 }
 
+/// Makes scratch `v` `n` bytes long for a use that writes all of them
+/// before it reads any: the bytes it holds already are left as they are
+/// and only those it gains are zeroed (it was emptied and zeroed whole, up
+/// to 64 KiB each time, just before a read wrote over it).
+fn read_room(v: &mut Vec<u8>, n: usize) {
+    if v.len() >= n {
+        v.truncate(n);
+    } else {
+        v.resize(n, 0);
+    }
+}
+
+#[cfg(test)]
+mod read_room_tests {
+    use super::read_room;
+
+    #[test]
+    fn read_room_sizes_without_zeroing_what_is_there() {
+        let mut v = vec![7u8; 8];
+        read_room(&mut v, 5);
+        assert_eq!(v, [7; 5], "shorter: the bytes there stay");
+        read_room(&mut v, 9);
+        assert_eq!(v, [7, 7, 7, 7, 7, 0, 0, 0, 0], "longer: only the new ones zeroed");
+        read_room(&mut v, 0);
+        assert!(v.is_empty());
+    }
+}
+
 /// What [`Shadow::copy_back`] does with a piece that differs from the
 /// snapshot: `host` is the copy's bytes there, `old` the snapshot's. From
 /// the first byte that differs to the last, title memory is read into
@@ -1828,8 +1970,7 @@ fn back_piece(
     let last = last_difference(host, old).unwrap_or(first);
     let n = last + 1 - first;
     let (host, old) = (&mut host[first..=last], &old[first..=last]);
-    title.clear();
-    title.resize(n, 0);
+    read_room(title, n);
     if !read(first, title) {
         return None;
     }
@@ -1844,8 +1985,7 @@ fn back_piece(
     // data (one cleared a bit of a record the title had already replaced,
     // and copying it back broke the title's object: an access violation
     // through 0xffffffff00000000; PalmVIDev e0b70476, VIctory f39c6c2).
-    mask.clear();
-    mask.resize(n, 0);
+    read_room(mask, n);
     let mut differs = 0u8;
     for (((t, h), o), m) in title.iter_mut().zip(host.iter_mut()).zip(old).zip(mask.iter_mut()) {
         let gpu = if (*h != *o) & (*t == *o) { 0xffu8 } else { 0 };
@@ -2858,7 +2998,7 @@ impl Shadow {
                     let (lo, hi) = (lo.max(from), hi.min(to));
                     // SAFETY: as below; `hi <= total`.
                     unsafe {
-                        std::ptr::copy_nonoverlapping(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
+                        crate::fastcopy::copy(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
                     }
                     kept.0[piece] = whole;
                 }
@@ -3037,8 +3177,7 @@ impl Shadow {
         let last = last_difference(now, held).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (now, held) = (&now[first..=last], &mut held[first..=last]);
-        title.clear();
-        title.resize(n, 0);
+        read_room(title, n);
         // Who touched the page since its last store is looked at before our
         // own read of it (`VICTORY_BACK_READS`): counted only.
         #[cfg(feature = "diagnostics")]
@@ -3657,7 +3796,7 @@ impl Shadow {
             let mut sent = 0;
             for &(at, len) in &stretches {
                 // SAFETY: as above; the stretch lies inside both.
-                unsafe { std::ptr::copy_nonoverlapping(now.as_ptr().add(at), self.data.add(from - start + at), len) };
+                unsafe { crate::fastcopy::copy(now.as_ptr().add(at), self.data.add(from - start + at), len) };
                 // After the bytes are in: a snapshot taken meanwhile is not current.
                 self.changed(from - start + at, from - start + at + len);
                 self.card_changed(from - start + at, from - start + at + len);
@@ -3827,8 +3966,7 @@ impl Shadow {
         let last = last_difference(gpu, old).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, old) = (&gpu[first..=last], &mut old[first..=last]);
-        title.clear();
-        title.resize(n, 0);
+        read_room(title, n);
         let mut written = 0;
         if crate::host::read_into((start + at) as *const u8, title) {
             // The stretch as read: what the card did not change is the
@@ -3909,8 +4047,7 @@ impl Shadow {
                 .filter(|&(a, b)| a < at + n && b > at)
                 .collect()
         };
-        title.clear();
-        title.resize(n, 0);
+        read_room(title, n);
         // Who touched the page since its last store is looked at before our
         // own read of it (`VICTORY_BACK_READS`): counted only.
         #[cfg(feature = "diagnostics")]
