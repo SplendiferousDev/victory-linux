@@ -24,6 +24,8 @@
 /extracted/
 /cache/
 /out/
+# The physical page pool's temporary file (VICTORY_XMEM_POOL_DIR) holds title data.
+victory-pool-*.tmp
 
 # Executables, libraries, symbols
 *.exe

@@ -30,6 +30,13 @@ Usage: run.sh --game <folder> --exe <file name> [options]
   --measure <file>     sample once a second into <file> while it runs: memory,
                        CPU and I/O pressure, MemAvailable, swap, and the
                        resident size of the title's processes (measure.sh)
+  --pool-dir <dir>     experimental: keep the title's physical page pool in a
+                       temporary file in <dir> instead of shared memory (sets
+                       VICTORY_XMEM_POOL_DIR). Creates <dir>, marks it no
+                       copy-on-write on btrfs (chattr +C) and removes pool files
+                       a killed run left there. Needs free disk space of about
+                       the pool's size (6-7 GB). Off unless given; see
+                       docs/linux.md
 
 Memory guard (needs systemd; the title uses more than 10 GB, and a limit
 stops it from taking the whole desktop down when memory runs out):
@@ -45,6 +52,7 @@ USAGE
 
 game= exe= console=series-x diag=0 proton=${VICTORY_PROTON:-} prefix=
 wserver= stock=0 stockwine=0 measure= config= name=$(date +%Y%m%d-%H%M%S) scope=0 mhigh= mmax= swapmax=
+pool_dir=
 
 while (($#)); do
   case $1 in
@@ -60,6 +68,7 @@ while (($#)); do
     --stock-wineserver) stock=1; shift ;;
     --stock-wine) stockwine=1; stock=1; shift ;;
     --measure) measure=${2:?--measure needs a file}; shift 2 ;;
+    --pool-dir) pool_dir=${2:?--pool-dir needs a directory}; shift 2 ;;
     --scope) scope=1; shift ;;
     --memory-high) mhigh=${2:?}; shift 2 ;;
     --memory-max) mmax=${2:?}; shift 2 ;;
@@ -188,6 +197,30 @@ fi
 mkdir -p "$run_dir" "$log_dir" "$vkd3d_cache"
 log=$log_dir/$name.log
 
+# The page pool on a file (VICTORY_XMEM_POOL_DIR). The file holds title data:
+# it must not be in the repository. On btrfs, copy-on-write would fragment it
+# and make writes to pages being written back wait; +C only takes effect for
+# files made after it is set, so it is set on the (still empty) directory.
+if [[ -n $pool_dir ]]; then
+  [[ ${VICTORY_INPLACE:-0} == 0 ]] || die "--pool-dir and VICTORY_INPLACE exclude each other"
+  refuse_inside_repo "pool directory" "$pool_dir"
+  mkdir -p -- "$pool_dir"
+  pool_dir=$(realpath -- "$pool_dir")
+  # Files of a run that was killed (with its wineserver) before it could
+  # delete them. Nothing else uses them.
+  find "$pool_dir" -maxdepth 1 -type f -name 'victory-pool-*.tmp' -delete
+  case $(stat -f -c %T -- "$pool_dir") in
+    btrfs)
+      if ! { command -v chattr >/dev/null && chattr +C -- "$pool_dir" 2>/dev/null; }; then
+        warn "could not mark $pool_dir no copy-on-write (chattr +C); the pool file will be copy-on-write"
+      fi
+      ;;
+    tmpfs | ramfs) warn "$pool_dir is in RAM ($(stat -f -c %T -- "$pool_dir")): a pool file there saves nothing" ;;
+  esac
+  export VICTORY_XMEM_POOL_DIR
+  VICTORY_XMEM_POOL_DIR=$(winpath "$pool_dir")
+fi
+
 export_wine_env "$prefix"
 if [[ -z ${VKD3D_SHADER_CACHE_PATH:-} ]]; then
   export VKD3D_SHADER_CACHE_PATH
@@ -215,6 +248,7 @@ echo "prefix:   $prefix"
 echo "vkd3d:    ${b:-unknown version} (the log's 'vkd3d-proton - build:' line confirms the build)"
 echo "profile:  $console ($exe_dir build)"
 echo "log:      $log"
+[[ -z $pool_dir ]] || echo "pool:     a file in $pool_dir (VICTORY_XMEM_POOL_DIR)"
 if [[ -n $patched_tree ]]; then
   echo "wine:     patched Proton tree $patched_tree (patched ntdll.so and wineserver)$tree_note"
 fi

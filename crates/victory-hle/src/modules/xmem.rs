@@ -340,7 +340,8 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 // Physical pages: on the console, 64 KiB frames a title maps into its own
 // reservations, at more than one address if it likes. Here each allocation
-// is a pagefile-backed section, its pages are 64 KiB slices of it, and a
+// is a pagefile-backed section (or one on a disk file, `pool_dir`), its
+// pages are 64 KiB slices of it, and a
 // mapping is a view of consecutive slices in place of a host placeholder.
 
 const PAGE: usize = 64 << 10;
@@ -434,6 +435,9 @@ fn stats_tick() {
 struct Section {
     handle: HANDLE,
     bytes: usize,
+    /// The disk file behind the section ([`pool_dir`]), closed (and so
+    /// deleted) after the section; null for a pagefile-backed section.
+    file: HANDLE,
     /// With [`section_views`]: a view of our own of the whole section,
     /// mapped at the first write through one and kept while the section
     /// lives; `None` inside if the host refused it (writes then map a view
@@ -448,12 +452,20 @@ unsafe impl Send for Section {}
 unsafe impl Sync for Section {}
 
 impl Section {
-    fn new(handle: HANDLE, bytes: usize) -> Section {
+    fn new(handle: HANDLE, bytes: usize, file: HANDLE) -> Section {
         Section {
             handle,
             bytes,
+            file,
             whole: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Whether the section was made committed whole, so that a view of it
+    /// needs no commit: always under Wine (see `XMemAllocatePhysicalPages`),
+    /// and a section on a file everywhere (files have no reserved state).
+    fn committed(&self) -> bool {
+        on_wine() || !self.file.is_null()
     }
 
     /// The address of the whole section's view of our own, mapped now if
@@ -484,6 +496,9 @@ impl Drop for Section {
                 SECTION_VIEWS.fetch_sub(1, Ordering::Relaxed);
             }
             CloseHandle(self.handle);
+            if !self.file.is_null() {
+                CloseHandle(self.file);
+            }
         }
     }
 }
@@ -580,6 +595,12 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     count: *mut usize,
     pages: *mut usize,
 ) -> BOOL {
+    allocate_physical(flags, count, pages, pool_dir())
+}
+
+/// [`XMemAllocatePhysicalPages`], its section on a file in `dir` if one
+/// can be made there ([`pool_dir`]), else pagefile-backed.
+fn allocate_physical(flags: u64, count: *mut usize, pages: *mut usize, dir: Option<&str>) -> BOOL {
     if count.is_null() || pages.is_null() {
         return 0;
     }
@@ -588,23 +609,9 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
         return 0;
     };
-    // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`): the title asks for 6.1
-    // GiB at once, which a busy host often cannot commit (error 1450).
-    // SAFETY: plain section creation.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
+    let (handle, file) = match dir.and_then(|dir| pool_section(dir, size)) {
+        Some(made) => made,
+        None => (anonymous_section(size), std::ptr::null_mut()),
     };
     if handle.is_null() {
         let error = std::io::Error::last_os_error();
@@ -613,15 +620,21 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         unsafe { count.write(0) };
         return 0;
     }
+    let backing = if file.is_null() { "pagefile (anonymous section)" } else { "a disk file (VICTORY_XMEM_POOL_DIR)" };
+    if size >= POOL_LOG_BYTES {
+        tracing::info!(mb = size / MIB, backing, "physical page pool");
+    }
     tracing::debug!(
         n,
         flags = format_args!("{flags:#x}"),
+        backing,
         "XMemAllocatePhysicalPages"
     );
+    let section = Section::new(handle, size, file);
     // For the GPU side's in-place census: only a committed section can be
-    // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
-    let section = Arc::new(Section::new(handle, size));
+    // opened as a host heap (and on NVIDIA not one on a file).
+    victory_gpu::title_memory_section(handle as usize, size as u64, section.committed(), !file.is_null());
+    let section = Arc::new(section);
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -636,6 +649,192 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         unsafe { pages.add(index).write(number) };
     }
     1
+}
+
+/// Allocations from this size on say their backing in the log at info
+/// level (the title's pool is one of 6.1 GiB).
+const POOL_LOG_BYTES: usize = 64 * MIB;
+
+/// A pagefile-backed section of `bytes`, its pages committed when first
+/// mapped or written (`commit`): the title asks for 6.1 GiB at once, which
+/// a busy host often cannot commit (error 1450). Null if the host refused.
+fn anonymous_section(bytes: usize) -> HANDLE {
+    // SAFETY: plain section creation.
+    unsafe {
+        CreateFileMappingW(
+            INVALID_HANDLE_VALUE,
+            std::ptr::null(),
+            // Under Wine a committed section is a sparse file, free until
+            // touched, and committing a reserved one page by page costs a
+            // wineserver request each that scans every range committed so
+            // far: commit it whole there.
+            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
+            (bytes as u64 >> 32) as u32,
+            bytes as u32,
+            std::ptr::null(),
+        )
+    }
+}
+
+/// `VICTORY_XMEM_POOL_DIR`: a directory (a Windows path; under Wine e.g.
+/// `Z:\...`) in which each physical page allocation gets a file of its
+/// own as backing, in place of the pagefile. Unset: pagefile-backed, as
+/// always.
+///
+/// Why: under Wine a pagefile-backed section is a memfd (shmem). When the
+/// machine runs short, its cold pages go to swap, and with zram the
+/// compressed store itself takes RAM. Pages of a shared mapping of a real
+/// file are written back to that file instead and cost no RAM once clean.
+///
+/// What changes, and what does not:
+/// - The file is made in `dir` with `FILE_FLAG_DELETE_ON_CLOSE` and
+///   `FILE_ATTRIBUTE_TEMPORARY`, shared with nobody, sized with
+///   `SetEndOfFile` (sparse: nothing is written until the title writes),
+///   and closed after the section, which deletes it. It holds title data:
+///   `dir` belongs in the user's own data or cache directory, never in a
+///   source tree. A file left behind by a killed process (or a killed
+///   wineserver) is not in use and may be deleted.
+/// - The section is made with `SEC_COMMIT`: a file has no reserved state
+///   (`SEC_RESERVE` has no effect on one under Windows, Wine drops it), so
+///   views need no commit ([`Section::committed`]; both hosts refuse a
+///   commit in a view of a file).
+/// - Placeholders, `MapViewOfFile3`, views at several addresses and
+///   `VirtualProtect` guards work as with the pagefile: Wine's ntdll maps
+///   both kinds the same way (`virtual_map_section` /
+///   `map_file_into_view`: `mmap(MAP_SHARED | MAP_FIXED)` of the section's
+///   unix fd, read-write for `PAGE_READWRITE`); only the fd differs (a
+///   memfd, or the file, opened read-write by wineserver). Views were never
+///   write-watched (only private memory is).
+/// - Linux writes dirty pages of the file back on its own after
+///   `vm.dirty_expire_centisecs` (30 s), not only under pressure, so the
+///   SSD sees about what the title dirties in each such period, and a
+///   writer over `vm.dirty_ratio` is throttled (title threads stall). See
+///   docs/linux.md, tuning.
+/// - The disk must have room: a write into a page the file system cannot
+///   place faults (an access violation in title code). The file is made
+///   only with [`POOL_SPARE_BYTES`] more than the allocation free.
+/// - On NVIDIA, the driver refuses to import file-backed pages as GPU host
+///   memory, so `VICTORY_INPLACE` and this switch exclude each other: with
+///   both set the pool stays pagefile-backed (logged once).
+fn pool_dir() -> Option<&'static str> {
+    static DIR: LazyLock<Option<String>> = LazyLock::new(|| {
+        let dir = std::env::var("VICTORY_XMEM_POOL_DIR").ok()?;
+        let in_place = std::env::var("VICTORY_INPLACE").ok().and_then(|v| v.trim().parse::<u8>().ok()).unwrap_or(0);
+        pool_dir_given(&dir, in_place)
+    });
+    DIR.as_deref()
+}
+
+/// [`pool_dir`] for a value of the switch and of `VICTORY_INPLACE`.
+fn pool_dir_given(dir: &str, in_place: u8) -> Option<String> {
+    let dir = dir.trim();
+    if dir.is_empty() {
+        return None;
+    }
+    if in_place != 0 {
+        tracing::warn!(
+            dir,
+            in_place,
+            "VICTORY_XMEM_POOL_DIR and VICTORY_INPLACE exclude each other (file-backed pages cannot be opened as GPU \
+             host memory on every driver): the physical page pool stays pagefile-backed"
+        );
+        return None;
+    }
+    Some(dir.to_owned())
+}
+
+/// Free space a pool file leaves on its disk beyond its own size.
+const POOL_SPARE_BYTES: u64 = 1 << 30;
+
+/// A section of `bytes` on a new file in `dir` ([`pool_dir`]), and the
+/// file; `None` (said once in the log) if one cannot be made there.
+fn pool_section(dir: &str, bytes: usize) -> Option<(HANDLE, HANDLE)> {
+    match pool_file(dir, bytes) {
+        Ok(made) => Some(made),
+        Err(why) => {
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    dir,
+                    mb = bytes / MIB,
+                    why = %why,
+                    "no physical page section on a file there (VICTORY_XMEM_POOL_DIR): pagefile-backed instead"
+                );
+            }
+            None
+        }
+    }
+}
+
+/// [`pool_section`], with the reason on failure.
+fn pool_file(dir: &str, bytes: usize) -> Result<(HANDLE, HANDLE), String> {
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_TEMPORARY, FILE_BEGIN, FILE_FLAG_DELETE_ON_CLOSE,
+        GetDiskFreeSpaceExW, SetEndOfFile, SetFilePointerEx,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    /// `FSCTL_SET_SPARSE` (not in the features we take of windows-sys).
+    const FSCTL_SET_SPARSE: u32 = 0x9_00c4;
+    static FILES: AtomicUsize = AtomicUsize::new(0);
+    let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+    let os = || std::io::Error::last_os_error();
+    let dir = dir.trim_end_matches(['\\', '/']);
+    let mut free = 0u64;
+    // SAFETY: a NUL-terminated path and one out value; the rest may be null.
+    if unsafe { GetDiskFreeSpaceExW(wide(&format!("{dir}\\")).as_ptr(), &mut free, std::ptr::null_mut(), std::ptr::null_mut()) } == 0 {
+        return Err(format!("the directory cannot be used: {}", os()));
+    }
+    if free < bytes as u64 + POOL_SPARE_BYTES {
+        return Err(format!("{} MiB free there, {} MiB needed", free >> 20, (bytes as u64 + POOL_SPARE_BYTES) >> 20));
+    }
+    let name = format!(
+        "{dir}\\victory-pool-{}-{}.tmp",
+        std::process::id(),
+        FILES.fetch_add(1, Ordering::Relaxed)
+    );
+    // SAFETY: a NUL-terminated path; a new file, shared with nobody.
+    let file = unsafe {
+        CreateFileW(
+            wide(&name).as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            0,
+            std::ptr::null(),
+            CREATE_NEW,
+            FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
+            std::ptr::null_mut(),
+        )
+    };
+    if file == INVALID_HANDLE_VALUE {
+        return Err(format!("creating {name}: {}", os()));
+    }
+    let fail = |what: &str| {
+        let error = os();
+        // SAFETY: our own file, deleted as it closes.
+        unsafe { CloseHandle(file) };
+        Err(format!("{what}: {error}"))
+    };
+    // SAFETY: our own file; a request without buffers. Sparse where the
+    // file system knows it (NTFS would otherwise write zeros up to each
+    // page written; Wine takes the request and does nothing, its files are
+    // sparse anyway).
+    unsafe {
+        let mut returned = 0;
+        DeviceIoControl(file, FSCTL_SET_SPARSE, std::ptr::null(), 0, std::ptr::null_mut(), 0, &mut returned, std::ptr::null_mut());
+    }
+    // SAFETY: our own file, sized without writing.
+    if unsafe { SetFilePointerEx(file, bytes as i64, std::ptr::null_mut(), FILE_BEGIN) } == 0 || unsafe { SetEndOfFile(file) } == 0 {
+        return fail("sizing the file");
+    }
+    // SAFETY: a section on our own file, of its size.
+    let section = unsafe {
+        CreateFileMappingW(file, std::ptr::null(), PAGE_READWRITE | SEC_COMMIT, (bytes as u64 >> 32) as u32, bytes as u32, std::ptr::null())
+    };
+    if section.is_null() {
+        return fail("a section on the file");
+    }
+    tracing::debug!(name, mb = bytes / MIB, "physical page section on a file");
+    Ok((section, file))
 }
 
 /// Page numbers count 4 KiB frames, so a 64 KiB page's is a multiple of
@@ -702,7 +901,7 @@ impl View {
         }
         count(Stat::Temporary, 1);
         let view = View { at, len, whole: None };
-        commit(at.Value as usize, len).then_some(view)
+        commit(at.Value as usize, len, slice.section.committed()).then_some(view)
     }
 
     fn bytes(&mut self) -> &mut [u8] {
@@ -1187,7 +1386,7 @@ fn map_quiet(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> 
     if view.Value as usize != base {
         return Err(std::io::Error::last_os_error());
     }
-    if !commit(base, len) {
+    if !commit(base, len, slice.section.committed()) {
         let error = std::io::Error::other("the view's pages could not be committed");
         // SAFETY: the view just mapped, back to a placeholder.
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
@@ -1206,10 +1405,13 @@ fn map_quiet(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> 
     Ok(())
 }
 
-/// Commits the section pages a view shows (once per page, whichever view).
-fn commit(base: usize, len: usize) -> bool {
-    if on_wine() {
-        return true; // sections are committed whole there
+/// Commits the section pages a view shows (once per page, whichever view),
+/// unless the section is committed whole ([`Section::committed`]; the
+/// host refuses a commit in a view of a file, Wine with
+/// `STATUS_ALREADY_COMMITTED`).
+fn commit(base: usize, len: usize, committed: bool) -> bool {
+    if committed {
+        return true;
     }
     // SAFETY: `[base, base + len)` is a view of a reserved section.
     if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
@@ -2041,6 +2243,126 @@ mod tests {
         );
         assert_eq!(given, n);
         pages
+    }
+
+    /// `n` pages of one new allocation, on a file in `dir` if one can be
+    /// made there.
+    fn allocate_on(n: usize, dir: Option<&str>) -> Vec<usize> {
+        let (mut pages, mut given) = (vec![0; n], n);
+        assert_eq!(allocate_physical(0, &mut given, pages.as_mut_ptr(), dir), 1);
+        assert_eq!(given, n);
+        pages
+    }
+
+    /// A new directory in the host's temporary directory (under Wine the
+    /// prefix's, so on a disk, as a pool directory should be), removed when
+    /// dropped.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new() -> TempDir {
+            static N: AtomicUsize = AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "victory-pool-test-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&path).expect("a temporary directory");
+            TempDir(path)
+        }
+
+        fn path(&self) -> &str {
+            self.0.to_str().expect("a UTF-8 path")
+        }
+
+        fn files(&self) -> usize {
+            std::fs::read_dir(&self.0).expect("readable").count()
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// With `VICTORY_XMEM_POOL_DIR`, pages on a file in that directory:
+    /// mapped into placeholders, at two addresses, remapped, written
+    /// through views of ours and the title's, as the pagefile-backed ones
+    /// are; the file goes with the last page and view.
+    #[test]
+    fn a_pool_on_a_file_behaves_like_the_pagefile_one() {
+        let dir = TempDir::new();
+        let pages = allocate_on(3, Some(dir.path()));
+        assert_eq!(dir.files(), 1, "one file for the allocation in {}", dir.path());
+        {
+            let section = physical().pages[&pages[0]].section.clone();
+            assert!(!section.file.is_null(), "on a file");
+            assert!(section.committed(), "committed whole");
+        }
+        let (a, b) = (reserve(3), reserve(3));
+        let at = |p: *mut c_void, page: usize| p.wrapping_byte_add(page * PAGE);
+        assert_eq!(XMemMapPhysicalPages(a, 3, pages.as_ptr()), a);
+        assert_eq!(XMemMapPhysicalPages(at(b, 1), 1, pages[2..].as_ptr()), at(b, 1));
+        // SAFETY (the reads and writes below): mapped read-write.
+        unsafe {
+            // One page at two addresses, either way round.
+            at(a, 2).cast::<u8>().write(7);
+            assert_eq!(at(b, 1).cast::<u8>().read(), 7);
+            at(b, 1).cast::<u8>().add(9).write(8);
+            assert_eq!(at(a, 2).cast::<u8>().add(9).read(), 8);
+            a.cast::<u8>().write(1);
+        }
+        // DirectStorage's writes, through a view of our own.
+        assert!(write_physical(&pages, PAGE + 5, &[4, 5, 6]));
+        // SAFETY: mapped read-write.
+        assert_eq!(unsafe { std::slice::from_raw_parts(at(a, 1).cast::<u8>().add(5), 3) }, [4, 5, 6]);
+        assert_eq!(page_bytes(pages[2])[9], 8);
+        // Remapped: the middle page unmapped, then page 0 scattered there.
+        assert_eq!(XMemMapPhysicalPages(at(a, 1), 1, std::ptr::null()), at(a, 1));
+        assert_eq!(query(at(a, 1)).host.State, MEM_RESERVE);
+        assert_eq!(XMemMapPhysicalPagesScatter([at(a, 1)].as_ptr(), 1, pages.as_ptr()), 1);
+        // SAFETY: mapped read-write.
+        assert_eq!(unsafe { at(a, 1).cast::<u8>().read() }, 1);
+        // The GPU's page-mapping copy.
+        assert!(map_alias(b as u64, at(a, 2) as u64, PAGE as u64));
+        // SAFETY: mapped read-write.
+        assert_eq!(unsafe { b.cast::<u8>().read() }, 7);
+        // All unmapped and freed: the section goes, and its file with it.
+        let gone = Arc::downgrade(&physical().pages[&pages[0]].section);
+        for p in [a, b] {
+            assert_eq!(XMemMapPhysicalPages(p, 3, std::ptr::null()), p);
+        }
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+        assert!(gone.upgrade().is_none(), "the section is gone");
+        assert_eq!(dir.files(), 0, "the file is deleted on close");
+    }
+
+    /// A pool directory that cannot be used: the pages are pagefile-backed,
+    /// as without the switch.
+    #[test]
+    fn a_pool_dir_that_does_not_exist_falls_back_to_the_pagefile() {
+        let dir = TempDir::new();
+        let missing = dir.0.join("missing");
+        let pages = allocate_on(2, Some(missing.to_str().expect("a UTF-8 path")));
+        {
+            let section = physical().pages[&pages[0]].section.clone();
+            assert!(section.file.is_null(), "pagefile-backed");
+            assert_eq!(section.committed(), on_wine());
+        }
+        assert!(write_physical(&pages, PAGE - 1, &[5, 6]));
+        assert_eq!((page_bytes(pages[0])[PAGE - 1], page_bytes(pages[1])[0]), (5, 6));
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+        assert!(!missing.exists());
+        assert_eq!(dir.files(), 0);
+    }
+
+    #[test]
+    fn the_pool_dir_is_refused_beside_in_place() {
+        assert_eq!(pool_dir_given(" X:\\pool ", 0).as_deref(), Some("X:\\pool"));
+        assert_eq!(pool_dir_given("  ", 0), None);
+        assert_eq!(pool_dir_given("X:\\pool", 1), None);
+        assert_eq!(pool_dir_given("X:\\pool", 2), None);
     }
 
     /// The bytes of one page, through a view of our own.

@@ -272,8 +272,9 @@ struct Views {
     /// page is a write of the bytes every other view shows
     /// (`crate::watch` guards them all).
     pages: BTreeMap<(usize, u64), Vec<usize>>,
-    /// Sections by handle: bytes, and whether made committed.
-    sections: Vec<(usize, u64, bool)>,
+    /// Sections by handle: bytes, whether made committed, and whether on
+    /// a disk file.
+    sections: Vec<(usize, u64, bool, bool)>,
 }
 
 static VIEWS: Mutex<Views> =
@@ -284,12 +285,14 @@ fn views() -> std::sync::MutexGuard<'static, Views> {
 }
 
 /// The runtime made a section of `bytes` for physical pages; `committed`
-/// if with `SEC_COMMIT` (only such a section can be opened as a heap).
-pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
+/// if with `SEC_COMMIT` (only such a section can be opened as a heap);
+/// `file` if on a disk file (`VICTORY_XMEM_POOL_DIR`; committed whole, and
+/// a commit in a view of it is refused).
+pub fn title_memory_section(section: usize, bytes: u64, committed: bool, file: bool) {
     {
         let mut v = views();
         v.sections.retain(|s| s.0 != section);
-        v.sections.push((section, bytes, committed));
+        v.sections.push((section, bytes, committed, file));
     }
     // A view of our own made on an earlier section that had this handle's
     // number shows that section's pages, not this one's: it is forgotten
@@ -482,7 +485,7 @@ pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
     // No mapping changes until the bytes are in: the view found below
     // shows these pages for as long as this is held.
     let _still = crate::watch::title_memory_reading_now()?;
-    let (section, offset, shown, section_bytes) = {
+    let (section, offset, shown, (section_bytes, on_file)) = {
         let v = views();
         let (&base, &(len, section, offset)) = v.views.range(..=at).next_back()?;
         if at + bytes.len() > base + len {
@@ -493,8 +496,8 @@ pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
         if shown.len() > crate::watch::MANY_VIEWS {
             return None;
         }
-        let section_bytes = v.sections.iter().find(|s| s.0 == section)?.1;
-        (section, offset, shown, section_bytes)
+        let found = v.sections.iter().find(|s| s.0 == section)?;
+        (section, offset, shown, (found.1, found.3))
     };
     if offset + bytes.len() as u64 > section_bytes {
         return None;
@@ -531,7 +534,9 @@ pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
         return None;
     }
     let block = offset as usize / K64;
-    if (view.committed[block / 64] & (1u64 << (block % 64))) == 0 {
+    // A section on a file is committed whole; the host refuses a commit in
+    // a view of one.
+    if !on_file && (view.committed[block / 64] & (1u64 << (block % 64))) == 0 {
         // The title's view committed these pages of the section; asked
         // once more through ours, which changes nothing if they are.
         // SAFETY: a block inside our own view.
@@ -1137,11 +1142,17 @@ fn census_of(spans: &[(u64, u64, bool)]) -> Vec<String> {
         bytes >> 20,
         big >> 20
     ));
-    for &(_, bytes, committed) in &v.sections {
+    for &(_, bytes, committed, file) in &v.sections {
         lines.push(format!(
             "census, a section of {} MB, {}",
             bytes >> 20,
-            if committed { "committed: it can be opened as one heap" } else { "reserved: refused as a heap until it is made with SEC_COMMIT" }
+            if file {
+                "on a disk file: not to be opened as a heap (NVIDIA refuses file-backed host memory)"
+            } else if committed {
+                "committed: it can be opened as one heap"
+            } else {
+                "reserved: refused as a heap until it is made with SEC_COMMIT"
+            }
         ));
     }
     lines

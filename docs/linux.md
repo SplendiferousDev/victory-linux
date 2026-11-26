@@ -293,6 +293,59 @@ your value (`VICTORY_WINDOW_KB`, `VICTORY_WINDOW_UPLOAD`,
 `VICTORY_TEXTURE_READ_KEEP_MB`). Every build logs a line `memory of host
 copies ...` every 10 s showing what the copies hold and where.
 
+Experimental: the page pool on a disk file. The title's physical pages are
+one section of about 6 GB, of which about 4 GB gets written. Under Wine that
+section is shared memory (a memfd, `memfd:wine-mapping` in
+`/proc/<pid>/smaps`). When memory runs short its cold pages go to swap, and
+with zram the compressed store itself takes RAM (several GB at the kills
+measured on a 16 GB machine). `VICTORY_XMEM_POOL_DIR=<Windows path of a
+directory>` (off unless set) puts the section on a temporary file in that
+directory instead. The kernel then evicts its pages by writing them back to
+the file, and clean pages cost no RAM. `run.sh --pool-dir <dir>` prepares
+the directory and sets the switch:
+
+```sh
+scripts/linux/run.sh --game ... --exe ... --pool-dir ~/.cache/victory-linux/pool
+```
+
+- The file holds title data. Put the directory in your own data or cache
+  directory, never in the repository (`run.sh` refuses that) and not in a
+  RAM file system such as `/tmp` on many distributions (that saves nothing).
+  The file is opened with delete-on-close and goes when the title exits. A
+  run killed together with its wineserver leaves it behind; `--pool-dir`
+  removes such leftovers (`victory-pool-*.tmp`) before the next start.
+- It needs free disk space of about the pool's size: the file is sparse, but
+  a page the title writes must find room on the disk, or the title crashes.
+  The runtime makes the file only with 1 GiB more than the pool free.
+- On btrfs, mark the directory no copy-on-write while it is empty
+  (`chattr +C <dir>`; `--pool-dir` does it). Otherwise each written-back page
+  is copied to a new place, the file fragments, and with data checksums a
+  title write to a page being written back waits for that write.
+- Disk writes: Linux writes dirty pages of a shared file back on its own
+  after `vm.dirty_expire_centisecs` (30 s by default), not only under memory
+  pressure. A load writes roughly the pool's touched size (about 4 GB); in
+  play, about what the title changes in each 30 s period. Measure with the
+  disk's write counters (`/proc/diskstats`, or `iostat`) if SSD wear matters.
+- Throttling: a process that dirties pages faster than the disk takes them
+  is held in the kernel once dirty pages pass `vm.dirty_ratio` (or
+  `vm.dirty_bytes`; under a cgroup memory limit, a share of that limit). The
+  title's threads then stall. Watch the `io` pressure columns of
+  `--measure`. Lower `vm.dirty_background_bytes` (for example 256 MB) to make
+  writeback start earlier and in smaller pieces.
+- Wine maps a section on a file the same way as shared memory (one shared
+  read-write `mmap` of the section's file descriptor per view). Placeholders,
+  views at several addresses, remapping and page guards behave the same.
+  The runtime's own changes are small: a file has no reserved state, so the
+  section is created committed and views are never committed one by one.
+- `VICTORY_INPLACE` and this switch exclude each other. NVIDIA's driver
+  refuses to import file-backed pages as GPU host memory. With both set,
+  the pool stays shared memory and the log says so; `run.sh --pool-dir`
+  refuses to start.
+- The log line `physical page pool` names the backing in use and its size.
+  To judge it, compare against a run without it: the `memfd:wine-mapping`
+  swap in smaps (it should drop to about 0), the zram store (`zramctl`,
+  `mm_stat`), major faults of the process, disk writes, and frame times.
+
 Not tested yet (do not rely on it): `vm.swappiness`, `vm.max_map_count` effects
 beyond avoiding the limit, transparent huge pages, `zswap` instead of zram,
 `MemoryHigh` values other than the ones above, an AMD card (different memory
