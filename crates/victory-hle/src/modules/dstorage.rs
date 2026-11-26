@@ -17,7 +17,7 @@
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
@@ -434,7 +434,11 @@ fn scheduler() -> Option<&'static Scheduler> {
                     .is_ok()
             })
             .count();
-        tracing::info!(workers = started, "dstorage: workers");
+        tracing::info!(
+            workers = started,
+            scratch_kb = scratch_most() >> 10,
+            "dstorage: workers (scratch kept per worker: VICTORY_DSTORAGE_SCRATCH_KB)"
+        );
     });
     Some(scheduler)
 }
@@ -946,30 +950,46 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             if !bounce {
                 return read_into(request, out).map(|()| size);
             }
-            let mut data = vec![0; size];
-            read_into(request, &mut data)?;
-            out.copy_from_slice(&data);
-            Ok(size)
+            with_scratch(FILE, size, |data| {
+                read_into(request, data)?;
+                out.copy_from_slice(data);
+                Ok(size)
+            })
         })
         .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
-    let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
-    // The console's order: zlib first, then BCPack.
-    let source = if bc != 0 && options & ZLIB != 0 {
-        let mut packed = vec![0; request.intermediate_size as usize];
-        let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
-        packed.truncate(n);
-        Cow::Owned(packed)
-    } else {
-        source
+    let unpack = |source: &[u8]| {
+        into_destination(request, size, |out| match tables {
+            Some(tables) => bcpack::decode(bc, source, out, tables)
+                .map(|()| out.len())
+                .map_err(|e| fail(INVALID_DATA, &e.to_string())),
+            None => inflate(source, out).map_err(|hr| fail(hr, "zlib")),
+        })
     };
-    into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
-            .map(|()| out.len())
-            .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
-    })?;
+    // The console's order: zlib first, then BCPack.
+    let inflate_and_unpack = |source: &[u8]| {
+        if bc != 0 && options & ZLIB != 0 {
+            with_scratch(INTERMEDIATE, request.intermediate_size as usize, |packed| {
+                let n = inflate(source, packed).map_err(|hr| fail(hr, "zlib"))?;
+                unpack(&packed[..n])
+            })
+        } else {
+            unpack(source)
+        }
+    };
+    let source_size = request.source_size as usize;
+    if options & MEMORY_SOURCE != 0 {
+        // SAFETY: the title's source holds `source_size` bytes until
+        // completion.
+        let source = unsafe { std::slice::from_raw_parts(request.source.cast(), source_size) };
+        inflate_and_unpack(source)?;
+    } else {
+        with_scratch(FILE, source_size, |source| {
+            read_into(request, source).map_err(|hr| fail(hr, "reading the source"))?;
+            inflate_and_unpack(source)
+        })?;
+    }
     tracing::trace!(
         options = format_args!("{options:#x}"),
         offset = request.offset,
@@ -1066,18 +1086,51 @@ fn load_bcpack_tables() -> Result<Tables, String> {
     Tables::parse(&bytes).map_err(|e| e.to_string())
 }
 
-/// A compressed request's source: borrowed from memory, or read from the
-/// file.
-fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
-    let size = request.source_size as usize;
-    if request.options & MEMORY_SOURCE != 0 {
-        // SAFETY: the title's source holds `size` bytes until completion.
-        let bytes = unsafe { std::slice::from_raw_parts(request.source.cast(), size) };
-        return Ok(Cow::Borrowed(bytes));
+/// [`with_scratch`]'s buffers: a file's bytes (a plain request's, read
+/// beside its destination, or a compressed request's source), and the
+/// output of zlib that BCPack unpacks.
+const FILE: usize = 0;
+const INTERMEDIATE: usize = 1;
+
+/// The most bytes a worker keeps of each of its scratch buffers between
+/// requests (`VICTORY_DSTORAGE_SCRATCH_KB`; 0, the default: none, every
+/// request allocates its buffers and frees them when done, as before). A
+/// buffer kept is resident memory: up to twice this per worker, one
+/// worker per hardware thread.
+fn scratch_most() -> usize {
+    static MOST: OnceLock<usize> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_DSTORAGE_SCRATCH_KB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(0, |kb| kb.saturating_mul(1 << 10))
+    })
+}
+
+/// Calls `f` with `len` bytes of this worker's scratch buffer `which`
+/// ([`FILE`] or [`INTERMEDIATE`]); their contents are whatever the last
+/// request left there, so `f` writes before it reads. Over
+/// [`scratch_most`] the bytes are new, zeroed memory, freed afterwards.
+fn with_scratch<R>(which: usize, len: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+    thread_local! {
+        static SCRATCH: [RefCell<Vec<u8>>; 2] = const { [const { RefCell::new(Vec::new()) }; 2] };
     }
-    let mut bytes = vec![0; size];
-    read_into(request, &mut bytes)?;
-    Ok(Cow::Owned(bytes))
+    SCRATCH.with(|scratch| scratch_in(&scratch[which], len, scratch_most(), f))
+}
+
+fn scratch_in<R>(
+    kept: &RefCell<Vec<u8>>,
+    len: usize,
+    most: usize,
+    f: impl FnOnce(&mut [u8]) -> R,
+) -> R {
+    let Some(mut kept) = kept.try_borrow_mut().ok().filter(|_| len <= most) else {
+        return f(&mut vec![0; len]);
+    };
+    if kept.len() < len {
+        kept.resize(len, 0);
+    }
+    f(&mut kept[..len])
 }
 
 /// Nanoseconds workers spent reading files, for the debug summary.
@@ -1374,6 +1427,27 @@ mod tests {
 
     fn pattern(n: usize) -> Vec<u8> {
         (0..n).map(|i| (i * 7 + i / 251) as u8).collect()
+    }
+
+    /// Up to the most, the kept buffer is lent (grown, not zeroed again);
+    /// over it, or while lent already, the bytes are new zeroes.
+    #[test]
+    fn scratch_is_kept_only_up_to_its_most() {
+        let kept = RefCell::new(Vec::new());
+        scratch_in(&kept, 8, 16, |b| b.fill(5));
+        assert_eq!(*kept.borrow(), [5; 8]);
+        scratch_in(&kept, 4, 16, |b| assert_eq!(b, [5; 4]));
+        scratch_in(&kept, 12, 16, |b| assert_eq!(b, [5, 5, 5, 5, 5, 5, 5, 5, 0, 0, 0, 0]));
+        scratch_in(&kept, 32, 16, |b| {
+            assert!(b.iter().all(|&x| x == 0));
+            b.fill(9);
+        });
+        assert_eq!(kept.borrow().len(), 12, "over the most: the kept one untouched");
+        scratch_in(&kept, 4, 0, |b| assert_eq!(b, [0; 4]));
+        scratch_in(&kept, 4, 16, |outer| {
+            outer.fill(1);
+            scratch_in(&kept, 4, 16, |inner| assert_eq!(inner, [0; 4], "lent: new bytes"));
+        });
     }
 
     #[test]
