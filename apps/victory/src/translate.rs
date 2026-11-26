@@ -312,9 +312,7 @@ pub fn warm_pipelines(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool)
 pub fn precompile_graphics(
     archive: Option<PathBuf>,
     jobs: Option<usize>,
-    limit: Option<usize>,
-    skip: usize,
-    mesh: bool,
+    choice: victory_hle::modules::d3d12x::PrecompileChoice,
 ) -> Result<()> {
     let cfg = victory_core::Config::load()?;
     let archive = match archive {
@@ -327,7 +325,7 @@ pub fn precompile_graphics(
     let index = cfg.cache_subdir("precompiled")?.join("shader-archive.index");
     let jobs = jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).max(1)));
     let started = std::time::Instant::now();
-    let report = victory_hle::modules::d3d12x::precompile_graphics(&archive, Some(&index), jobs, limit, skip, mesh, &|done, r| {
+    let report = victory_hle::modules::d3d12x::precompile_graphics(&archive, Some(&index), jobs, &choice, &|done, r| {
         println!(
             "{:6.0} s  {done} records: {} made, {} failed, {} duplicates, {} unmapped, {} undecoded",
             started.elapsed().as_secs_f64(),

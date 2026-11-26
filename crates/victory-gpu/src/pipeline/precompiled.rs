@@ -462,24 +462,51 @@ pub struct PrecompileReport {
     pub failed: usize,
 }
 
+/// Which graphics records [`precompile_graphics`] makes.
+#[derive(Debug, Default, Clone)]
+pub struct PrecompileChoice {
+    /// At most this many (after `skip`).
+    pub limit: Option<usize>,
+    /// Leaves out the first this many (of those chosen).
+    pub skip: usize,
+    /// Only records with a mesh shader.
+    pub mesh_only: bool,
+    /// Only these record numbers.
+    pub records: Option<Vec<usize>>,
+}
+
+impl PrecompileChoice {
+    /// The record numbers to make, in order, of `count` records;
+    /// `mesh(i)` tells whether record `i` has a mesh shader.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn records(&self, count: usize, mesh: impl Fn(usize) -> bool) -> Vec<usize> {
+        let listed: Box<dyn Iterator<Item = usize>> = match &self.records {
+            Some(r) => Box::new(r.iter().copied().filter(|&i| i < count)),
+            None => Box::new(0..count),
+        };
+        listed
+            .filter(|&i| !self.mesh_only || mesh(i))
+            .skip(self.skip)
+            .take(self.limit.unwrap_or(usize::MAX))
+            .collect()
+    }
+}
+
 /// Offline: makes the host pipeline of every graphics record of the
 /// title's pipeline cache (found in the shader archive `archive`) into
 /// the pipeline library, so that a run finds them there, at the key a
 /// run names them by when the title hands out the same pipeline (with
 /// `VICTORY_PRECOMPILED_GRAPHICS=1`). Runs `jobs` workers at the lowest
 /// thread priority, in background mode (lowered I/O and memory priority
-/// too), so it can go on beside other work; needs a host GPU. Stops after
-/// `limit` records if given, after the first `skip`; with `mesh_only`,
-/// only mesh-shader records count. The caller saves the library
+/// too), so it can go on beside other work; needs a host GPU. Makes the
+/// records `choice` names. The caller saves the library
 /// ([`super::save_pipeline_cache`]).
 #[cfg(windows)]
 pub fn precompile_graphics(
     archive: &std::path::Path,
     index: Option<&std::path::Path>,
     jobs: usize,
-    limit: Option<usize>,
-    skip: usize,
-    mesh_only: bool,
+    choice: &PrecompileChoice,
     progress: &(dyn Fn(usize, &PrecompileReport) + Sync),
 ) -> Result<PrecompileReport, String> {
     use std::sync::atomic::AtomicUsize;
@@ -494,13 +521,11 @@ pub fn precompile_graphics(
     drop(bytes);
     let cache = pso_cache::Cache::parse(&file)?;
     // The record numbers to make, in order.
-    let chosen: Vec<usize> = (0..cache.graphics_count())
-        .filter(|&i| !mesh_only || cache.graphics(i).is_some_and(|g| g.stages[2].is_some()))
-        .skip(skip)
-        .take(limit.unwrap_or(usize::MAX))
-        .collect();
+    let chosen = choice.records(cache.graphics_count(), |i| {
+        cache.graphics(i).is_some_and(|g| g.stages[2].is_some())
+    });
     let records = chosen.len();
-    tracing::info!(records, skip, mesh_only, shaders, jobs, "precompiling the title's graphics pipelines");
+    tracing::info!(records, ?choice, shaders, jobs, "precompiling the title's graphics pipelines");
 
     let next = AtomicUsize::new(0);
     let keys = Mutex::new(HashSet::new());
@@ -665,6 +690,22 @@ pub(crate) mod tests {
         assert!(text.contains("POSITION"), "{text}");
         assert_eq!(g.topology, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
         assert_eq!(g.targets.NumRenderTargets, 1);
+    }
+
+    #[test]
+    fn records_are_chosen_by_number_then_kind_then_window() {
+        let all = PrecompileChoice::default();
+        assert_eq!(all.records(4, |_| false), [0, 1, 2, 3]);
+        let window = PrecompileChoice { skip: 1, limit: Some(2), ..Default::default() };
+        assert_eq!(window.records(5, |_| false), [1, 2]);
+        let listed = PrecompileChoice {
+            records: Some(vec![7, 2, 3, 40]),
+            mesh_only: true,
+            skip: 1,
+            ..Default::default()
+        };
+        // 40 is past the end; 2 is not a mesh record; 7 is skipped.
+        assert_eq!(listed.records(10, |i| i != 2), [3]);
     }
 
     #[test]

@@ -69,7 +69,7 @@ pub fn use_shader_pack(archive: std::path::PathBuf, index: std::path::PathBuf) {
     victory_gpu::pipeline::use_shader_pack(archive, Some(index));
 }
 
-pub use victory_gpu::pipeline::PrecompileReport;
+pub use victory_gpu::pipeline::{PrecompileChoice, PrecompileReport};
 
 /// `victory precompile-graphics`: see
 /// `victory_gpu::pipeline::precompile_graphics`.
@@ -77,18 +77,16 @@ pub fn precompile_graphics(
     archive: &std::path::Path,
     index: Option<&std::path::Path>,
     jobs: usize,
-    limit: Option<usize>,
-    skip: usize,
-    mesh_only: bool,
+    choice: &PrecompileChoice,
     progress: &(dyn Fn(usize, &PrecompileReport) + Sync),
 ) -> Result<PrecompileReport, String> {
     #[cfg(windows)]
     {
-        victory_gpu::pipeline::precompile_graphics(archive, index, jobs, limit, skip, mesh_only, progress)
+        victory_gpu::pipeline::precompile_graphics(archive, index, jobs, choice, progress)
     }
     #[cfg(not(windows))]
     {
-        let _ = (archive, index, jobs, limit, skip, mesh_only, progress);
+        let _ = (archive, index, jobs, choice, progress);
         Err("no host GPU on this host".into())
     }
 }

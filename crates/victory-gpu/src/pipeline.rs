@@ -831,7 +831,7 @@ static FUNCTIONS: Table<24> = {
 mod pack;
 mod precompiled;
 pub use pack::use_shader_pack;
-pub use precompiled::PrecompileReport;
+pub use precompiled::{PrecompileChoice, PrecompileReport};
 #[cfg(windows)]
 pub use precompiled::precompile_graphics;
 pub(crate) use precompiled::{Precompiled, create_precompiled};

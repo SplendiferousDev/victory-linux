@@ -124,6 +124,10 @@ enum Command {
         /// Only records with a mesh shader.
         #[arg(long)]
         mesh: bool,
+        /// Only these record numbers (comma-separated, as the log's
+        /// `record=` names them), before --mesh, --skip and --limit.
+        #[arg(long, value_delimiter = ',')]
+        records: Vec<usize>,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -210,9 +214,16 @@ fn main() -> Result<()> {
             limit,
             skip,
             mesh,
+            records,
         } => {
             translator_env();
-            translate::precompile_graphics(archive, jobs, limit, skip, mesh)
+            let choice = victory_hle::modules::d3d12x::PrecompileChoice {
+                limit,
+                skip,
+                mesh_only: mesh,
+                records: (!records.is_empty()).then_some(records),
+            };
+            translate::precompile_graphics(archive, jobs, choice)
         }
         Command::Run {
             exe,
