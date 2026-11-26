@@ -1,0 +1,75 @@
+From 5ba34cb3c9c9dfbbc6cdf4382bcdd27f4abd2f21 Mon Sep 17 00:00:00 2001
+From: SplendiferousDev <361138182+SplendiferousDev@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 16:10:23 -0800
+Subject: [PATCH 2/5] ntdll: Use server_call_unlocked() for requests made with
+ virtual_mutex held.
+
+The virtual_mutex sections already block the server signals, so masking
+them again in wine_server_call() only adds two sigprocmask calls per
+request. This matters for processes that map and unmap many section
+views.
+---
+ dlls/ntdll/unix/virtual.c | 12 ++++++------
+ 1 file changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index fa2b37d..0175639 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -3675,7 +3675,7 @@ static NTSTATUS virtual_map_image( HANDLE mapping, void **addr_ptr, SIZE_T *size
+             req->entry   = image_info->entry_point;
+             req->machine = image_info->machine;
+             req->offset  = offset;
+-            status = wine_server_call( req );
++            status = server_call_unlocked( req );
+         }
+         SERVER_END_REQ;
+     }
+@@ -3815,7 +3815,7 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
+             req->base    = wine_server_client_ptr( view->base );
+             req->size    = size;
+             req->start   = offset.QuadPart;
+-            res = wine_server_call( req );
++            res = server_call_unlocked( req );
+         }
+         SERVER_END_REQ;
+     }
+@@ -4135,7 +4135,7 @@ NTSTATUS virtual_create_builtin_view( void *module, const UNICODE_STRING *nt_nam
+         {
+             wine_server_add_data( req, info, sizeof(*info) );
+             wine_server_add_data( req, nt_name->Buffer, nt_name->Length );
+-            status = wine_server_call( req );
++            status = server_call_unlocked( req );
+         }
+         SERVER_END_REQ;
+ 
+@@ -5518,7 +5518,7 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
+                 req->base   = wine_server_client_ptr( view->base );
+                 req->offset = (char *)base - (char *)view->base;
+                 req->size   = size;
+-                wine_server_call( req );
++                server_call_unlocked( req );
+             }
+             SERVER_END_REQ;
+         }
+@@ -6925,7 +6925,7 @@ static NTSTATUS unmap_view_of_section( HANDLE process, PVOID addr, ULONG flags )
+     SERVER_START_REQ( unmap_view )
+     {
+         req->base = wine_server_client_ptr( view->base );
+-        status = wine_server_call( req );
++        status = server_call_unlocked( req );
+     }
+     SERVER_END_REQ;
+     if (!status)
+@@ -7301,7 +7301,7 @@ NTSTATUS WINAPI NtAreMappedFilesTheSame(PVOID addr1, PVOID addr2)
+         {
+             req->base1 = wine_server_client_ptr( view1->base );
+             req->base2 = wine_server_client_ptr( view2->base );
+-            status = wine_server_call( req );
++            status = server_call_unlocked( req );
+         }
+         SERVER_END_REQ;
+     }
+-- 
+2.56.1
+

@@ -18,10 +18,14 @@ Usage: run.sh --game <folder> --exe <file name> [options]
   --prefix <dir>       Wine prefix (default: saved by setup.sh)
   --config <file>      victory.toml (default: $vl_config_home/victory.toml)
   --name <log name>    log file name (default: a timestamp)
-  --wineserver <path>  wineserver to run for the prefix (default: the patched one
-                       built by build-wineserver.sh, if installed, in
+  --stock-wine         use Proton's own files. Default: the private patched
+                       tree built by build-wine.sh (in $vl_patched_tree), if
+                       it exists; it is refused when Proton was updated since
+  --wineserver <path>  wineserver to run for the prefix (default: the one in the
+                       patched tree; or, without a tree, the server built by
+                       build-wine.sh --server-only in
                        $vl_data_home/wineserver-patched)
-  --stock-wineserver   use Proton's own wineserver (slow once the title holds
+  --stock-wineserver   use Proton's own wineserver, also with the patched tree (slow once the title holds
                        tens of thousands of memory views)
   --measure <file>     sample once a second into <file> while it runs: memory,
                        CPU and I/O pressure, MemAvailable, swap, and the
@@ -40,7 +44,7 @@ USAGE
 }
 
 game= exe= console=series-x diag=0 proton=${VICTORY_PROTON:-} prefix=
-wserver= stock=0 measure= config= name=$(date +%Y%m%d-%H%M%S) scope=0 mhigh= mmax= swapmax=
+wserver= stock=0 stockwine=0 measure= config= name=$(date +%Y%m%d-%H%M%S) scope=0 mhigh= mmax= swapmax=
 
 while (($#)); do
   case $1 in
@@ -54,6 +58,7 @@ while (($#)); do
     --name) name=${2:?}; shift 2 ;;
     --wineserver) wserver=${2:?--wineserver needs a path}; shift 2 ;;
     --stock-wineserver) stock=1; shift ;;
+    --stock-wine) stockwine=1; stock=1; shift ;;
     --measure) measure=${2:?--measure needs a file}; shift 2 ;;
     --scope) scope=1; shift ;;
     --memory-high) mhigh=${2:?}; shift 2 ;;
@@ -75,16 +80,6 @@ else
   ((scope)) || die "memory limits only apply with --scope"
 fi
 
-if ((stock)); then
-  [[ -z $wserver ]] || die "--wineserver and --stock-wineserver exclude each other"
-elif [[ -z $wserver && -x $vl_data_home/wineserver-patched ]]; then
-  wserver=$vl_data_home/wineserver-patched
-fi
-if [[ -n $wserver ]]; then
-  [[ -f $wserver && -x $wserver ]] || die "wineserver not found or not executable: $wserver"
-  wserver=$(realpath -- "$wserver")
-fi
-
 # A config file given by hand has its launcher.env beside it.
 if [[ -n $config && -z ${VICTORY_LINUX_CONFIG_DIR:-} ]]; then
   VICTORY_LINUX_CONFIG_DIR=$(dirname -- "$(realpath -- "$config")")
@@ -97,6 +92,38 @@ need_proton "$proton"
 proton=$(realpath -- "$proton")
 prefix=$(realpath -- "$prefix")
 wine=$(wine_of "$proton")
+
+# The patched Proton tree (ntdll.so and wineserver), if there is one.
+patched_tree=
+tree_note=
+if ((stockwine)); then
+  [[ -z $wserver ]] || die "--wineserver and --stock-wine exclude each other"
+elif [[ -f $vl_patched_tree/stamp && -x $vl_patched_tree/files/bin/wine ]]; then
+  stamp_proton=$(sed -n 's/^proton=//p' "$vl_patched_tree/stamp")
+  stamp_fp=$(sed -n 's/^fingerprint=//p' "$vl_patched_tree/stamp")
+  stamp_patches=$(sed -n 's/^patches=//p' "$vl_patched_tree/stamp")
+  if [[ $stamp_proton != "$proton" || $stamp_fp != "$(proton_fingerprint "$proton")" ]]; then
+    die "the patched Proton tree in $vl_patched_tree was built from another Proton build (or one that has been updated since). Rebuild it with scripts/linux/build-wine.sh, or run with --stock-wine"
+  fi
+  cur_patches=$(cat "$VL_ROOT"/patches/wine/*.patch 2>/dev/null | sha256sum | cut -d' ' -f1)
+  if [[ $stamp_patches != "$cur_patches" ]]; then
+    warn "patches/wine has changed since the patched tree was built; run build-wine.sh to apply the new ones"
+  fi
+  patched_tree=$vl_patched_tree/files
+  wine=$patched_tree/bin/wine
+  [[ -z $wserver ]] || tree_note=" (the tree's own server is replaced by --wineserver)"
+fi
+if ((stock)); then
+  [[ -z $wserver ]] || die "--wineserver and --stock-wineserver exclude each other"
+  # With the patched tree, wine would start the tree's server: run Proton's own.
+  if [[ -n $patched_tree && $stockwine == 0 ]]; then wserver=$proton/files/bin/wineserver; fi
+elif [[ -z $wserver && -z $patched_tree && -x $vl_data_home/wineserver-patched ]]; then
+  wserver=$vl_data_home/wineserver-patched
+fi
+if [[ -n $wserver ]]; then
+  [[ -f $wserver && -x $wserver ]] || die "wineserver not found or not executable: $wserver"
+  wserver=$(realpath -- "$wserver")
+fi
 config=${config:-${VICTORY_CONFIG_FILE:-${VICTORY_LINUX_CONFIG_DIR:-$vl_config_home}/victory.toml}}
 if [[ -z ${VICTORY_CONFIG:-} ]]; then
   [[ -f $config ]] || die "no config at $config; run setup.sh with --game"
@@ -188,8 +215,13 @@ echo "prefix:   $prefix"
 echo "vkd3d:    ${b:-unknown version} (the log's 'vkd3d-proton - build:' line confirms the build)"
 echo "profile:  $console ($exe_dir build)"
 echo "log:      $log"
+if [[ -n $patched_tree ]]; then
+  echo "wine:     patched Proton tree $patched_tree (patched ntdll.so and wineserver)$tree_note"
+fi
 if [[ -n $wserver ]]; then
-  echo "server:   $wserver (patched)"
+  echo "server:   $wserver$( ((stock)) || echo " (patched)")"
+elif [[ -n $patched_tree ]]; then
+  echo "server:   $patched_tree/bin/wineserver (patched; started by wine)"
 else
   echo "server:   Proton's stock wineserver (slow in the world; see docs/linux.md)"
 fi

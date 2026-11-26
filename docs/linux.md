@@ -274,7 +274,7 @@ beyond avoiding the limit, transparent huge pages, `zswap` instead of zram,
 `MemoryHigh` values other than the ones above, an AMD card (different memory
 behaviour).
 
-## Faster memory mapping: the wineserver patch
+## Faster memory mapping: the Wine patches
 
 The runtime keeps one mapped 64 KiB view per page of the title's memory, about
 140,000 in the world. Stock wineserver searches a process's views linearly on
@@ -283,28 +283,48 @@ map 764 us to 11.8 us, unmap and remap 2854 us to 22 us, address query 900 us
 to 6 us. In the title, the first world frame arrives after 77 s instead of
 204-253 s, and world frames take about 0.8 s instead of 8.7-13.5 s.
 
-`patches/wine/0001-server-index-memory-views.patch` indexes the views by base
-address in the server. It is optional, but strongly recommended. It touches only
-the server, so Proton's other files stay as they are. It is LGPL-2.1-or-later
-like Wine and is not upstream yet (`patches/wine/README.md`).
+`patches/wine/` holds two series, optional but recommended; both are
+LGPL-2.1-or-later like Wine and not upstream yet (`patches/wine/README.md`):
 
-Build it from the Wine source your Proton build was made from (the protocol
-must match exactly; the script checks this by running `wine cmd /c echo ok`
-against the new server on a temporary prefix):
+- 0001 indexes the views by base address in the server (the big win above).
+- 0002 to 0005 make section maps cheaper in ntdll: fewer signal-mask system
+  calls and no redundant `mprotect`, and a cache of section info. In a
+  150,000-view micro-benchmark, map 11.9 to 6.7 us, unmap and remap 21.9 to
+  15.4 us, single-thread throughput 41,000 to 58,300 cycles/s.
+
+Build them from the Wine source your Proton build was made from (the protocol
+must match exactly):
 
 ```sh
-scripts/linux/build-wineserver.sh --proton <proton dir> \
+scripts/linux/build-wine.sh --proton <proton dir> \
     --wine-src <git url or local clone> --wine-ref <commit>
 ```
 
 The commit is the one the Proton build was made from; `--help` explains how to
-find it. Only `wineserver` is built (about a minute). It is installed to
+find it. The script applies every `patches/wine/*.patch` in order, builds
+`wineserver` and `ntdll.so` (about a minute, at most 4 jobs), and copies
+Proton's `files/` tree (about 1.6 GB; reflinked on btrfs and xfs) to
+`~/.cache/victory-linux/proton-patched`, replacing `lib/wine/x86_64-unix/ntdll.so`
+and `bin/wineserver`. A copy is needed because Wine loads `ntdll.so` only from
+next to the `wine` binary it runs. It then checks that `wine --version` and a
+trivial program run from the new tree on a throwaway prefix, and writes a
+stamp. The server alone is also installed to
 `~/.local/share/victory-linux/wineserver-patched`.
+`build-wine.sh --server-only` (also what the old `build-wineserver.sh` does)
+builds only the server, as before.
 
-`run.sh` uses that file if it exists, starts it for the prefix before wine
-(inside the same `--scope`, if any; wine would otherwise use the server next to
-it) and prints which server it runs. `--wineserver <path>` picks another,
-`--stock-wineserver` turns it off.
+`run.sh` uses the patched tree automatically when it exists and prints which
+wine and server it runs. The tree is valid only for the Proton build it was
+copied from; the stamp records that build's version and file sizes and times,
+and `run.sh` stops with a message when Proton has been updated. Run
+`build-wine.sh` again then (or `--stock-wine`). `run.sh` warns when
+`patches/wine` has changed since the tree was built. Options:
+
+- `--stock-wine`: Proton's own files, no patches.
+- `--stock-wineserver`: Proton's own server, even with the patched tree (the
+  patched ntdll still runs).
+- `--wineserver <path>`: another server, started before wine. Without a tree,
+  `run.sh` falls back to the server-only install above.
 
 ## Troubleshooting
 

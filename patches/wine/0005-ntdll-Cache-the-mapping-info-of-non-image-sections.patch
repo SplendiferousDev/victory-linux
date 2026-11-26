@@ -1,0 +1,142 @@
+From 217a186bd4c5746c0e5edd565789df9f94ac3029 Mon Sep 17 00:00:00 2001
+From: SplendiferousDev <361138182+SplendiferousDev@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 16:12:50 -0800
+Subject: [PATCH 5/5] ntdll: Cache the mapping info of non-image sections.
+
+The flags and size of a section never change, but virtual_map_section()
+asks the server for them on every map. Remember them per handle, with the
+access rights the server already granted, and drop the entry where the
+cached fd of the handle is dropped, so that a reused handle value can't
+return stale data. Image sections are not cached.
+---
+ dlls/ntdll/unix/server.c       |  2 ++
+ dlls/ntdll/unix/unix_private.h |  1 +
+ dlls/ntdll/unix/virtual.c      | 53 +++++++++++++++++++++++++++++++++-
+ 3 files changed, 55 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
+index 597e95b..28fa149 100644
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -1944,6 +1944,7 @@ NTSTATUS WINAPI NtDuplicateObject( HANDLE source_process, HANDLE source, HANDLE
+     {
+         fd = remove_fd_from_cache( source );
+         close_inproc_sync( source );
++        virtual_remove_cached_mapping_info( source );
+     }
+ 
+     SERVER_START_REQ( dup_handle )
+@@ -2018,6 +2019,7 @@ NTSTATUS WINAPI NtClose( HANDLE handle )
+      * retrieve it again */
+     fd = remove_fd_from_cache( handle );
+     close_inproc_sync( handle );
++    virtual_remove_cached_mapping_info( handle );
+ 
+     SERVER_START_REQ( close_handle )
+     {
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+index c270d50..69f41b1 100644
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -324,6 +324,7 @@ extern void virtual_map_user_shared_data(void);
+ extern void virtual_init_user_shared_data(void);
+ extern NTSTATUS virtual_handle_fault( EXCEPTION_RECORD *rec, void *stack );
+ extern unsigned int virtual_locked_server_call( void *req_ptr );
++extern void virtual_remove_cached_mapping_info( HANDLE handle );
+ extern ssize_t virtual_locked_read( int fd, void *addr, size_t size );
+ extern ssize_t virtual_locked_pread( int fd, void *addr, size_t size, off_t offset );
+ extern ssize_t virtual_locked_recvmsg( int fd, struct msghdr *hdr, int flags );
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index 1dae9fb..3674bce 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -3511,6 +3511,34 @@ done:
+ }
+ 
+ 
++/* get_mapping_info() replies for non-image sections, whose flags and size never change.
++ * Protected by fd_cache_mutex; entries are removed when their handle is closed. */
++static struct mapping_info_cache_entry
++{
++    HANDLE       handle;
++    ACCESS_MASK  access;  /* access rights already granted by the server */
++    unsigned int flags;
++    mem_size_t   size;
++} mapping_info_cache[64];
++
++static struct mapping_info_cache_entry *get_mapping_info_cache_entry( HANDLE handle )
++{
++    return &mapping_info_cache[((ULONG_PTR)handle >> 2) % ARRAY_SIZE(mapping_info_cache)];
++}
++
++/***********************************************************************
++ *             virtual_remove_cached_mapping_info
++ *
++ * Caller must hold fd_cache_mutex.
++ */
++void virtual_remove_cached_mapping_info( HANDLE handle )
++{
++    struct mapping_info_cache_entry *entry = get_mapping_info_cache_entry( handle );
++
++    if (entry->handle == handle) entry->handle = 0;
++}
++
++
+ /***********************************************************************
+  *             get_mapping_info
+  */
+@@ -3519,20 +3547,35 @@ static unsigned int get_mapping_info( HANDLE handle, ACCESS_MASK access, unsigne
+                                       struct pe_image_info **info, UNICODE_STRING *nt_name,
+                                       ANSI_STRING *exp_name )
+ {
++    struct mapping_info_cache_entry *entry = get_mapping_info_cache_entry( handle );
+     struct pe_image_info *image_info;
+     SIZE_T namelen, total, size = 1024;
+     unsigned int status;
++    sigset_t sigset;
++
++    server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );
++    if (handle && entry->handle == handle && !(access & ~entry->access))
++    {
++        *sec_flags   = entry->flags;
++        *full_size   = entry->size;
++        *shared_file = 0;
++        server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
++        return STATUS_SUCCESS;
++    }
++    server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
+ 
+     for (;;)
+     {
+         if (!(image_info = malloc( size ))) return STATUS_NO_MEMORY;
+ 
++        /* hold fd_cache_mutex so that the handle can't be closed before the reply is cached */
++        server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );
+         SERVER_START_REQ( get_mapping_info )
+         {
+             req->handle = wine_server_obj_handle( handle );
+             req->access = access;
+             wine_server_set_reply( req, image_info, size );
+-            status = wine_server_call( req );
++            status = server_call_unlocked( req );
+             *sec_flags   = reply->flags;
+             *full_size   = reply->size;
+             namelen      = reply->name_len;
+@@ -3540,6 +3583,14 @@ static unsigned int get_mapping_info( HANDLE handle, ACCESS_MASK access, unsigne
+             *shared_file = wine_server_ptr_handle( reply->shared_file );
+         }
+         SERVER_END_REQ;
++        if (!status && !(*sec_flags & SEC_IMAGE) && !total && !*shared_file)
++        {
++            entry->access = (entry->handle == handle ? entry->access : 0) | access;
++            entry->handle = handle;
++            entry->flags  = *sec_flags;
++            entry->size   = *full_size;
++        }
++        server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
+         if (!status && total <= size) break;
+         free( image_info );
+         if (status) return status;
+-- 
+2.56.1
+
