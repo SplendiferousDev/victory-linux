@@ -47,6 +47,14 @@ const fn vop3(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
     vop3_mod(op, vdst, src0, src1, src2, 0, 0, 0, false)
 }
 
+/// VOP3P `op vdst, src0, src1, src2` (default opsel_hi: high halves for second element).
+const fn vop3p(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
+    [
+        0x33 << 26 | (op as u32 & 0x7F) << 16 | vdst as u32,
+        (src0 as u32 & 0x1FF) | (src1 as u32 & 0x1FF) << 9 | (src2 as u32 & 0x1FF) << 18 | (3 << 27),
+    ]
+}
+
 /// VOP3 `op vdst, src0, src1, src2` with explicit `abs`, `neg`, `omod`, `clamp`.
 #[allow(clippy::too_many_arguments)]
 const fn vop3_mod(
@@ -262,6 +270,26 @@ fn run_cases_on(
 
 fn is_f16_nan(bits: u16) -> bool {
     (bits & 0x7FFF) > 0x7C00
+}
+
+#[test]
+fn a_branch_to_fallthrough_keeps_both_values_at_a_join() {
+    let shader = build_valu_cs(&[
+        0xBF06_0100,            // s_cmp_eq_u32 s0, s1
+        0xBF85_0002,            // s_cbranch_scc1 -> the s2 = 1 path
+        s_mov_b32(2, 128),      // s2 = 0
+        0xBF82_0002,            // s_branch -> the join
+        s_mov_b32(2, 129),      // s2 = 1
+        0xBF85_0000,            // s_cbranch_scc1 -> the following instruction
+        vop1(0x001, 0, sgpr(2)), // join: v0 = s2
+    ]);
+    run_cases(
+        &shader,
+        &[[7, 7, 0, 0], [7, 5, 0, 0]],
+        |backend, _, inputs, actual| {
+            assert_eq!(actual, u32::from(inputs[0] == inputs[1]), "{backend}");
+        },
+    );
 }
 
 fn f16_to_f32(bits: u16) -> f32 {
@@ -987,6 +1015,19 @@ fn bfe_signed_and_unsigned_match_rdna2() {
     let v_unsigned = build_valu_cs(&vop3(0x148, 0, vgpr(1), vgpr(2), vgpr(3)));
     // s_bfe_i32 s6, s0, s1 (SOP2 opcode 0x28: s1 = off[4:0] | width[22:16]); v_mov_b32 v0, s6
     let s_signed = build_valu_cs(&[sop2(0x28, 6, 0, 1), vop1(0x001, 0, sgpr(6))]);
+    // s_bfe_u32 s6, s0, s1 (SOP2 opcode 0x27: s1 = off[4:0] | width[22:16]); v_mov_b32 v0, s6
+    let s_unsigned = build_valu_cs(&[sop2(0x27, 6, 0, 1), vop1(0x001, 0, sgpr(6))]);
+    // SCC = (result != 0), consumed by s_cselect_b32 s7, s2, s3.
+    let s_signed_scc = build_valu_cs(&[
+        sop2(0x28, 6, 0, 1),
+        sop2(0x0A, 7, 2, 3),
+        vop1(0x001, 0, sgpr(7)),
+    ]);
+    let s_unsigned_scc = build_valu_cs(&[
+        sop2(0x27, 6, 0, 1),
+        sop2(0x0A, 7, 2, 3),
+        vop1(0x001, 0, sgpr(7)),
+    ]);
 
     let signed_cases: &[([u32; 4], u32)] = &[
         // Field crosses bit 31: extends from bit 31.
@@ -1010,22 +1051,36 @@ fn bfe_signed_and_unsigned_match_rdna2() {
             inp[0], inp[1], inp[2],
         );
     });
-    // v_bfe_i32 width is 5-bit (src2[4:0]), so width=32 wraps to 0.
-    run_cases(
-        &v_signed,
-        &[[0x8000_0000, 4, 32, 0]],
-        |backend, _, _, got| {
-            assert_eq!(got, 0, "{backend}: v_bfe_i32 width 32 should mask to 0");
-        },
-    );
+    // v_bfe_{i32,u32} width is 5-bit (src2[4:0]), so width=32 wraps to 0.
+    for (name, shader) in [("v_bfe_i32", &v_signed), ("v_bfe_u32", &v_unsigned)] {
+        run_cases(shader, &[[0x8000_0000, 4, 32, 0]], |backend, _, _, got| {
+            assert_eq!(got, 0, "{backend}: {name} width 32 should mask to 0");
+        });
+    }
 
-    // s_bfe_i32 width is 7-bit (src1[22:16]), so width=32 keeps all 32 bits.
+    const WHEN_NZ: u32 = 0xAAAA_5555;
+    const WHEN_ZERO: u32 = 0x1111_2222;
+    let pack = |off: u32, width: u32| (off & 31) | ((width & 0x7F) << 16);
+
+    // s_bfe_i32 width is 7-bit (src1[22:16]), so widths >= 32 keep all remaining bits
+    // with sign extension from bit 31 (including width=64 where width & 31 == 0).
     let mut s_cases = signed_cases.to_vec();
-    s_cases.push(([0x8000_0000, 4, 32, 0], 0xf800_0000));
-    let s_in: Vec<[u32; 4]> = s_cases
+    s_cases.extend([
+        ([0x8000_0000, 4, 32, 0], 0xf800_0000),
+        ([0x8000_0000, 0, 32, 0], 0x8000_0000),
+        ([0x8000_0000, 4, 64, 0], 0xf800_0000),
+        ([0xd2f9_0159, 28, 127, 0], 0xffff_fffd),
+        ([0x0000_000f, 4, 32, 0], 0),
+    ]);
+    let mut s_in: Vec<[u32; 4]> = s_cases
         .iter()
-        .map(|&(inp, _)| [inp[0], (inp[1] & 31) | ((inp[2] & 0x7F) << 16), 0, 0])
+        .map(|&(inp, _)| [inp[0], pack(inp[1], inp[2]), WHEN_NZ, WHEN_ZERO])
         .collect();
+    // Unused bits src1[15:5] and src1[31:23] are ignored by hardware.
+    s_cases.push(([0x8000_0000, 4, 32, 0], 0xf800_0000));
+    s_in.push([0x8000_0000, 0xFF80_FFE0 | pack(4, 32), WHEN_NZ, WHEN_ZERO]);
+    s_cases.push(([0xffff_ffff, 4, 0, 0], 0));
+    s_in.push([0xffff_ffff, 0xFF80_FFE4, WHEN_NZ, WHEN_ZERO]);
     run_cases(&s_signed, &s_in, |backend, i, inp, got| {
         let want = s_cases[i].1;
         assert_eq!(
@@ -1034,10 +1089,23 @@ fn bfe_signed_and_unsigned_match_rdna2() {
             inp[0], inp[1],
         );
     });
+    run_cases(&s_signed_scc, &s_in, |backend, i, inp, got| {
+        let want = if s_cases[i].1 != 0 {
+            WHEN_NZ
+        } else {
+            WHEN_ZERO
+        };
+        assert_eq!(
+            got, want,
+            "{backend}: s_bfe_i32 SCC({:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1],
+        );
+    });
 
     let unsigned_cases: &[([u32; 4], u32)] = &[
         ([0xd2f9_0159, 28, 16, 0], 0x0000_000d),
         ([0x8000_0000, 31, 4, 0], 0x0000_0001),
+        ([0x0000_0080, 4, 4, 0], 0x0000_0008),
         ([0xffff_ffff, 4, 0, 0], 0),
         ([0x8000_0000, 4, 31, 0], 0x0800_0000),
     ];
@@ -1050,6 +1118,80 @@ fn bfe_signed_and_unsigned_match_rdna2() {
             inp[0], inp[1], inp[2],
         );
     });
+
+    // s_bfe_u32 width is 7-bit (src1[22:16]): widths >= 32 shift without sign extension.
+    let mut su_cases = unsigned_cases.to_vec();
+    su_cases.extend([
+        ([0x8000_0000, 4, 32, 0], 0x0800_0000),
+        ([0x8000_0000, 0, 32, 0], 0x8000_0000),
+        ([0x8000_0000, 4, 64, 0], 0x0800_0000),
+        ([0xd2f9_0159, 28, 127, 0], 0x0000_000d),
+        ([0x0000_000f, 4, 32, 0], 0),
+    ]);
+    let mut su_in: Vec<[u32; 4]> = su_cases
+        .iter()
+        .map(|&(inp, _)| [inp[0], pack(inp[1], inp[2]), WHEN_NZ, WHEN_ZERO])
+        .collect();
+    su_cases.push(([0x8000_0000, 4, 32, 0], 0x0800_0000));
+    su_in.push([0x8000_0000, 0xFF80_FFE0 | pack(4, 32), WHEN_NZ, WHEN_ZERO]);
+    su_cases.push(([0xffff_ffff, 4, 0, 0], 0));
+    su_in.push([0xffff_ffff, 0xFF80_FFE4, WHEN_NZ, WHEN_ZERO]);
+    run_cases(&s_unsigned, &su_in, |backend, i, inp, got| {
+        let want = su_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: s_bfe_u32({:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1],
+        );
+    });
+    run_cases(&s_unsigned_scc, &su_in, |backend, i, inp, got| {
+        let want = if su_cases[i].1 != 0 {
+            WHEN_NZ
+        } else {
+            WHEN_ZERO
+        };
+        assert_eq!(
+            got, want,
+            "{backend}: s_bfe_u32 SCC({:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1],
+        );
+    });
+
+    // Literal src1 (`0xFF` followed by 32-bit immediate) for both s_bfe_u32 and s_bfe_i32:
+    // offset=4 (with ignored bits [15:5]), width=32/64/0 (with ignored bits [31:23]).
+    let literals: [(u8, u32, u32, u32, u32); 6] = [
+        (0x27, 0x8020_FFE4, 0x8000_0000, 0x0800_0000, WHEN_NZ),
+        (0x28, 0x8020_FFE4, 0x8000_0000, 0xf800_0000, WHEN_NZ),
+        (0x27, 0x0040_001C, 0xd2f9_0159, 0x0000_000d, WHEN_NZ),
+        (0x28, 0x0040_001C, 0xd2f9_0159, 0xffff_fffd, WHEN_NZ),
+        (0x27, 0xFF80_FFE4, 0xffff_ffff, 0, WHEN_ZERO),
+        (0x28, 0xFF80_FFE4, 0xffff_ffff, 0, WHEN_ZERO),
+    ];
+    for (op, lit, src0, want, want_scc) in literals {
+        let val_cs = build_valu_cs(&[sop2(op, 6, 0, 255), lit, vop1(0x001, 0, sgpr(6))]);
+        run_cases(&val_cs, &[[src0, 0, 0, 0]], |backend, _, _, got| {
+            assert_eq!(
+                got, want,
+                "{backend}: literal sop2({op:#x}, {src0:#010x}, {lit:#010x}) = {got:#010x}, want {want:#010x}",
+            );
+        });
+        let scc_cs = build_valu_cs(&[
+            sop2(op, 6, 0, 255),
+            lit,
+            sop2(0x0A, 7, 2, 3),
+            vop1(0x001, 0, sgpr(7)),
+        ]);
+        run_cases(
+            &scc_cs,
+            &[[src0, 0, WHEN_NZ, WHEN_ZERO]],
+            |backend, _, _, got| {
+                assert_eq!(
+                    got, want_scc,
+                    "{backend}: literal sop2({op:#x}) SCC({src0:#010x}, {lit:#010x}) = {got:#010x}",
+                );
+            },
+        );
+    }
 }
 
 #[test]
@@ -1655,6 +1797,126 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
             );
         }
     }
+}
+
+#[test]
+fn packed_dot_products_and_clamps_execute_cleanly() {
+    let [iw0, iw1] = vop3p(0x016, 0, vgpr(1), vgpr(2), vgpr(3));
+    let dot4_i8_shader = build_valu_cs(&[iw0, iw1]);
+    let inputs = [[0x0403_0201u32, 0x0504_0302u32, 10u32, 0]];
+    run_cases(&dot4_i8_shader, &inputs, |backend, _i, _inp, got| {
+        assert_eq!(got, 50, "{backend}: v_dot4_i32_i8 got {got}, want 50");
+    });
+
+    // v_mov_b32 v0, v3; v_dot4c_i32_i8 v0, v1, v2
+    let d4c_copy = vop1(0x001, 0, vgpr(3));
+    let d4c = (0x0Du32 << 25) | (2u32 << 9) | (vgpr(1) as u32);
+    let dot4c_i8_shader = build_valu_cs(&[d4c_copy, d4c]);
+    run_cases(&dot4c_i8_shader, &inputs, |backend, _i, _inp, got| {
+        assert_eq!(got, 50, "{backend}: v_dot4c_i32_i8 got {got}, want 50");
+    });
+
+    let [uw0, uw1] = vop3p(0x017, 0, vgpr(1), vgpr(2), vgpr(3));
+    let dot4_u8_shader = build_valu_cs(&[uw0, uw1]);
+    run_cases(&dot4_u8_shader, &inputs, |backend, _i, _inp, got| {
+        assert_eq!(got, 50, "{backend}: v_dot4_u32_u8 got {got}, want 50");
+    });
+
+    // opsel_hi / opsel swapping the halves of s0 on v_dot4_u32_u8 (opsel=0b001, opsel_hi=0b110)
+    let mut u8_op = vop3p(0x017, 0, vgpr(1), vgpr(2), vgpr(3));
+    u8_op[0] |= 1 << 11;
+    u8_op[1] = (u8_op[1] & !(3 << 27)) | (2 << 27);
+    let dot4_u8_opsel_shader = build_valu_cs(&u8_op);
+    run_cases(&dot4_u8_opsel_shader, &inputs, |backend, _i, _inp, got| {
+        assert_eq!(got, 42, "{backend}: v_dot4_u32_u8 opsel got {got}, want 42");
+    });
+
+    let [d2i_w0, d2i_w1] = vop3p(0x014, 0, vgpr(1), vgpr(2), vgpr(3));
+    let dot2_i16_shader = build_valu_cs(&[d2i_w0, d2i_w1]);
+    run_cases(
+        &dot2_i16_shader,
+        &[[0x0003_FFFEu32, 0xFFFB_0004u32, 10u32, 0]],
+        |backend, _i, _inp, got| {
+            assert_eq!(got, 0xFFFF_FFF3, "{backend}: v_dot2_i32_i16 got {got:#x}");
+        },
+    );
+
+    let [d2u_w0, d2u_w1] = vop3p(0x015, 0, vgpr(1), vgpr(2), vgpr(3));
+    let dot2_u16_shader = build_valu_cs(&[d2u_w0, d2u_w1]);
+    run_cases(
+        &dot2_u16_shader,
+        &[[0x0003_0002u32, 0x0005_0004u32, 10u32, 0]],
+        |backend, _i, _inp, got| {
+            assert_eq!(got, 33, "{backend}: v_dot2_u32_u16 got {got}, want 33");
+        },
+    );
+
+    let [d8u_w0, d8u_w1] = vop3p(0x019, 0, vgpr(1), vgpr(2), vgpr(3));
+    let dot8_u4_shader = build_valu_cs(&[d8u_w0, d8u_w1]);
+    run_cases(
+        &dot8_u4_shader,
+        &[[0x1111_1111u32, 0x2222_2222u32, 10u32, 0]],
+        |backend, _i, _inp, got| {
+            assert_eq!(got, 26, "{backend}: v_dot8_u32_u4 got {got}, want 26");
+        },
+    );
+
+    let [mut d2f_w0, d2f_w1] = vop3p(0x013, 0, vgpr(1), vgpr(2), vgpr(3));
+    let d2f_in = [[0x4000_3C00u32, 0x4400_4200u32, 5.0f32.to_bits(), 0]];
+    let dot2_f16_shader = build_valu_cs(&[d2f_w0, d2f_w1]);
+    run_cases(&dot2_f16_shader, &d2f_in, |backend, _i, _inp, got| {
+        assert_eq!(got, 16.0f32.to_bits(), "{backend}: v_dot2_f32_f16 got {got:#x}");
+    });
+    d2f_w0 |= 1 << 15;
+    let dot2_f16_clamp_shader = build_valu_cs(&[d2f_w0, d2f_w1]);
+    run_cases(&dot2_f16_clamp_shader, &d2f_in, |backend, _i, _inp, got| {
+        assert_eq!(got, 1.0f32.to_bits(), "{backend}: v_dot2_f32_f16 clamp got {got:#x}");
+    });
+
+    // VOP2 v_dot2c_f32_f16 v3, v1, v2 (opcode 0x02): 1.0*3.0 + 2.0*4.0 + 5.0 = 16.0
+    let d2c = (0x02u32 << 25) | (3u32 << 17) | ((2u32) << 9) | (vgpr(1) as u32);
+    let copy_v3_v0 = vop1(0x001, 0, vgpr(3));
+    let dot2c_f16_shader = build_valu_cs(&[d2c, copy_v3_v0]);
+    run_cases(&dot2c_f16_shader, &d2f_in, |backend, _i, _inp, got| {
+        assert_eq!(got, 16.0f32.to_bits(), "{backend}: v_dot2c_f32_f16 got {got:#x}");
+    });
+
+    // Clamped integer dot products saturate instead of wrapping.
+    let [mut cu_w0, cu_w1] = vop3p(0x017, 0, vgpr(1), vgpr(2), vgpr(3));
+    cu_w0 |= 1 << 15;
+    let clamp_u8_shader = build_valu_cs(&[cu_w0, cu_w1]);
+    run_cases(
+        &clamp_u8_shader,
+        &[[0xFFFF_FFFFu32, 0xFFFF_FFFFu32, 0xFFFF_FFF0u32, 0]],
+        |backend, _i, _inp, got| {
+            assert_eq!(got, 0xFFFF_FFFFu32, "{backend}: v_dot4_u32_u8 clamp got {got:#x}");
+        },
+    );
+
+    let [mut ci_w0, ci_w1] = vop3p(0x016, 0, vgpr(1), vgpr(2), vgpr(3));
+    ci_w0 |= 1 << 15;
+    let clamp_i8_shader = build_valu_cs(&[ci_w0, ci_w1]);
+    let ci_in = [
+        [0x7F7F_7F7Fu32, 0x7F7F_7F7Fu32, 0x7FFF_FFF0u32, 0],
+        [0x7F7F_7F7Fu32, 0xFFFF_FFFFu32, 0x8000_0010u32, 0],
+    ];
+    run_cases(&clamp_i8_shader, &ci_in, |backend, i, _inp, got| {
+        let want = if i == 0 { 0x7FFF_FFFFu32 } else { 0x8000_0000u32 };
+        assert_eq!(got, want, "{backend}: v_dot4_i32_i8 clamp case {i} got {got:#x}");
+    });
+
+    // v_dot2_u32_u16 with opsel picking high half of v1 for pair 0 (opsel[0] = 1, opsel_hi[0] = 0).
+    let mut u16_op = vop3p(0x015, 0, vgpr(1), vgpr(2), vgpr(3));
+    u16_op[0] |= 1 << 11;
+    u16_op[1] &= !(1 << 27);
+    let opsel_u16_shader = build_valu_cs(&u16_op);
+    run_cases(
+        &opsel_u16_shader,
+        &[[0x0003_0002u32, 0x0005_0004u32, 10u32, 0]],
+        |backend, _i, _inp, got| {
+            assert_eq!(got, 32, "{backend}: v_dot2_u32_u16 opsel got {got}, want 32");
+        },
+    );
 }
 
 /// `v_mad_legacy_f32` as RDNA 2 runs it: fused (`v_fma_legacy_f32`), with
