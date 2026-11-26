@@ -437,6 +437,10 @@ pub(crate) extern "system" fn create_precompiled<const SLOT: usize>(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    #[cfg(windows)]
+    if let Some(dir) = std::env::var_os("VICTORY_NATIVE_PSO_DUMP") {
+        crate::device::dump_native(SLOT, desc as usize, std::path::Path::new(&dir));
+    }
     create_as(
         if SLOT == 0x218 { Kind::Compute } else { Kind::Graphics },
         desc,
