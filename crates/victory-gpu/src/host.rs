@@ -214,12 +214,26 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
 /// Once a second, before a submission starts: lets go of what nothing
 /// names any more (copies of windows of title memory, staging buffers,
 /// host copies of textures the title fills).
-/// `VICTORY_SWEEP=0` keeps everything, as before.
+/// `VICTORY_SWEEP=0` keeps everything, as before, but only together with
+/// `VICTORY_SWEEP_OFF_CONFIRM=1` ([`sweep_on`]).
 fn sweep() {
     // The in-place probe and census, if asked for (`VICTORY_INPLACE_PROBE`).
     crate::inplace::tick();
     static ON: OnceLock<bool> = OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_SWEEP").is_none_or(|v| v != "0")) {
+    if !*ON.get_or_init(|| {
+        let var = |name| std::env::var(name).ok();
+        let (sweep, confirm) = (var("VICTORY_SWEEP"), var("VICTORY_SWEEP_OFF_CONFIRM"));
+        let on = sweep_on(sweep.as_deref(), confirm.as_deref());
+        if on && sweep.as_deref().is_some_and(|v| v.trim() == "0") {
+            tracing::warn!(
+                "VICTORY_SWEEP=0 ignored: the idle sweep stays on (a run without it hung the host's graphics driver); \
+                 VICTORY_SWEEP_OFF_CONFIRM=1 as well turns it off"
+            );
+        } else if !on {
+            tracing::warn!("the idle sweep is OFF (VICTORY_SWEEP=0 VICTORY_SWEEP_OFF_CONFIRM=1): nothing idle is let go");
+        }
+        on
+    }) {
         return;
     }
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -236,6 +250,14 @@ fn sweep() {
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
+}
+
+/// Whether the idle sweep runs, from `VICTORY_SWEEP` and
+/// `VICTORY_SWEEP_OFF_CONFIRM`: it is off only with both `0` and `1`.
+/// Switching it off was part of a run whose card fault hung the host's
+/// graphics driver and froze the desktop, so `0` alone is not enough.
+fn sweep_on(sweep: Option<&str>, confirm: Option<&str>) -> bool {
+    !(sweep.is_some_and(|v| v.trim() == "0") && confirm.is_some_and(|v| v.trim() == "1"))
 }
 
 /// Drops `object` once every submission running now has finished: at once
@@ -4667,7 +4689,7 @@ fn late_line(frames: f64) {
             let [submissions, dispatches, mask, copies, plain, past] =
                 [0, 1, 2, 3, 4, 5].map(|i| CARD_MERGES[i].swap(0, Ordering::Relaxed) as f64 / frames);
             tracing::info!(
-                "of them through the merge on the card per frame (VICTORY_MERGE_ON_CARD=0 turns it off): {submissions:.1} submissions with \
+                "of them through the merge on the card per frame (VICTORY_MERGE_ON_CARD=1 turned it on): {submissions:.1} submissions with \
                  {dispatches:.1} dispatches and {:.0} KiB of masks; {copies:.1} submissions sent theirs up as copies; plain CPU sides \
                  (VICTORY_CARD_TWIN_PLAIN): {:.0} KiB of title bytes beside the masks, {past:.1} copies sent as copies (past the most a submission)",
                 mask / 1024.0,

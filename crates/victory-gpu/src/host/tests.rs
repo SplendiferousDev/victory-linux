@@ -142,3 +142,15 @@ fn warp_adapter_accepts_only_software() {
         desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
     );
 }
+
+#[test]
+fn the_idle_sweep_goes_off_only_with_its_confirmation() {
+    use super::sweep_on;
+    assert!(sweep_on(None, None), "on by default");
+    assert!(sweep_on(Some("0"), None), "0 alone is ignored");
+    assert!(sweep_on(Some("0"), Some("0")));
+    assert!(sweep_on(None, Some("1")), "the confirmation alone changes nothing");
+    assert!(sweep_on(Some("1"), Some("1")));
+    assert!(!sweep_on(Some("0"), Some("1")), "both: off");
+    assert!(!sweep_on(Some(" 0 "), Some("1 ")));
+}

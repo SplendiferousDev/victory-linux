@@ -152,11 +152,14 @@ fn wait_step(rip: usize) -> u64 {
     0
 }
 
-/// How an emulated `mwaitx` waits: `VICTORY_MWAITX=wait` (the default) spins as the
+/// How an emulated `mwaitx` waits: `VICTORY_MWAITX=wait` spins as the
 /// processor's early return would for [`Pacing::spin_us`] of a wait on the same address and
 /// value, then blocks on the monitored address ([`block`]) for at most
 /// [`Pacing::timeout_us`] at a time (`VICTORY_MWAITX_SPIN_US`, `VICTORY_MWAITX_TIMEOUT_US`);
-/// `VICTORY_MWAITX=spin` takes an exception at every `mwaitx` all through the wait, as before.
+/// `VICTORY_MWAITX=spin` (the default, also when unset) takes an exception at every `mwaitx`
+/// all through the wait, as before. The blocking wait is off by default since a run with it on
+/// faulted on the card and the fault hung the host's graphics driver; it is not known to be
+/// the cause, but it stays a choice until the faults are understood.
 /// Under Wine an exception costs about 4 us of the waiting thread, and a long wait took
 /// 250,000 of them a second.
 ///
@@ -174,7 +177,7 @@ impl Pacing {
     fn parse(mode: Option<&str>, spin_us: Option<&str>, timeout_us: Option<&str>) -> Pacing {
         let number = |v: Option<&str>, default: u64, least: u64, most: u64| v.and_then(|v| v.trim().parse().ok()).unwrap_or(default).clamp(least, most);
         Pacing {
-            block: !mode.is_some_and(|m| m.trim().eq_ignore_ascii_case("spin")),
+            block: mode.is_some_and(|m| m.trim().eq_ignore_ascii_case("wait")),
             spin_us: number(spin_us, 200, 0, 1_000_000),
             timeout_us: number(timeout_us, 1_000, MIN_BLOCK_US, 100_000),
         }
@@ -212,7 +215,11 @@ fn pacing() -> &'static Pacing {
     static PACING: std::sync::OnceLock<Pacing> = std::sync::OnceLock::new();
     PACING.get_or_init(|| {
         let var = |name: &str| std::env::var(name).ok();
-        let p = Pacing::parse(var("VICTORY_MWAITX").as_deref(), var("VICTORY_MWAITX_SPIN_US").as_deref(), var("VICTORY_MWAITX_TIMEOUT_US").as_deref());
+        let mode = var("VICTORY_MWAITX");
+        // The tests of the blocking wait run it unless told otherwise.
+        #[cfg(test)]
+        let mode = mode.or_else(|| Some("wait".to_owned()));
+        let p = Pacing::parse(mode.as_deref(), var("VICTORY_MWAITX_SPIN_US").as_deref(), var("VICTORY_MWAITX_TIMEOUT_US").as_deref());
         tracing::info!(
             "mwaitx: {} (VICTORY_MWAITX=wait|spin; spin {} us, then blocks of at most {} us: VICTORY_MWAITX_SPIN_US, VICTORY_MWAITX_TIMEOUT_US)",
             if p.block { "spins, then blocks on the monitored address" } else { "spins" },
@@ -975,11 +982,14 @@ mod tests {
 
     #[test]
     fn mwaitx_spins_first_then_blocks_within_the_title_s_timer() {
-        let p = Pacing::parse(None, None, None);
-        assert_eq!(p, Pacing { block: true, spin_us: 200, timeout_us: 1_000 }, "the defaults");
+        assert_eq!(Pacing::parse(None, None, None), Pacing { block: false, spin_us: 200, timeout_us: 1_000 }, "the defaults spin");
+        assert_eq!(Pacing::parse(None, None, None).plan(10_000_000, 0, 0), None, "unset: spins all through");
+        assert_eq!(Pacing::parse(Some("other"), None, None).plan(10_000_000, 0, 0), None, "anything but wait spins");
+        let p = Pacing::parse(Some("wait"), None, None);
+        assert_eq!(p, Pacing { block: true, spin_us: 200, timeout_us: 1_000 }, "VICTORY_MWAITX=wait");
         assert_eq!(Pacing::parse(Some("spin"), None, None).plan(10_000_000, 0, 0), None, "VICTORY_MWAITX=spin");
         assert_eq!(Pacing::parse(Some("wait"), Some("50"), Some("300")), Pacing { block: true, spin_us: 50, timeout_us: 300 });
-        assert_eq!(Pacing::parse(None, Some("x"), Some("1")).timeout_us, MIN_BLOCK_US, "nonsense and too small");
+        assert_eq!(Pacing::parse(Some("wait"), Some("x"), Some("1")).timeout_us, MIN_BLOCK_US, "nonsense and too small");
         // the spin phase, then blocks of the timeout
         assert_eq!(p.plan(0, 0, 0), None);
         assert_eq!(p.plan(199, 0, 0), None);
@@ -996,7 +1006,7 @@ mod tests {
         assert_eq!(p.plan(500, 2, 0), None);
         // a wait goes on across a block
         assert!(p.gap_us() > p.timeout_us && p.gap_us() >= 2_000);
-        assert_eq!(Pacing::parse(None, None, Some("10000")).gap_us(), 21_000);
+        assert_eq!(Pacing::parse(Some("wait"), None, Some("10000")).gap_us(), 21_000);
         assert_eq!(Pacing::parse(Some("spin"), None, Some("10000")).gap_us(), 2_000, "as before");
         assert_eq!((wait_size(0x1000), wait_size(0x1004), wait_size(0x1002), wait_size(0x1001)), (Some(8), Some(4), None, None));
     }

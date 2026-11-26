@@ -155,7 +155,7 @@ impl Host {
             Ok(merge) => {
                 tracing::info!(
                     "title bytes put in under flights' shader writes reach copies in the card's memory through a merge on the card \
-                     (VICTORY_MERGE_ON_CARD=0: as copies of the changed runs)"
+                     (VICTORY_MERGE_ON_CARD=1; unset: as copies of the changed runs)"
                 );
                 if crate::shadow::plain_twins() {
                     tracing::info!(

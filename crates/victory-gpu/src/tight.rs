@@ -20,10 +20,11 @@
 //!   device has no such heaps a window is not put on the card as two
 //!   buffers either (that keeps the PC's side and takes the card's room);
 //! - the spare pools keep less: list scratch chunks, texture staging
-//!   buffers, snapshot buffers, the threads' texture read buffers;
-//! - the CPU sides of copies in the card's memory are plain (swappable)
-//!   memory, sent up through upload chunks (`VICTORY_CARD_TWIN_PLAIN`,
-//!   `crate::shadow::plain_twins`).
+//!   buffers, snapshot buffers, the threads' texture read buffers.
+//!
+//! The mode no longer makes the CPU sides of copies in the card's memory
+//! plain memory: that is `VICTORY_CARD_TWIN_PLAIN=1` alone
+//! (`crate::shadow::plain_twins`).
 //!
 //! The memory line ([`line`], in every build, every 10 s with the frame
 //! line) says what the host copies hold by kind and where, so a run with
@@ -234,7 +235,7 @@ pub(crate) fn say() {
             "VICTORY_TIGHT_MEMORY=1: defaults for a PC short of memory, where not set: VICTORY_WINDOW_KB={WINDOW_KB} \
              VICTORY_WINDOW_UPLOAD=1 VICTORY_CARD_WINDOWS_MB={CARD_WINDOWS_MB} (no windows on the card beside a copy \
              in the PC's memory) VICTORY_STAGING_POOL_MB={STAGING_SPARE_MB} VICTORY_SNAPSHOT_POOL_MB={SNAPSHOT_POOL_MB} \
-             VICTORY_TEXTURE_READ_KEEP_MB={TEXTURE_READ_KEEP_MB} VICTORY_CARD_TWIN_PLAIN=1; list scratch kept spare: {} MB",
+             VICTORY_TEXTURE_READ_KEEP_MB={TEXTURE_READ_KEEP_MB}; list scratch kept spare: {} MB",
             SCRATCH_SPARE >> 20
         );
     });

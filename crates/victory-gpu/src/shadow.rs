@@ -181,8 +181,11 @@ pub(crate) fn plain_held() -> ([u64; 3], [u64; 2]) {
 
 /// Whether the CPU side of a copy in the card's memory ([`cards`]) is plain
 /// memory of the process instead of a buffer in the PC's memory
-/// (`VICTORY_CARD_TWIN_PLAIN=1`; `VICTORY_TIGHT_MEMORY=1` turns it on unless
-/// it is set; off by default). Read when a copy is made.
+/// (`VICTORY_CARD_TWIN_PLAIN=1`; off by default, also with
+/// `VICTORY_TIGHT_MEMORY=1`, which turned it on before: a run with it and
+/// the newest card features faulted on the card and hung the host's
+/// graphics driver, so it is on only by choice until the faults are
+/// understood). Read when a copy is made.
 ///
 /// The CPU side only takes title memory and is compared with what the card
 /// wrote; nothing on the card reads it but the copy of its changed ranges
@@ -206,7 +209,7 @@ pub(crate) fn plain_twins() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = crate::tight::flag(std::env::var("VICTORY_CARD_TWIN_PLAIN").ok().as_deref(), crate::tight::on());
+        let on = std::env::var("VICTORY_CARD_TWIN_PLAIN").is_ok_and(|v| v == "1");
         if !on {
             return false;
         }
@@ -409,8 +412,13 @@ pub(crate) fn mask_runs(blocks: &MaskBlocks) -> Vec<(usize, usize)> {
 /// Whether the title's bytes put into a copy in the card's memory under
 /// flights' shader writes ([`Shadow::merge_under_writes`]) reach the card's
 /// side through one pass of ours on the card (`crate::host::CARD_MERGE`)
-/// and not as a copy for each changed run (`VICTORY_MERGE_ON_CARD`; on
-/// unless `0`).
+/// and not as a copy for each changed run (`VICTORY_MERGE_ON_CARD=1`; off
+/// by default).
+///
+/// Off by default since a run with it on faulted on the card (an MMU fault
+/// in the kernel's log) and the fault hung the host's graphics driver,
+/// taking the desktop with it; on again only by choice until the faults
+/// are understood.
 ///
 /// Each run was a copy of its own on the card and a hash pass of its own
 /// behind it, so a submission sent up 512 of them at most
@@ -460,13 +468,13 @@ pub(crate) fn merge_on_card() -> bool {
     }
 }
 
-/// [`merge_on_card`]'s switch: 0 off, 1 on, 2 in turn.
+/// [`merge_on_card`]'s switch: 0 off (unset), 1 on (`1`), 2 in turn (`alt`).
 fn merge_on_card_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("VICTORY_MERGE_ON_CARD").as_deref() {
-        Ok("0") => 0,
+        Ok("1") => 1,
         Ok("alt") => 2,
-        _ => 1,
+        _ => 0,
     })
 }
 
