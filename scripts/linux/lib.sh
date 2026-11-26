@@ -88,3 +88,20 @@ preflight_host() {
     warn "/dev/ntsync is missing (needs kernel 6.14+ with the ntsync module: sudo modprobe ntsync); Wine falls back to slower synchronisation"
   fi
 }
+
+# True if $1 is an ELF file.
+is_elf() { [[ $(head -c4 -- "$1" 2>/dev/null | od -An -c | tr -d ' ') == '177ELF' ]]; }
+
+# A string that changes when the Proton build in $1 changes: its version file
+# and the size and modification time of its wine, wineserver and ntdll.so.
+proton_fingerprint() { # proton dir
+  local f out
+  out=$(cat -- "$1/version" 2>/dev/null | tr '\n' ' ')
+  for f in files/bin/wine files/bin/wineserver files/lib/wine/x86_64-unix/ntdll.so; do
+    out+="|$f:$(stat -c '%s:%Y' -- "$1/$f" 2>/dev/null)"
+  done
+  printf '%s' "$out"
+}
+
+# The private patched Proton tree made by build-wine.sh.
+vl_patched_tree=$vl_cache_home/proton-patched

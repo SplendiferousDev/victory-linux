@@ -1,0 +1,36 @@
+From e4feda767f168b8b22ec4f18160e49077e366b94 Mon Sep 17 00:00:00 2001
+From: SplendiferousDev <361138182+SplendiferousDev@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 16:11:36 -0800
+Subject: [PATCH 4/5] ntdll: Skip mprotect() after mapping a section view when
+ the protection is already right.
+
+map_file_into_view() maps the file read/write. For the common read/write
+view the following mprotect() doesn't change anything.
+---
+ dlls/ntdll/unix/virtual.c | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index 5b8bfc8..1dae9fb 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -3818,8 +3818,14 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
+     res = map_file_into_view( view, unix_handle, 0, size, offset.QuadPart, vprot, needs_close );
+     if (res == STATUS_SUCCESS)
+     {
+-        /* file mappings must always be accessible */
+-        mprotect_range( view->base, view->size, VPROT_COMMITTED, 0 );
++        BYTE page_vprot;
++
++        /* file mappings must always be accessible; map_file_into_view() made them
++         * read/write, so mprotect is only needed if the protection differs */
++        if (force_exec_prot ||
++            get_vprot_range_size( view->base, view->size, 0xff, &page_vprot ) != view->size ||
++            get_unix_prot( page_vprot | VPROT_COMMITTED ) != (PROT_READ | PROT_WRITE))
++            mprotect_range( view->base, view->size, VPROT_COMMITTED, 0 );
+ 
+         SERVER_START_REQ( map_view )
+         {
+-- 
+2.56.1
+

@@ -37,6 +37,22 @@ const EXCEPTIONS: &[(&str, &str)] = &[
         "patches/wine/0001-server-index-memory-views.patch",
         "our own patch to Wine's server (LGPL-2.1-or-later): a small text diff, no game data; a patch is the form Wine changes take (patches/wine/README.md)",
     ),
+    (
+        "patches/wine/0002-ntdll-Use-server_call_unlocked-for-requests-made-wit.patch",
+        "our own patch to Wine's ntdll client (LGPL-2.1-or-later): a small text diff, no game data; a patch is the form Wine changes take (patches/wine/README.md)",
+    ),
+    (
+        "patches/wine/0003-ntdll-Don-t-change-the-host-protection-of-a-placehol.patch",
+        "our own patch to Wine's ntdll client (LGPL-2.1-or-later): a small text diff, no game data; a patch is the form Wine changes take (patches/wine/README.md)",
+    ),
+    (
+        "patches/wine/0004-ntdll-Skip-mprotect-after-mapping-a-section-view-whe.patch",
+        "our own patch to Wine's ntdll client (LGPL-2.1-or-later): a small text diff, no game data; a patch is the form Wine changes take (patches/wine/README.md)",
+    ),
+    (
+        "patches/wine/0005-ntdll-Cache-the-mapping-info-of-non-image-sections.patch",
+        "our own patch to Wine's ntdll client (LGPL-2.1-or-later): a small text diff, no game data; a patch is the form Wine changes take (patches/wine/README.md)",
+    ),
 ];
 
 /// Signatures of formats that must never be committed.
