@@ -148,13 +148,26 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 }
 
 /// Translates the containers of compute programs and makes their host
-/// pipelines, for the caches on disk; whether it has one. Made by the
-/// workers as a run's are (so a pipeline whose making ends its thread is
-/// found and listed as in a run, [`watch`], instead of the warm-up waiting
-/// for that thread for ever); the library is saved as it grows.
+/// pipelines, for the caches on disk; whether it has one.
 pub(crate) fn warm(shaders: Vec<Arc<Shader>>) -> bool {
-    let p = Arc::new(Pending::new(shaders, None));
-    start(&p, REQUESTED);
+    by_workers(&Arc::new(Pending::new(shaders, None)))
+}
+
+/// As [`warm`], for a graphics pipeline with its state (the offline
+/// precompile of the title's cache, [`super::precompiled::precompile_graphics`]).
+/// Also the key a run will name it by.
+pub(crate) fn warm_graphics(shaders: Vec<Arc<Shader>>, graphics: GraphicsState) -> (String, bool) {
+    let p = Arc::new(Pending::new(shaders, Some(Box::new(graphics))));
+    let made = by_workers(&p);
+    (p.key.clone(), made)
+}
+
+/// Has the workers make `p` and waits for them (offline): made as a run's
+/// are, so a pipeline whose making ends its thread is found and listed as
+/// in a run ([`watch`]) instead of the caller waiting for a dead thread for
+/// ever; the library is saved as it grows. Whether it has a host pipeline.
+fn by_workers(p: &Arc<Pending>) -> bool {
+    start(p, REQUESTED);
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() && !p.dead.load(Ordering::Relaxed) {
@@ -165,19 +178,6 @@ pub(crate) fn warm(shaders: Vec<Arc<Shader>>) -> bool {
     }
     drop(held);
     p.made.get().is_some_and(|made| made.is_some())
-}
-
-/// As [`warm`], for a graphics pipeline with its state (the offline
-/// precompile of the title's cache, [`super::precompiled::precompile_graphics`]).
-/// Also the key a run will name it by.
-pub(crate) fn warm_graphics(shaders: Vec<Arc<Shader>>, graphics: GraphicsState) -> (String, bool) {
-    let p = Pending::new(shaders, Some(Box::new(graphics)));
-    if super::library::ends_its_thread(&p.key) {
-        return (p.key, false);
-    }
-    let made = HostPipeline::new(&p.shaders, p.graphics.as_deref()).is_some();
-    super::library::save(false);
-    (p.key, made)
 }
 
 /// At the title's creation of a pipeline: starts it at once if an earlier
@@ -342,12 +342,20 @@ fn next() -> Arc<Pending> {
     }
 }
 
-/// Starts the workers (half the logical processors, 2 to 8) on first use,
-/// and the thread that watches them ([`watch`]).
+/// Starts the workers (half the logical processors, 2 to 8; or
+/// `VICTORY_PIPELINE_WORKERS`, 1 to 16) on first use, and the thread that
+/// watches them ([`watch`]). Fewer workers make fewer pipelines at once:
+/// each compile holds its own working memory in the host's compiler, which
+/// counts on a PC that is out of memory in the world (16 GB).
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
-        let count = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let count = std::env::var("VICTORY_PIPELINE_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|n| n.clamp(1, 16))
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8)));
+        tracing::info!(count, "host pipeline workers");
         let workers: Vec<Worker> = (0..count).filter_map(Worker::spawn).collect();
         let running = !workers.is_empty();
         if running {
