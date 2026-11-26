@@ -157,6 +157,9 @@ fn wait_step(rip: usize) -> u64 {
 /// value, then blocks on the monitored address ([`block`]) for at most
 /// [`Pacing::timeout_us`] at a time (`VICTORY_MWAITX_SPIN_US`, `VICTORY_MWAITX_TIMEOUT_US`);
 /// `VICTORY_MWAITX=spin` takes an exception at every `mwaitx` all through the wait, as before.
+/// `VICTORY_MWAITX=alt` (`alt40`): twenty (forty) seconds of each in turn, spin first, each
+/// change said in the log, so that one run measures both on the same scene. A wait may change
+/// between the two midway, which is harmless: each `mwaitx` decides alone.
 /// Under Wine an exception costs about 4 us of the waiting thread, and a long wait took
 /// 250,000 of them a second.
 ///
@@ -166,6 +169,8 @@ fn wait_step(rip: usize) -> u64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Pacing {
     block: bool,
+    /// With `alt`/`alt40`: the seconds of each way in turn (`block` is then ignored); else 0.
+    alt_s: u64,
     spin_us: u64,
     timeout_us: u64,
 }
@@ -173,8 +178,14 @@ struct Pacing {
 impl Pacing {
     fn parse(mode: Option<&str>, spin_us: Option<&str>, timeout_us: Option<&str>) -> Pacing {
         let number = |v: Option<&str>, default: u64, least: u64, most: u64| v.and_then(|v| v.trim().parse().ok()).unwrap_or(default).clamp(least, most);
+        let mode = mode.map(|m| m.trim().to_ascii_lowercase());
         Pacing {
-            block: !mode.is_some_and(|m| m.trim().eq_ignore_ascii_case("spin")),
+            block: mode.as_deref() != Some("spin"),
+            alt_s: match mode.as_deref() {
+                Some("alt") => 20,
+                Some("alt40") => 40,
+                _ => 0,
+            },
             spin_us: number(spin_us, 200, 0, 1_000_000),
             timeout_us: number(timeout_us, 1_000, MIN_BLOCK_US, 100_000),
         }
@@ -183,7 +194,25 @@ impl Pacing {
     /// The longest gap between two `mwaitx` of one wait: 2 ms, longer when a block lies
     /// between them.
     fn gap_us(&self) -> u64 {
-        if self.block { 2_000.max(2 * self.timeout_us + 1_000) } else { 2_000 }
+        if self.block || self.alt_s != 0 { 2_000.max(2 * self.timeout_us + 1_000) } else { 2_000 }
+    }
+
+    /// Whether a wait blocks after its spin now: `block`, or with `alt` the half of the
+    /// period we are in (the first spins), said in the log at each change.
+    fn blocks(&self) -> bool {
+        if self.alt_s == 0 {
+            return self.block;
+        }
+        static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / self.alt_s) % 2 == 1;
+        static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+        if LAST.swap(u8::from(on), Relaxed) != u8::from(on) {
+            tracing::info!(
+                "mwaitx waits from now (VICTORY_MWAITX=alt): {}",
+                if on { "ON, spins and then blocks (=wait)" } else { "off, spins all through (=spin)" }
+            );
+        }
+        on
     }
 
     /// How the `mwaitx` of a wait that has lasted `waited_us` waits: None spins (one more
@@ -192,7 +221,7 @@ impl Pacing {
     /// [`TICKS_PER_US`], faster than the console's or this PC's, so that it is never
     /// overslept; a timer too short to block for spins.
     fn plan(&self, waited_us: u64, ecx: u64, ebx: u64) -> Option<u64> {
-        if !self.block || waited_us < self.spin_us {
+        if waited_us < self.spin_us || !self.blocks() {
             return None;
         }
         let mut timeout = self.timeout_us;
@@ -214,8 +243,14 @@ fn pacing() -> &'static Pacing {
         let var = |name: &str| std::env::var(name).ok();
         let p = Pacing::parse(var("VICTORY_MWAITX").as_deref(), var("VICTORY_MWAITX_SPIN_US").as_deref(), var("VICTORY_MWAITX_TIMEOUT_US").as_deref());
         tracing::info!(
-            "mwaitx: {} (VICTORY_MWAITX=wait|spin; spin {} us, then blocks of at most {} us: VICTORY_MWAITX_SPIN_US, VICTORY_MWAITX_TIMEOUT_US)",
-            if p.block { "spins, then blocks on the monitored address" } else { "spins" },
+            "mwaitx: {} (VICTORY_MWAITX=wait|spin|alt|alt40; spin {} us, then blocks of at most {} us: VICTORY_MWAITX_SPIN_US, VICTORY_MWAITX_TIMEOUT_US)",
+            if p.alt_s != 0 {
+                "in turn: spins / spins, then blocks on the monitored address"
+            } else if p.block {
+                "spins, then blocks on the monitored address"
+            } else {
+                "spins"
+            },
             p.spin_us,
             p.timeout_us
         );
@@ -773,7 +808,7 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
         ConsoleOnly::Monitorx => {
             KINDS[K_MONITORX].fetch_add(1, Relaxed);
             let address = ctx.Rax as usize;
-            let armed = if pacing().block { armed_value(address, clock_us()) } else { None };
+            let armed = if pacing().blocks() { armed_value(address, clock_us()) } else { None };
             MONITOR.with(|m| m.set((address, ctx.Rsi, armed)));
         }
         ConsoleOnly::Mwaitx => {
@@ -976,9 +1011,12 @@ mod tests {
     #[test]
     fn mwaitx_spins_first_then_blocks_within_the_title_s_timer() {
         let p = Pacing::parse(None, None, None);
-        assert_eq!(p, Pacing { block: true, spin_us: 200, timeout_us: 1_000 }, "the defaults");
+        assert_eq!(p, Pacing { block: true, alt_s: 0, spin_us: 200, timeout_us: 1_000 }, "the defaults");
         assert_eq!(Pacing::parse(Some("spin"), None, None).plan(10_000_000, 0, 0), None, "VICTORY_MWAITX=spin");
-        assert_eq!(Pacing::parse(Some("wait"), Some("50"), Some("300")), Pacing { block: true, spin_us: 50, timeout_us: 300 });
+        assert_eq!(Pacing::parse(Some("wait"), Some("50"), Some("300")), Pacing { block: true, alt_s: 0, spin_us: 50, timeout_us: 300 });
+        assert_eq!((Pacing::parse(Some("alt"), None, None).alt_s, Pacing::parse(Some(" ALT40 "), None, None).alt_s), (20, 40));
+        assert_eq!(Pacing::parse(Some("alt"), None, Some("10000")).gap_us(), 21_000, "a wait goes on across a block in either half");
+        assert!(!Pacing::parse(Some("alt"), None, None).blocks(), "the first half spins");
         assert_eq!(Pacing::parse(None, Some("x"), Some("1")).timeout_us, MIN_BLOCK_US, "nonsense and too small");
         // the spin phase, then blocks of the timeout
         assert_eq!(p.plan(0, 0, 0), None);

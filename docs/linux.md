@@ -252,7 +252,9 @@ choice is ambiguous, `VICTORY_AMBIENT_TINT=r,g,b`, `VICTORY_AMBIENT_SHADE=s,r,n,
   the monitored address (`RtlWaitOnAddress`, a futex under Wine) for up to
   1 ms. The runtime's fence and bottom-of-pipe writes wake it. Before this, a
   long wait took about 250,000 exceptions a second. `VICTORY_MWAITX=spin`
-  brings back the old behaviour. `VICTORY_MWAITX_SPIN_US` and
+  brings back the old behaviour; `VICTORY_MWAITX=alt` (or `alt40`) switches
+  between the two every 20 (40) seconds within one run, saying each change in
+  the log, to compare them on the same scene. `VICTORY_MWAITX_SPIN_US` and
   `VICTORY_MWAITX_TIMEOUT_US` tune the two phases. The log's "console CPU
   instructions, exceptions a second" line counts the blocks, their ends and
   the wakes.
