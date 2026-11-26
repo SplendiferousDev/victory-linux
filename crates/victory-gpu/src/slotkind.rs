@@ -55,14 +55,16 @@ pub(crate) fn must_wait(on: bool, dynamic: bool, was: u8, now: u8, in_flight: u6
     on && !dynamic && was != NONE && now != NONE && was != now && in_flight > 0
 }
 
-/// Whether the rule is applied (`VICTORY_SLOT_KIND_WAIT`, on; `0` off:
-/// such slots are written under the flights, as before, and counted).
+/// Whether the rule is applied (`VICTORY_SLOT_KIND_WAIT=1`; off unless set:
+/// such slots are written under the flights, as before, and counted). Off by
+/// default since a run measured it: about 29 waits and 740 ms of waiting a
+/// frame, frames half as long again, and a fault of the same kind all the same.
 pub(crate) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_SLOT_KIND_WAIT").is_none_or(|v| v != "0");
-        if !on {
-            tracing::warn!("view heap slots of the title change kind under submissions in flight without a wait (VICTORY_SLOT_KIND_WAIT=0)");
+        let on = std::env::var_os("VICTORY_SLOT_KIND_WAIT").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("view heap slots of the title wait for the submissions in flight before they change kind (VICTORY_SLOT_KIND_WAIT=1)");
         }
         on
     })
