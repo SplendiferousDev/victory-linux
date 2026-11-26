@@ -1298,11 +1298,36 @@ fn pooled(n: usize) -> Vec<u8> {
     v
 }
 
-/// Returns a snapshot buffer to the pool: at most 8 kept, the largest, and
-/// of those the largest one and the next ones up to `KEPT` bytes in all.
+/// The most bytes of snapshot buffers [`give_back`] keeps in the pool
+/// (`VICTORY_SNAPSHOT_POOL_MB`, 512 unless set). The largest buffer is kept
+/// whatever its size unless this is 0, which keeps none: every snapshot is
+/// then new memory, freed when it is done with. The pool is resident
+/// memory (its pages were all written), which a PC short of memory may
+/// want back.
+fn pool_most() -> usize {
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_SNAPSHOT_POOL_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(512 << 20, |mb| mb.saturating_mul(1 << 20))
+    })
+}
+
+/// Returns a snapshot buffer to the pool.
 fn give_back(v: Vec<u8>) {
-    const KEPT: usize = 512 << 20;
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    keep_in_pool(&mut pool, v, pool_most());
+}
+
+/// Puts `v` in `pool` and keeps at most 8 buffers, the largest: of those
+/// the largest one (unless `most` is 0) and the next ones up to `most`
+/// bytes in all.
+fn keep_in_pool(pool: &mut Vec<Vec<u8>>, v: Vec<u8>, most: usize) {
+    if most == 0 {
+        pool.clear();
+        return;
+    }
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
     pool.truncate(8);
@@ -1310,8 +1335,46 @@ fn give_back(v: Vec<u8>) {
     pool.retain(|v| {
         seen += 1;
         total = total.saturating_add(v.capacity());
-        seen == 1 || total <= KEPT
+        seen == 1 || total <= most
     });
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::keep_in_pool;
+
+    fn caps(pool: &[Vec<u8>]) -> Vec<usize> {
+        pool.iter().map(Vec::capacity).collect()
+    }
+
+    #[test]
+    fn the_pool_keeps_the_largest_and_the_next_up_to_its_most() {
+        let mut pool = Vec::new();
+        for n in [100, 400, 300, 200] {
+            keep_in_pool(&mut pool, Vec::with_capacity(n), 700);
+        }
+        assert_eq!(caps(&pool), [400, 300]);
+        // The largest stays even over the most.
+        keep_in_pool(&mut pool, Vec::with_capacity(5000), 700);
+        assert_eq!(caps(&pool), [5000]);
+    }
+
+    #[test]
+    fn the_pool_keeps_at_most_eight() {
+        let mut pool = Vec::new();
+        for n in 1..=10 {
+            keep_in_pool(&mut pool, Vec::with_capacity(n), usize::MAX);
+        }
+        assert_eq!(caps(&pool), [10, 9, 8, 7, 6, 5, 4, 3]);
+    }
+
+    #[test]
+    fn a_most_of_zero_keeps_nothing() {
+        let mut pool = Vec::new();
+        keep_in_pool(&mut pool, Vec::with_capacity(64), 0);
+        keep_in_pool(&mut pool, Vec::new(), 0);
+        assert!(pool.is_empty());
+    }
 }
 
 const NOT_WATCHED: u8 = 2;
