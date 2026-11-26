@@ -1684,6 +1684,9 @@ impl State {
                             None,
                         ));
                     }
+                    // For a fault address: which title address went to the
+                    // card as which host address (`crate::gpuwatch`).
+                    crate::gpuwatch::note_root(compute, srv, address, gpu);
                     // SAFETY: an open list; the address is in live memory.
                     unsafe {
                         match (compute, srv) {

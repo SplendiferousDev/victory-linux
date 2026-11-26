@@ -3279,10 +3279,14 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::Ato
 /// in the kernel's log, or the host runtime's fault report with
 /// `VKD3D_CONFIG=fault`) can be told to be ours, ours and let go, or not
 /// ours at all.
-static GONE: Mutex<std::collections::VecDeque<(u64, u64, u64, &'static str)>> = Mutex::new(std::collections::VecDeque::new());
+/// Host ranges let go lately: GPU address, bytes, when
+/// ([`crate::host::now_us`]), what, and the title memory it copied (start,
+/// bytes; 0 for none).
+type Gone = (u64, u64, u64, &'static str, (u64, u64));
+static GONE: Mutex<std::collections::VecDeque<Gone>> = Mutex::new(std::collections::VecDeque::new());
 const GONE_MOST: usize = 512;
 
-fn note_gone(gpu: u64, bytes: u64, what: &'static str) {
+fn note_gone(gpu: u64, bytes: u64, what: &'static str, title: (u64, u64)) {
     if gpu == 0 {
         return;
     }
@@ -3290,7 +3294,24 @@ fn note_gone(gpu: u64, bytes: u64, what: &'static str) {
     if gone.len() >= GONE_MOST {
         gone.pop_front();
     }
-    gone.push_back((gpu, bytes, crate::host::now_us(), what));
+    gone.push_back((gpu, bytes, crate::host::now_us(), what, title));
+}
+
+/// The range let go after `since` ([`crate::host::now_us`]) that holds the
+/// host GPU address `gpu`, described, if one does (the newest). Only tries
+/// the lock.
+pub(crate) fn gone_holding(gpu: u64, since: u64) -> Option<String> {
+    let gone = GONE.try_lock().ok()?;
+    let now = crate::host::now_us();
+    gone.iter()
+        .rev()
+        .find(|(va, bytes, at, ..)| *at > since && (*va..*va + *bytes).contains(&gpu))
+        .map(|(va, bytes, at, what, (start, len))| {
+            format!(
+                "{what} {va:#x}+{bytes:#x} of title {start:#x}+{len:#x}, let go {:.2} s ago",
+                now.saturating_sub(*at) as f64 / 1e6
+            )
+        })
 }
 
 /// Writes `va+bytes` ranges, joined where they touch, at most `most`.
@@ -3346,8 +3367,12 @@ pub(crate) fn gpu_map(out: &mut String) {
     match GONE.try_lock() {
         Ok(gone) => {
             let _ = write!(out, "; let go lately ({}), newest first:", gone.len());
-            for (va, bytes, at, what) in gone.iter().rev().take(128) {
-                let _ = write!(out, " {va:#x}+{bytes:#x} {what} {:.1} s ago;", now.saturating_sub(*at) as f64 / 1e6);
+            for (va, bytes, at, what, (start, len)) in gone.iter().rev().take(128) {
+                let _ = write!(
+                    out,
+                    " {va:#x}+{bytes:#x} {what} (title {start:#x}+{len:#x}) {:.1} s ago;",
+                    now.saturating_sub(*at) as f64 / 1e6
+                );
             }
         }
         Err(_) => out.push_str("; let go lately: locked"),
@@ -3358,12 +3383,22 @@ impl Drop for Shadow {
     fn drop(&mut self) {
         // SAFETY: a plain query of our own buffer.
         let bytes = unsafe { self.buffer.GetDesc() }.Width;
-        note_gone(self.gpu, bytes, if self.window { "window" } else if self.card.is_some() { "card copy" } else { "buffer copy" });
+        note_gone(
+            self.gpu,
+            bytes,
+            if self.window { "window" } else if self.card.is_some() { "card copy" } else { "buffer copy" },
+            (self.start, self.len),
+        );
         if let Some(card) = &mut self.card
             && let Some(before) = card.before.get_mut().unwrap_or_else(|e| e.into_inner()).as_ref()
         {
             // SAFETY: plain queries of our own buffer.
-            note_gone(unsafe { before.GetGPUVirtualAddress() }, unsafe { before.GetDesc() }.Width, "before-hashes");
+            note_gone(
+                unsafe { before.GetGPUVirtualAddress() },
+                unsafe { before.GetDesc() }.Width,
+                "before-hashes",
+                (self.start, self.len),
+            );
         }
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
@@ -3626,12 +3661,23 @@ pub(crate) fn let_go_idle() {
             format!("sweep: {went} host copies of windows of title memory let go ({} KiB), held by no list and no slot", bytes >> 10)
         });
     }
+    // The submissions started so far: what is let go here is held until
+    // the next one has run (`crate::gpuwatch::hold`).
+    let started = crate::host::started();
     for shadow in gone {
         LET_GO[0].fetch_add(1, Ordering::Relaxed);
         LET_GO[1].fetch_add(shadow.len, Ordering::Relaxed);
-        // Nothing runs now and nothing names it: freed at once unless a
-        // submission is running after all.
-        crate::host::retire(shadow);
+        // Nothing runs now and nothing names it: freed once the next
+        // submission has run and the hold's time has passed. Freed at once
+        // (unless a submission is running after all) a window was read by
+        // a compute shader right after the sweep (run b9-X1: the host
+        // runtime's fault report, "use-after-free", on its first page).
+        if crate::gpuwatch::hold_ms() > 0 {
+            let bytes = shadow.len;
+            crate::gpuwatch::hold(shadow, bytes, started);
+        } else {
+            crate::host::retire(shadow);
+        }
     }
 }
 

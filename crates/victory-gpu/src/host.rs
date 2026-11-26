@@ -247,8 +247,14 @@ pub(crate) fn retire<T: 'static>(object: T) {
         .push((started, Retired(Box::new(object))));
 }
 
+/// Submissions started so far ([`STARTED`]).
+pub(crate) fn started() -> u64 {
+    STARTED.load(Ordering::Acquire)
+}
+
 /// Drops what waited for submissions up to `finished`.
 fn bury(finished: u64) {
+    crate::gpuwatch::release(finished);
     let done: Vec<(u64, Retired)> = {
         let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
         if retired.is_empty() {
@@ -367,6 +373,8 @@ pub(crate) fn removal_context() -> String {
     crate::hostq::stall_section(&mut text);
     text.push_str("\n  GPU addresses of our host copies: ");
     crate::shadow::gpu_map(&mut text);
+    text.push_str("\n  root views: ");
+    crate::gpuwatch::roots_section(&mut text);
     text
 }
 

@@ -376,6 +376,7 @@ fn report(now: u64) -> String {
     section("host queues", &crate::hostq::stall_section);
     section("host device", &crate::host::device_section);
     section("GPU addresses of our host copies", &crate::shadow::gpu_map);
+    section("root views", &crate::gpuwatch::roots_section);
     section("kernel", &kernel_section);
     section("pipelines", &|out: &mut String| {
         let _ = write!(
