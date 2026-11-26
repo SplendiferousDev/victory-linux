@@ -125,19 +125,176 @@ fn wait_ended(begin: u64, last: u64, address: usize, wanted: u64, spins: u32) {
     }
 }
 
-/// A `mwaitx` of this thread: part of the wait under way, or the first of a new one.
-fn wait_step() {
+/// A `mwaitx` of this thread at `rip`: part of the wait under way, or the first of a new one.
+fn wait_step(rip: usize) {
     let now = clock_us();
     let (address, wanted) = MONITOR.with(Cell::get);
     let (begin, last, was_at, was_for, spins) = WAIT.with(Cell::get);
     if begin != 0 && was_at == address && was_for == wanted && now.saturating_sub(last) < 2_000 {
         WAIT.with(|w| w.set((begin, now, address, wanted, spins + 1)));
+        waiting::note(rip, address, wanted, begin, now, spins + 1);
         return;
     }
     if begin != 0 {
         wait_ended(begin, last, was_at, was_for, spins);
     }
     WAIT.with(|w| w.set((now, now, address, wanted, 1)));
+    waiting::note(rip, address, wanted, now, now, 1);
+}
+
+/// The waits of the title's threads, readable from another thread: a table
+/// of slots, one per thread that ever used `mwaitx` (the first [`waiting::SLOTS`]
+/// of them), each with its newest wait. For the stall report
+/// ([`stall_report`]): a thread that spins in an emulated wait for a value
+/// that never comes says nothing else.
+mod waiting {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+
+    pub(super) const SLOTS: usize = 64;
+
+    /// A thread's newest wait: the thread, the `mwaitx`'s address, the
+    /// monitored address and the value the title wants there (rsi), when
+    /// the wait began and its last `mwaitx` (microseconds), its `mwaitx`
+    /// count. Written by its thread alone; a reader may see a wait half
+    /// changed, which a report can bear.
+    pub(super) struct Slot {
+        pub(super) thread: AtomicU32,
+        pub(super) rip: AtomicU64,
+        pub(super) address: AtomicU64,
+        pub(super) wanted: AtomicU64,
+        pub(super) begin: AtomicU64,
+        pub(super) last: AtomicU64,
+        pub(super) spins: AtomicU64,
+    }
+
+    pub(super) static TABLE: [Slot; SLOTS] = [const {
+        Slot {
+            thread: AtomicU32::new(0),
+            rip: AtomicU64::new(0),
+            address: AtomicU64::new(0),
+            wanted: AtomicU64::new(0),
+            begin: AtomicU64::new(0),
+            last: AtomicU64::new(0),
+            spins: AtomicU64::new(0),
+        }
+    }; SLOTS];
+
+    thread_local! {
+        /// This thread's slot: [`SLOTS`] + 1 not looked for yet, [`SLOTS`]
+        /// the table was full.
+        static MINE: Cell<usize> = const { Cell::new(SLOTS + 1) };
+    }
+
+    fn mine() -> Option<&'static Slot> {
+        let mut i = MINE.with(Cell::get);
+        if i > SLOTS {
+            // SAFETY: no preconditions.
+            let thread = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+            i = TABLE
+                .iter()
+                .position(|s| s.thread.load(Relaxed) == thread || s.thread.compare_exchange(0, thread, Relaxed, Relaxed).is_ok())
+                .unwrap_or(SLOTS);
+            MINE.with(|m| m.set(i));
+        }
+        TABLE.get(i)
+    }
+
+    pub(super) fn note(rip: usize, address: usize, wanted: u64, begin: u64, last: u64, spins: u32) {
+        let Some(slot) = mine() else { return };
+        if spins == 1 {
+            slot.rip.store(rip as u64, Relaxed);
+            slot.address.store(address as u64, Relaxed);
+            slot.wanted.store(wanted, Relaxed);
+            slot.begin.store(begin, Relaxed);
+        }
+        slot.last.store(last, Relaxed);
+        slot.spins.store(u64::from(spins), Relaxed);
+    }
+}
+
+/// One thread's wait as the report reads it: thread, `mwaitx` address,
+/// monitored address, wanted value, began and last (microseconds), count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Waiting {
+    thread: u32,
+    rip: usize,
+    address: usize,
+    wanted: u64,
+    begin: u64,
+    last: u64,
+    spins: u64,
+}
+
+/// The waits still under way at `now` (a `mwaitx` in the last two seconds),
+/// longest first, each with the value at its address now (`read`; None: not
+/// readable) and where its code lies (`place`).
+fn describe_waits(waits: &[Waiting], now: u64, read: impl Fn(usize) -> Option<u64>, place: impl Fn(usize) -> String, out: &mut String) {
+    use std::fmt::Write;
+    let mut under_way: Vec<&Waiting> = waits.iter().filter(|w| w.thread != 0 && w.last != 0 && now.saturating_sub(w.last) < 2_000_000).collect();
+    under_way.sort_by_key(|w| w.begin);
+    let _ = write!(out, "{} title threads in an emulated mwaitx wait now ({} ever used it)", under_way.len(), waits.iter().filter(|w| w.thread != 0).count());
+    for w in under_way.iter().take(16) {
+        let seconds = w.last.saturating_sub(w.begin) as f64 / 1e6;
+        let _ = write!(
+            out,
+            "; thread {} at {} waits {seconds:.1} s for the value at {:#x} (wants {:#x}, holds {}), {} mwaitx ({:.0} a second)",
+            w.thread,
+            place(w.rip),
+            w.address,
+            w.wanted,
+            read(w.address).map_or_else(|| "not readable".to_owned(), |v| format!("{v:#x}")),
+            w.spins,
+            if seconds > 0.0 { w.spins as f64 / seconds } else { 0.0 },
+        );
+    }
+}
+
+/// The stall report's section of the title's waits (`victory_gpu::stall`):
+/// every thread inside an emulated `mwaitx` wait now, on which address and
+/// value, for how long; and the exception counts since the last line.
+pub fn stall_report(out: &mut String) {
+    use std::fmt::Write;
+    let waits: Vec<Waiting> = waiting::TABLE
+        .iter()
+        .map(|s| Waiting {
+            thread: s.thread.load(Relaxed),
+            rip: s.rip.load(Relaxed) as usize,
+            address: s.address.load(Relaxed) as usize,
+            wanted: s.wanted.load(Relaxed),
+            begin: s.begin.load(Relaxed),
+            last: s.last.load(Relaxed),
+            spins: s.spins.load(Relaxed),
+        })
+        .collect();
+    let read = |address: usize| -> Option<u64> {
+        use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let mut value = 0u64;
+        let mut done = 0;
+        // SAFETY: our own 8 bytes; the kernel checks the source.
+        let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), address as *const _, (&raw mut value).cast(), 8, &mut done) } != 0;
+        ok.then_some(value)
+    };
+    let place = |rip: usize| -> String {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+        // SAFETY: plain data filled in by the query.
+        let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        if unsafe { VirtualQuery(rip as *const _, &mut m, size_of_val(&m)) } == 0 {
+            return format!("{rip:#x}");
+        }
+        format!("{rip:#x} (image {:#x} +{:#x})", m.AllocationBase as usize, rip - m.AllocationBase as usize)
+    };
+    describe_waits(&waits, clock_us(), read, place, out);
+    let _ = write!(
+        out,
+        "; since the last exceptions line: monitorx {}, mwaitx {}, clzero loops {}; emulated since the start {}",
+        KINDS[K_MONITORX].load(Relaxed),
+        KINDS[K_MWAITX].load(Relaxed),
+        KINDS[K_LOOP12].load(Relaxed) + KINDS[K_LOOP15].load(Relaxed) + KINDS[K_CLZERO].load(Relaxed),
+        EMULATED.load(Relaxed),
+    );
 }
 
 /// A line every five seconds: exceptions a second by kind, and the waits that ended.
@@ -371,7 +528,7 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
         }
         ConsoleOnly::Mwaitx => {
             KINDS[K_MWAITX].fetch_add(1, Relaxed);
-            wait_step();
+            wait_step(rip);
             std::hint::spin_loop()
         }
         ConsoleOnly::Clzero | ConsoleOnly::ClzeroStep { .. } => {
@@ -510,6 +667,45 @@ mod tests {
             lines.push(rax & !63);
         }
         (lines, rax, ptr)
+    }
+
+    #[test]
+    fn the_report_names_the_waits_under_way_longest_first() {
+        let w = |thread, address, begin, last, spins| Waiting { thread, rip: 0x5000, address, wanted: 7, begin, last, spins };
+        let waits = [
+            w(0, 0, 0, 0, 0),
+            // ended long ago
+            w(11, 0x100, 1_000_000, 2_000_000, 5),
+            // under way, the later one
+            w(12, 0x200, 40_000_000, 49_500_000, 1_000),
+            // under way, the longest
+            w(13, 0x300, 10_000_000, 50_000_000, 10_000_000),
+        ];
+        let mut out = String::new();
+        describe_waits(&waits, 50_000_000, |a| (a == 0x300).then_some(6), |rip| format!("{rip:#x}"), &mut out);
+        assert_eq!(
+            out,
+            "2 title threads in an emulated mwaitx wait now (3 ever used it); \
+             thread 13 at 0x5000 waits 40.0 s for the value at 0x300 (wants 0x7, holds 0x6), 10000000 mwaitx (250000 a second); \
+             thread 12 at 0x5000 waits 9.5 s for the value at 0x200 (wants 0x7, holds not readable), 1000 mwaitx (105 a second)"
+        );
+    }
+
+    #[test]
+    fn a_thread_keeps_its_slot_and_notes_its_newest_wait() {
+        std::thread::spawn(|| {
+            waiting::note(0x10, 0x1000, 3, 100, 100, 1);
+            waiting::note(0x10, 0x1000, 3, 100, 900, 2);
+            // SAFETY: no preconditions.
+            let me = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+            let slots: Vec<_> = waiting::TABLE.iter().filter(|s| s.thread.load(Relaxed) == me).collect();
+            assert_eq!(slots.len(), 1, "one slot per thread");
+            let s = slots[0];
+            assert_eq!((s.address.load(Relaxed), s.wanted.load(Relaxed)), (0x1000, 3));
+            assert_eq!((s.begin.load(Relaxed), s.last.load(Relaxed), s.spins.load(Relaxed)), (100, 900, 2));
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]

@@ -31,6 +31,12 @@ pub struct HleResolver {
 
 impl HleResolver {
     pub fn new(host: HostPolicy) -> Self {
+        // The stall report's sections of the loader and of the runtime.
+        #[cfg(windows)]
+        {
+            victory_gpu::stall::add_source("title threads", victory_loader::mwait_stall_report);
+            victory_gpu::stall::add_source("DirectStorage", modules::dstorage::stall_report);
+        }
         HleResolver { host }
     }
 

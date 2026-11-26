@@ -743,10 +743,13 @@ pub(crate) fn before_sync() {
     }
 }
 
+/// One caller of [`release_held_now`] at a time, so a queue's submissions
+/// keep their order.
+#[cfg(windows)]
+static RELEASING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(windows)]
 fn release_held_now(all: bool) {
-    // One caller at a time, so a queue's submissions keep their order.
-    static RELEASING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     if lock(&WAITING).is_empty() {
         return;
     }
@@ -957,6 +960,111 @@ fn value_met(wait: &crate::list::ValueWait) -> bool {
     wait.met() || (crate::host::late() && crate::host::late_met(wait))
 }
 
+/// Whether a queue's line is free to move by what memory holds now: its
+/// head is a wait for a fence that has reached its value, or for a memory
+/// value that is there. Only tries the locks (a line being run is not
+/// free to look at, and whoever runs it looks again).
+///
+/// For the poll of [`crate::host`]'s helper thread: a queue's line is run
+/// when something of ours happens (a submission, a signal, a present, a
+/// landing), but the value a wait stands at may come from the title's own
+/// processor, which tells us nothing. On the console the card sees it at
+/// once. Here the line stood until the title's next call; a title thread
+/// that waits for a fence behind that wait by reading the fence's memory
+/// (its `mwaitx` loop) makes no call, and nothing moved again.
+#[cfg(windows)]
+pub(crate) fn head_free() -> bool {
+    let Ok(queues) = WAITING.try_lock().map(|w| w.clone()) else {
+        return false;
+    };
+    queues.into_iter().any(|q| {
+        // SAFETY: a live queue (one released is taken off the list), read
+        // as `release_held_now` reads it.
+        let queue = unsafe { &*(q as *const Queue) };
+        let Ok(held) = queue.held.try_lock() else {
+            return false;
+        };
+        match held.first() {
+            Some(&Held::Wait(fence, value)) => crate::fence::completed(fence as This) >= value,
+            Some(Held::Value(wait)) => wait.met(),
+            _ => false,
+        }
+    })
+}
+
+/// The stall report's section of the queues (`crate::stall`): for each
+/// queue that holds anything, what stands at the head of its line and what
+/// waits behind it; and whether a thread is inside [`release_held_now`].
+/// Only tries the locks.
+#[cfg(windows)]
+pub(crate) fn stall_section(out: &mut String) {
+    use crate::stall::HeldView;
+    use std::fmt::Write;
+    let _ = write!(
+        out,
+        "running the lines: {}; presents held in a line {}; ",
+        match RELEASING.try_lock() {
+            Ok(_) => "nobody",
+            Err(std::sync::TryLockError::WouldBlock) => "a thread is inside (lock RELEASING held)",
+            Err(_) => "nobody (lock poisoned)",
+        },
+        PRESENTS_HELD.load(Ordering::Relaxed)
+    );
+    let queues = match WAITING.try_lock() {
+        Ok(w) => w.clone(),
+        Err(_) => {
+            out.push_str("the list of waiting queues is locked (lock WAITING)");
+            return;
+        }
+    };
+    if queues.is_empty() {
+        out.push_str("no queue holds anything");
+        return;
+    }
+    let _ = write!(out, "{} queues hold something", queues.len());
+    for q in queues {
+        // SAFETY: a live queue: one released is taken off the list (its
+        // address may be stale if it went since the copy; only its lock and
+        // line are read, as `release_held_now` reads them).
+        let queue = unsafe { &*(q as *const Queue) };
+        let _ = write!(out, "; queue {q:#x} (kind {}): ", queue.kind);
+        let views: Vec<HeldView> = match queue.held.try_lock() {
+            Ok(held) => held
+                .iter()
+                .take(256)
+                .map(|h| match h {
+                    Held::Wait(fence, value) => {
+                        HeldView::Fence { fence: *fence, wanted: *value, now: crate::fence::completed(*fence as This) }
+                    }
+                    Held::Value(wait) => {
+                        let (address, bytes) = wait.place();
+                        let mut raw = [0u8; 8];
+                        let now = crate::host::peek(address as *const u8, &mut raw[..bytes]).then(|| u64::from_le_bytes(raw));
+                        HeldView::Value {
+                            address,
+                            wait: format!("{wait:?}"),
+                            now,
+                            met: now.is_some_and(|v| wait.holds_for(v)),
+                            flight_writes: crate::host::late_met_tried(wait),
+                        }
+                    }
+                    Held::Run(_, order) => HeldView::Run { lists: order.len() },
+                    Held::Signal(fence, value) => {
+                        HeldView::Signal { fence: *fence, value: *value, now: crate::fence::completed(*fence as This) }
+                    }
+                    Held::Running => HeldView::Running,
+                    Held::Present(_, _, frame, _) => HeldView::Present { frame: *frame },
+                })
+                .collect(),
+            Err(_) => {
+                out.push_str("its line is locked (the queue's lock `held`)");
+                continue;
+            }
+        };
+        crate::stall::describe_line(&views, out);
+    }
+}
+
 fn queue<'a>(this: This) -> &'a Queue {
     // SAFETY: called from queue methods only.
     unsafe { &*this.cast::<Queue>() }
@@ -1040,6 +1148,7 @@ extern "system" fn release(this: This) -> u32 {
 /// Runs the lists' host lists and waits for them (decision 0007). A queue
 /// that waits for a fence keeps them until the fence is reached.
 extern "system" fn execute(this: This, count: u32, lists: *const This) {
+    crate::stall::submitted();
     #[cfg(windows)]
     let started = std::time::Instant::now();
     execute_now(this, count, lists);
@@ -1307,6 +1416,7 @@ extern "system" fn present(
     {
         crate::framelog::add(crate::framelog::T::PresentUs, presenting.elapsed().as_micros() as u64);
         crate::framelog::frame();
+        crate::stall::presented();
         #[cfg(feature = "diagnostics")]
         crate::fence::pace::frame();
     }
@@ -1778,6 +1888,43 @@ mod tests {
             slot::<extern "system" fn(This) -> u64>(fence, 0x40)(fence),
             7
         );
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
+    }
+
+    /// A line standing at a fence the title's processor moved (no signal,
+    /// no call of ours): the poll finds it free, and the stall report says
+    /// the head was met and not released.
+    #[cfg(windows)]
+    #[test]
+    fn a_line_at_a_wait_memory_meets_is_found_free_and_reported() {
+        let null = std::ptr::null();
+        let desc = QueueDesc { kind: 0, priority: 0, flags: 0, nodes: 0 };
+        let mut q = null;
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+        let mut fence = null;
+        assert_eq!(crate::fence::create(null, 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence), S_OK);
+        lock(&queue(q).held).extend([Held::Wait(fence as usize, 5), Held::Signal(fence as usize, 6)]);
+        lock(&WAITING).push(q as usize);
+
+        assert!(!head_free(), "the fence is at 0");
+        let mut out = String::new();
+        stall_section(&mut out);
+        assert!(out.contains(&format!("head wait for fence {:#x} to reach 5 (it is at 0)", fence as usize)), "{out}");
+        assert!(out.contains("then signal of fence"), "{out}");
+
+        // The title writes the fence's memory itself.
+        // SAFETY: the fence's value, at its GPU address.
+        unsafe { (slot::<extern "system" fn(This) -> u64>(fence, 0x60)(fence) as *mut u64).write(5) };
+        assert!(head_free());
+        let mut out = String::new();
+        stall_section(&mut out);
+        assert!(out.contains("(it is at 5: MET, not released)"), "{out}");
+
+        // The poll runs the line: the wait passes and the signal is set.
+        release_held(false);
+        assert!(lock(&queue(q).held).is_empty());
+        assert_eq!(slot::<extern "system" fn(This) -> u64>(fence, 0x40)(fence), 6);
+        assert!(!lock(&WAITING).contains(&(q as usize)));
         assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
     }
 
