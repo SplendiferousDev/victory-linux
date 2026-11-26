@@ -102,6 +102,18 @@ scripts/linux/run.sh --game <your game folder> --exe <file name of the title> \
   and `VICTORY_NO_WATCHDOG=1`. The title has a watchdog that crashes it on
   purpose after about 30 seconds without progress of its main thread, which a
   slow load can reach.
+- `VKD3D_DEBUG=none` and `VKD3D_SHADER_DEBUG=none` are set unless you set them
+  (they are Proton's own defaults, which launching wine directly would miss).
+  With `VKD3D_DEBUG=none` the `vkd3d-proton - build:` line is not logged; set
+  `VKD3D_DEBUG=info` to see it.
+- Before starting, the script warns when `vm.max_map_count` is below 1048576
+  (the layer keeps about 150,000 mapped views with 2-3 kernel mappings each, so
+  the common default of 65530 is too low; the message gives the `sysctl` line)
+  and when `/dev/ntsync` is missing.
+- Synchronisation: Wine uses ntsync automatically when `/dev/ntsync` exists
+  (kernel 6.14 or newer with the `ntsync` module loaded). Do not set
+  `PROTON_NO_NTSYNC`, `WINEESYNC` or `WINEFSYNC`. A log line `ntsync: up and
+  running.` (printed by Wine when it is in use) confirms it.
 - Every `VICTORY_*` and `VKD3D_*` variable in your environment is passed on, so
   `VICTORY_LOG=debug scripts/linux/run.sh ...` works.
 - It prints the vkd3d-proton version found in the prefix. The version number
@@ -220,6 +232,34 @@ choice is ambiguous, `VICTORY_AMBIENT_TINT=r,g,b`, `VICTORY_AMBIENT_SHADE=s,r,n,
   with `NV_ERR_NO_MEMORY` in the kernel log). Plan on more RAM, or a card with
   more memory; swap only delays it.
 - Swap helps with loading peaks. zram first and a swap file behind it work well.
+
+## Measuring a run
+
+`run.sh --measure <file>` samples once a second while the title runs and
+writes tab-separated values: memory, CPU and I/O pressure (PSI `avg10`),
+`MemAvailable`, free swap, and the number of processes and total resident size
+of the launcher's process tree (including any wineserver). The file must be
+outside the repository. `scripts/linux/measure.sh <file> <pid>` does the same
+for any process. Read the pressure columns together with the frame lines of
+the log: a world frame that takes seconds while `mem_full` is high is waiting
+for memory, not for the GPU.
+
+## Tuning for 16 GB machines
+
+Verified on a machine with 16 GB of RAM, an 8 GB card and an NVIDIA driver:
+
+- Swap (zram plus a swap file) helps loading peaks, and a `--scope` with
+  `--memory-high`/`--memory-max` keeps the desktop alive when memory runs out.
+- The patched wineserver removes the largest CPU cost; use it.
+- In the world the machine ran out of both video memory and system memory
+  (the driver then failed system-memory allocations and the process was
+  killed). Nothing we tried tunes this away; more RAM and a larger card are
+  needed.
+
+Not tested yet (do not rely on it): `vm.swappiness`, `vm.max_map_count` effects
+beyond avoiding the limit, transparent huge pages, `zswap` instead of zram,
+`MemoryHigh` values other than the ones above, an AMD card (different memory
+behaviour).
 
 ## Faster memory mapping: the wineserver patch
 

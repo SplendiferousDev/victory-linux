@@ -75,3 +75,16 @@ vkd3d_build_of() { # prefix
     awk '/-g[0-9a-f]+$/ {print; found=1; exit} !first {first=$0} END {if (!found) print first}') || true
   printf '%s' "$v"
 }
+
+# Warns about host settings the title is known to need. Never fails.
+preflight_host() {
+  local mmc
+  mmc=$(cat /proc/sys/vm/max_map_count 2>/dev/null || true)
+  if [[ $mmc =~ ^[0-9]+$ ]] && ((mmc < 1048576)); then
+    warn "vm.max_map_count is $mmc; the layer keeps about 150,000 mapped views (2-3 kernel mappings each) and can run out. Raise it:"
+    warn "  sudo sysctl -w vm.max_map_count=1048576   (persist: echo 'vm.max_map_count = 1048576' | sudo tee /etc/sysctl.d/99-victory.conf)"
+  fi
+  if [[ ! -e /dev/ntsync ]]; then
+    warn "/dev/ntsync is missing (needs kernel 6.14+ with the ntsync module: sudo modprobe ntsync); Wine falls back to slower synchronisation"
+  fi
+}
