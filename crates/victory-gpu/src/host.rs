@@ -3276,6 +3276,11 @@ pub(crate) fn stall_section(out: &mut String) {
     }
     let _ = write!(
         out,
+        "; lines run because a held head was met by memory alone (VICTORY_HELD_POLL_MS): {} times",
+        HELD_POLLED.load(Ordering::Relaxed)
+    );
+    let _ = write!(
+        out,
         "; objects kept until a submission finishes: {}",
         match RETIRED.try_lock() {
             Ok(r) => r.len().to_string(),
@@ -3338,6 +3343,7 @@ fn late_helper() {
         tracing::warn!("no event for the thread that settles submissions sent ahead");
         return;
     };
+    let poll = held_poll();
     loop {
         let target = {
             let mut line = line();
@@ -3350,7 +3356,22 @@ fn late_helper() {
                 if !relay() && !line.line.is_empty() && !line.settling {
                     break Some(line.target);
                 }
-                line = LINE_MOVED.wait(line).unwrap_or_else(|e| e.into_inner());
+                let Some(poll) = poll else {
+                    line = LINE_MOVED.wait(line).unwrap_or_else(|e| e.into_inner());
+                    continue;
+                };
+                let (back, waited) = LINE_MOVED.wait_timeout(line, poll).unwrap_or_else(|e| e.into_inner());
+                line = back;
+                if waited.timed_out() && !line.poke {
+                    // A queue's line may stand at a value the title's own
+                    // processor wrote since ([`held_poll`]).
+                    drop(line);
+                    if crate::queue::head_free() {
+                        HELD_POLLED.fetch_add(1, Ordering::Relaxed);
+                        crate::queue::release_held(false);
+                    }
+                    line = self::line();
+                }
             }
         };
         let Some(target) = target else {
@@ -3379,6 +3400,31 @@ fn late_helper() {
         crate::queue::release_held(false);
     }
 }
+
+/// How often the helper thread of [`late`] looks whether a queue's line
+/// stands at a wait that memory meets now (`crate::queue::head_free`), and
+/// runs the lines if one does (`VICTORY_HELD_POLL_MS`, 2; 0: never, as
+/// before).
+///
+/// Why: lines are run when something of ours happens (a submission, a
+/// signal, a present, a landing). A value the title's own processor writes
+/// tells us nothing: on the console the card sees it at once, here the
+/// line stood until the title's next call. A title thread that then waits
+/// for a fence behind that line by reading the fence's memory (its
+/// `mwaitx` loop, which makes no call) stopped the title for good; two runs
+/// froze that way (frames stopped, the title's main thread spinning in its
+/// fence wait), and the stall report says whether a held head was met.
+fn held_poll() -> Option<std::time::Duration> {
+    static MS: OnceLock<u64> = OnceLock::new();
+    let ms = *MS.get_or_init(|| {
+        std::env::var("VICTORY_HELD_POLL_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(2, |n| n.min(1000))
+    });
+    (ms > 0).then(|| std::time::Duration::from_millis(ms))
+}
+
+/// Times the poll of [`held_poll`] found a line free to move and ran the
+/// lines, since the start (said in the stall report).
+pub(crate) static HELD_POLLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Starts the threads of [`late`], once: the one that settles flights when
 /// the card has run them and looks at what queues hold, and with [`relay`]
