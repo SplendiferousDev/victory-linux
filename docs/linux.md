@@ -248,14 +248,36 @@ choice is ambiguous, `VICTORY_AMBIENT_TINT=r,g,b`, `VICTORY_AMBIENT_SHADE=s,r,n,
 - The title waits for fences with AMD's `monitorx` / `mwaitx`, which Intel CPUs
   lack. Each one is an exception that the runtime emulates, and under Wine an
   exception costs far more than on Windows (a signal, then the exception
-  dispatch). So once a wait has lasted 200 us, an emulated `mwaitx` blocks on
-  the monitored address (`RtlWaitOnAddress`, a futex under Wine) for up to
-  1 ms. The runtime's fence and bottom-of-pipe writes wake it. Before this, a
-  long wait took about 250,000 exceptions a second. `VICTORY_MWAITX=spin`
-  brings back the old behaviour. `VICTORY_MWAITX_SPIN_US` and
-  `VICTORY_MWAITX_TIMEOUT_US` tune the two phases. The log's "console CPU
-  instructions, exceptions a second" line counts the blocks, their ends and
-  the wakes.
+  dispatch): a long wait takes about 250,000 exceptions a second.
+  `VICTORY_MWAITX=wait` (off by default, see below) makes an emulated
+  `mwaitx` block on the monitored address (`RtlWaitOnAddress`, a futex under
+  Wine) for up to 1 ms once a wait has lasted 200 us; the runtime's fence and
+  bottom-of-pipe writes wake it. `VICTORY_MWAITX=spin` (the default) spins as
+  before; `VICTORY_MWAITX=alt` does 20 s of each in turn for measuring. `VICTORY_MWAITX_SPIN_US` and `VICTORY_MWAITX_TIMEOUT_US` tune the
+  two phases. The log's "console CPU instructions, exceptions a second" line
+  counts the blocks, their ends and the wakes.
+
+## Safety defaults
+
+A GPU fault (an NVIDIA `Xid 13` or `Xid 31` MMU fault in the kernel log) can
+do more than end the run: once it hung the kernel driver, froze the desktop
+and left the game process unkillable until a reboot. Until these faults are
+understood, the features that were on when they became frequent are opt-in:
+
+| Switch | Default | To turn it on |
+|---|---|---|
+| merge of the title's bytes on the card | off | `VICTORY_MERGE_ON_CARD=1` (`alt`: 20 s on, 20 s off) |
+| blocking `mwaitx` emulation | off (spins) | `VICTORY_MWAITX=wait` |
+| plain (swappable) CPU sides of card copies | off, also with `VICTORY_TIGHT_MEMORY=1` | `VICTORY_CARD_TWIN_PLAIN=1` |
+
+The idle sweep (which lets go of host copies nothing uses) can no longer be
+switched off by mistake: `VICTORY_SWEEP=0` alone logs a warning and is
+ignored; it takes effect only together with `VICTORY_SWEEP_OFF_CONFIRM=1`.
+
+Also avoid `VKD3D_CONFIG=fault` in unattended runs: it makes vkd3d-proton
+wait for the device to be lost after a fault, which was part of the same
+hang. After every run, check the kernel log:
+`journalctl -k --since "-10 min" | grep Xid`.
 
 ## Measuring a run
 

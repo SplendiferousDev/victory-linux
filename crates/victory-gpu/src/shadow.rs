@@ -181,8 +181,11 @@ pub(crate) fn plain_held() -> ([u64; 3], [u64; 2]) {
 
 /// Whether the CPU side of a copy in the card's memory ([`cards`]) is plain
 /// memory of the process instead of a buffer in the PC's memory
-/// (`VICTORY_CARD_TWIN_PLAIN=1`; `VICTORY_TIGHT_MEMORY=1` turns it on unless
-/// it is set; off by default). Read when a copy is made.
+/// (`VICTORY_CARD_TWIN_PLAIN=1`; off by default, also with
+/// `VICTORY_TIGHT_MEMORY=1`, which turned it on before: a run with it and
+/// the newest card features faulted on the card and hung the host's
+/// graphics driver, so it is on only by choice until the faults are
+/// understood). Read when a copy is made.
 ///
 /// The CPU side only takes title memory and is compared with what the card
 /// wrote; nothing on the card reads it but the copy of its changed ranges
@@ -206,7 +209,7 @@ pub(crate) fn plain_twins() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = crate::tight::flag(std::env::var("VICTORY_CARD_TWIN_PLAIN").ok().as_deref(), crate::tight::on());
+        let on = std::env::var("VICTORY_CARD_TWIN_PLAIN").is_ok_and(|v| v == "1");
         if !on {
             return false;
         }
@@ -409,8 +412,13 @@ pub(crate) fn mask_runs(blocks: &MaskBlocks) -> Vec<(usize, usize)> {
 /// Whether the title's bytes put into a copy in the card's memory under
 /// flights' shader writes ([`Shadow::merge_under_writes`]) reach the card's
 /// side through one pass of ours on the card (`crate::host::CARD_MERGE`)
-/// and not as a copy for each changed run (`VICTORY_MERGE_ON_CARD`; on
-/// unless `0`).
+/// and not as a copy for each changed run (`VICTORY_MERGE_ON_CARD=1`; off
+/// by default).
+///
+/// Off by default since a run with it on faulted on the card (an MMU fault
+/// in the kernel's log) and the fault hung the host's graphics driver,
+/// taking the desktop with it; on again only by choice until the faults
+/// are understood.
 ///
 /// Each run was a copy of its own on the card and a hash pass of its own
 /// behind it, so a submission sent up 512 of them at most
@@ -460,13 +468,13 @@ pub(crate) fn merge_on_card() -> bool {
     }
 }
 
-/// [`merge_on_card`]'s switch: 0 off, 1 on, 2 in turn.
+/// [`merge_on_card`]'s switch: 0 off (unset), 1 on (`1`), 2 in turn (`alt`).
 fn merge_on_card_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("VICTORY_MERGE_ON_CARD").as_deref() {
-        Ok("0") => 0,
+        Ok("1") => 1,
         Ok("alt") => 2,
-        _ => 1,
+        _ => 0,
     })
 }
 
@@ -2157,6 +2165,16 @@ mod pool_tests {
 
 const NOT_WATCHED: u8 = 2;
 
+/// [`Shadow::update_free`]'s counter (fps41 round 8): refreshes that copied
+/// nothing are also looked at for being known unchanged before asking
+/// (`VICTORY_REFRESH_COUNT=1`; off by default: the look takes the
+/// journal's and the guards' locks once more a refresh).
+#[cfg(feature = "diagnostics")]
+fn refresh_count() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_COUNT").is_some_and(|v| v == "1"))
+}
+
 // Fixed-size equality compiles to two SIMD comparisons on Windows x64.
 // Only the first or last unequal chunk needs a byte-wise search.
 const DIFF_CHUNK: usize = 32;
@@ -3778,7 +3796,13 @@ unsafe impl Sync for Shadow {}
 impl Shadow {
     /// The host GPU address of a title address inside the buffer.
     pub(crate) fn gpu(&self, address: u64) -> u64 {
-        self.gpu + (address - self.start)
+        if self.offset_in(address).is_none() {
+            // A host address outside the copy: past its end, or (with the
+            // subtraction wrapping) far below it. The card would read
+            // memory that is not this copy's (`crate::gpuwatch`).
+            crate::gpuwatch::outside(address, self.start, self.len, self.gpu);
+        }
+        self.gpu.wrapping_add(address.wrapping_sub(self.start))
     }
 
     /// The title memory the copy is of: its start and length.
@@ -4648,9 +4672,33 @@ impl Shadow {
                 }
                 return 0;
             }
+            // The counter of fps41 round 8: copied nothing or something,
+            // and (with `VICTORY_REFRESH_COUNT=1`) whether it was known
+            // unchanged before asking. Looked at before the asking, which
+            // changes the guards and the journal.
+            #[cfg(feature = "diagnostics")]
+            let (asking, known) = (std::time::Instant::now(), refresh_count() && self.unchanged_known(from, to));
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
+                // With `VICTORY_DIRTY_4K`: the 4 KiB pages the kernel found, read before the copy's lock.
+                let subs = crate::watch::subpages(from, to);
+                let copied = self.copy_stale(from, to, now, &written, &subs);
+                #[cfg(feature = "diagnostics")]
+                {
+                    use crate::copystat::{C, add};
+                    let us = asking.elapsed().as_micros() as u64;
+                    if copied == 0 {
+                        add(C::RefreshNone, 1);
+                        add(C::RefreshNoneUs, us);
+                        if known {
+                            add(C::RefreshKnown, 1);
+                            add(C::RefreshKnownUs, us);
+                        }
+                    } else {
+                        add(C::RefreshSome, 1);
+                        add(C::RefreshSomeUs, us);
+                    }
+                }
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
                 {
@@ -4670,6 +4718,18 @@ impl Shadow {
         #[cfg(feature = "diagnostics")]
         crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
         to - from
+    }
+
+    /// Whether a refresh of `[from, to)` would copy nothing, known before
+    /// asking (`crate::watch::unchanged_known`); `false` for a copy not
+    /// known to be watched yet.
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    fn unchanged_known(&self, from: usize, to: usize) -> bool {
+        if self.watched.load(Ordering::Relaxed) != 1 {
+            return false;
+        }
+        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        crate::watch::unchanged_known(from, to, self.start as usize / PAGE, &copied)
     }
 
     /// Whether [`Shadow::update_free`] of `[from, to)` would copy nothing,
@@ -4745,11 +4805,19 @@ impl Shadow {
     /// Copies the pages of `[from, to)` written after their last copy
     /// (`written`: last writes by page, in page order; `now`: this
     /// asking), whole pages within the buffer.
-    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
+    ///
+    /// `subs` ([`crate::watch::subpages`], `VICTORY_DIRTY_4K`): for a page the kernel's write watch found written,
+    /// the 4 KiB pages its last asking found and the asking before that which found the page written. A copy that
+    /// took the page at or after that earlier asking copies only those 4 KiB pages: the others have not been written
+    /// since it took them (`crate::watch::dirty4k`).
+    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)], subs: &[(usize, u64, u64, u16)]) -> usize {
+        const KERNEL_PAGE: usize = 4096;
+        let narrow = !subs.is_empty() && crate::watch::dirty4k();
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
-        let (mut bytes, mut run) = (0, None);
+        let mut subs = subs.iter().peekable();
+        let (mut bytes, mut run): (_, Option<usize>) = (0, None);
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
             let write = match writes.peek() {
@@ -4759,13 +4827,46 @@ impl Shadow {
                 }
                 _ => 0,
             };
+            while subs.peek().is_some_and(|s| s.0 < page) {
+                subs.next();
+            }
+            // The page's entry, if it stands for the asking the refresh was given for the page.
+            let sub = subs.peek().filter(|s| s.0 == page && s.1 == write && write != 0).map(|s| (s.2, s.3));
             let at = &mut copied[page - base];
             if *at == 0 || write > *at {
+                let taken = *at;
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.
                 let (start, end) = (self.start as usize, (self.start + self.len) as usize);
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
                     *at = now;
+                }
+                // Only the 4 KiB pages written since the copy took the page: the asking before the last one that
+                // found it written came no later than the copy's taking.
+                let found = sub.filter(|&(before, _)| taken != 0 && before <= taken).map(|(_, bits)| bits);
+                if crate::watch::dirty4k_kept() {
+                    crate::watch::dirty4k_count(found, narrow && found.is_some());
+                }
+                if narrow && let Some(bits) = found {
+                    if let Some(first) = run.take() {
+                        bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                    }
+                    let mut k = 0;
+                    while k < PAGE / KERNEL_PAGE {
+                        if bits & (1 << k) == 0 {
+                            k += 1;
+                            continue;
+                        }
+                        let a = k;
+                        while k < PAGE / KERNEL_PAGE && bits & (1 << k) != 0 {
+                            k += 1;
+                        }
+                        let (lo, hi) = ((page * PAGE + a * KERNEL_PAGE).max(from), (page * PAGE + k * KERNEL_PAGE).min(to));
+                        if lo < hi {
+                            bytes += self.copy(lo, hi);
+                        }
+                    }
+                    continue;
                 }
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {
