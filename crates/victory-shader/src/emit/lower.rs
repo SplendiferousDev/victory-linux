@@ -914,7 +914,6 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
             lds_flags::why(p, &blocks);
             return None;
         }
-        }
     }
     let mut meet = vec![(false, false); n];
     for b in 0..n {
