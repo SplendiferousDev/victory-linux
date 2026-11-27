@@ -263,6 +263,8 @@ pub(crate) fn start() {
                     if fault.time.is_some_and(|t| t < started - 1.0) {
                         continue;
                     }
+                    // Every line with an address (one event may name two).
+                    crate::faultaddr::say(&fault.text);
                     if !events.is_new(&fault, unix_now()) {
                         continue;
                     }
