@@ -8,10 +8,14 @@
 //! Ported from the Belobug fork's list-side half of dd799aad (credit in the
 //! commit); its submission-side half is not needed here, which indexes the
 //! declared ranges by copy already (`step_index`).
+//!
+//! The base fork now declares each range once per list always (dropping a
+//! copy's entries when it is refreshed again); here that is the default, and
+//! `VICTORY_GPU_WRITE_ONCE=0` declares per draw as before (`alt`: in turn).
 
 use super::{Deferred, HostList, Step};
 
-static ONCE: crate::alt::Switch = crate::alt::Switch::new(
+static ONCE: crate::alt::Switch = crate::alt::Switch::new_on(
     "VICTORY_GPU_WRITE_ONCE",
     "a range shaders write is declared once per list until the title next writes memory",
 );

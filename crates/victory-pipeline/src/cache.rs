@@ -72,9 +72,12 @@ impl Cache {
     }
 }
 
+/// Names the staging files: the process id and a counter, which a killed
+/// process can leave behind for a later one to meet ([`create_tempfile_in`]).
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 fn tempfile_in(dir: &Path) -> io::Result<(PathBuf, File)> {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    create_tempfile_in(dir, &COUNTER)
+    create_tempfile_in(dir, &TEMP_COUNTER)
 }
 
 fn create_tempfile_in(dir: &Path, counter: &AtomicU64) -> io::Result<(PathBuf, File)> {
@@ -104,6 +107,13 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// The tests share the process-wide staging-file counter (and so the
+    /// name the next file gets): one at a time keeps them predictable.
+    fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+        static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        ONE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     struct Upper {
         version: u32,
         runs: AtomicUsize,
@@ -124,6 +134,7 @@ mod tests {
 
     #[test]
     fn converts_once_then_hits() {
+        let _one = one_at_a_time();
         let tmp = tempfile::tempdir().unwrap();
         let cache = Cache::open(tmp.path().join("cache")).unwrap();
         let conv = Upper {
@@ -139,6 +150,7 @@ mod tests {
 
     #[test]
     fn failed_publication_removes_the_staging_file() {
+        let _one = one_at_a_time();
         let tmp = tempfile::tempdir().unwrap();
         let cache = Cache::open(tmp.path().join("cache")).unwrap();
         let conv = Upper {
@@ -154,6 +166,33 @@ mod tests {
             std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
             1
         );
+    }
+
+    /// A staging file a killed process left behind - the next process has
+    /// the same id and counter, which is how the name repeats - does not
+    /// fail the conversion: the next name is taken and the stale file is
+    /// left as it was.
+    #[test]
+    fn a_stale_staging_file_does_not_fail_a_conversion() {
+        let _one = one_at_a_time();
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Cache::open(tmp.path().join("cache")).unwrap();
+        let conv = Upper {
+            version: 1,
+            runs: AtomicUsize::new(0),
+        };
+        let path = cache.path_for(&CacheKey::new(&conv, b"abc"));
+        let dir = path.parent().unwrap();
+        std::fs::create_dir_all(dir).unwrap();
+        // The name the next staging file gets ([`tempfile_in`]): write a
+        // half-finished one there first, as a killed process would leave it.
+        let stale = dir.join(format!(".tmp-{}-0", std::process::id()));
+        TEMP_COUNTER.store(0, Ordering::Relaxed);
+        std::fs::write(&stale, b"half-written").unwrap();
+        let converted = cache.get_or_convert(&conv, b"abc").unwrap();
+        assert_eq!(converted, path);
+        assert_eq!(std::fs::read(&converted).unwrap(), b"ABC");
+        assert_eq!(std::fs::read(&stale).unwrap(), b"half-written", "the stale staging file is left alone");
     }
 
     #[test]
@@ -217,6 +256,7 @@ mod tests {
 
     #[test]
     fn version_bump_invalidates() {
+        let _one = one_at_a_time();
         let v1 = Upper {
             version: 1,
             runs: AtomicUsize::new(0),
@@ -230,6 +270,7 @@ mod tests {
 
     #[test]
     fn refuses_cache_inside_repo() {
+        let _one = one_at_a_time();
         let inside = victory_core::policy::build_path(env!("CARGO_MANIFEST_DIR")).join("cache");
         assert!(Cache::open(inside).is_err());
     }

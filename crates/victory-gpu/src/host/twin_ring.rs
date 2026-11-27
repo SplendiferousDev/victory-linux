@@ -109,7 +109,7 @@ impl TwinRing {
                     )));
                 }
                 RingPlace::Take => {
-                    let chunk = take_chunk(host, SCRATCH_CHUNK).ok_or(())?;
+                    let (chunk, _) = take_chunk(host, SCRATCH_CHUNK).ok_or(())?;
                     let now =
                         TWIN_RING[0].fetch_add(SCRATCH_CHUNK, Ordering::Relaxed) + SCRATCH_CHUNK;
                     TWIN_RING[1].fetch_max(now, Ordering::Relaxed);

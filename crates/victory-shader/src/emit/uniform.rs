@@ -37,7 +37,7 @@ pub(super) fn lane_uniform(
         };
         // Blocks every lane of a console wave reaches together: `all`, or reached only past
         // branches on alike conditions.
-        let wave_all: Vec<bool> = match lane_regions(st) {
+        let wave_all: Vec<bool> = match lane_regions(st, false) {
             Some(regions) => {
                 let mut w = vec![true; st.exits.len()];
                 for (d, region) in regions {

@@ -16,6 +16,7 @@
 //! runs only once and whose pipeline takes longer is lost.
 
 use std::collections::VecDeque;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -32,14 +33,24 @@ use super::host::{GraphicsState, HostPipeline, TargetFormats};
 /// two-layer vehicle wheel material, 57a3fad03cac36af and d5b9c94a30d7cf28;
 /// gfx41). Unlike `VICTORY_SKIP_PIPELINES`, in release builds too.
 fn denied(shaders: &[Arc<Shader>]) -> Option<&str> {
-    static LIST: OnceLock<Vec<String>> = OnceLock::new();
+    static LIST: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
     let list = LIST.get_or_init(|| {
-        std::env::var("VICTORY_DENY_PIPELINES")
+        // `VICTORY_DENY_PIPELINES_FILE=<path>`: more hashes, any 16 hex
+        // digits in the file (one a line, say), with the list's own.
+        let file = std::env::var_os("VICTORY_DENY_PIPELINES_FILE")
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .unwrap_or_default();
+        let list: std::collections::HashSet<String> = std::env::var("VICTORY_DENY_PIPELINES")
             .unwrap_or_default()
-            .split(',')
+            .split(|c: char| !c.is_ascii_hexdigit())
+            .chain(file.split(|c: char| !c.is_ascii_hexdigit()))
             .map(|h| h.trim().to_ascii_lowercase())
-            .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
-            .collect()
+            .filter(|h| h.len() == 16)
+            .collect();
+        if !list.is_empty() {
+            tracing::info!(pipelines = list.len(), "shaders whose pipelines are not built (VICTORY_DENY_PIPELINES / _FILE)");
+        }
+        list
     });
     if list.is_empty() {
         return None;
@@ -106,12 +117,25 @@ impl Pending {
     }
 
     fn make(&self) {
-        self.made.get_or_init(|| {
+        self.make_with(|| {
             if let Some(hash) = denied(&self.shaders) {
                 tracing::warn!(hash, shaders = ?self.shaders, "pipeline not built: its shader is in VICTORY_DENY_PIPELINES");
                 return None;
             }
             HostPipeline::new(&self.shaders, self.graphics.as_deref())
+        });
+    }
+
+    fn make_with(&self, build: impl FnOnce() -> Option<HostPipeline>) {
+        self.made.get_or_init(|| {
+            // A failed translation must complete this queue entry and wake its waiters.
+            match catch_unwind(AssertUnwindSafe(build)) {
+                Ok(pipeline) => pipeline,
+                Err(_) => {
+                    tracing::warn!(shaders = ?self.shaders, "host pipeline build panicked");
+                    None
+                }
+            }
         });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -179,7 +203,15 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() && !p.dead.load(Ordering::Relaxed) {
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        // A compute pipeline in the first 600 frames (the title's one-shot
+        // world and lighting set-up passes) or with `compute_waits`: made
+        // here, or waited for while a worker makes it, instead of dropping
+        // its dispatch after the frame's budget. `make` keeps its panic guard.
+        if p.graphics.is_none() && (compute_waits() || crate::frame::current() < 600) {
+            p.make();
+        } else {
+            wait(p, crate::frame::current());
+        }
     }
     let made = p.made.get()?.as_ref();
     // The first time the made pipeline goes to a draw or dispatch: noted
@@ -191,6 +223,26 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         crate::host::first_use(&host.name);
     }
     made
+}
+
+/// Whether a dispatch waits for its compute pipeline until it is made,
+/// whatever the frame's budget ([`wait_budget`]); a draw still waits within
+/// the budget and is dropped while its pipeline is not there.
+///
+/// A dropped draw is drawn again in the next frame. A dropped dispatch may
+/// not be: the title runs some compute passes once, when a scene changes
+/// (a buffer reset or cleared), and what they leave is read for as long as
+/// the scene lasts. In the prison corridor a compute program met for the
+/// first time took 4.4 s to make on a 16 GB machine; its one dispatch was
+/// dropped after the half second of budget, and the windows of the room
+/// before stayed blended over the whole picture for minutes (run 195).
+/// A wait of seconds once (the pipeline library has it on the next run)
+/// against a picture wrong until the scene ends.
+/// On by default; `VICTORY_PIPELINE_COMPUTE_WAIT=0`: within the budget, as
+/// before.
+fn compute_waits() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_COMPUTE_WAIT").is_none_or(|v| v != "0"))
 }
 
 /// Pipelines made again for the formats bound at a draw, since the start.
@@ -472,11 +524,12 @@ fn next() -> Arc<Pending> {
     }
 }
 
-/// Starts the workers (half the logical processors, 2 to 8; or
-/// `VICTORY_PIPELINE_WORKERS`, 1 to 16) on first use, and the thread that
-/// watches them ([`watch`]). Fewer workers make fewer pipelines at once:
-/// each compile holds its own working memory in the host's compiler, which
-/// counts on a PC that is out of memory in the world (16 GB).
+/// Starts the workers (the logical processors less 4, 4 to 14: 6 drained a
+/// cold library 35 % slower than 8 in run 353; or `VICTORY_PIPELINE_WORKERS`,
+/// 1 to 16) on first use, at normal priority, and the thread that watches
+/// them ([`watch`]). Fewer workers make fewer pipelines at once: each
+/// compile holds its own working memory in the host's compiler, which counts
+/// on a PC that is short of memory in the world.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
@@ -484,7 +537,7 @@ fn workers() -> bool {
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .map(|n| n.clamp(1, 16))
-            .unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8)));
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get().saturating_sub(4).clamp(4, 14)));
         tracing::info!(count, "host pipeline workers");
         let workers: Vec<Worker> = (0..count).filter_map(Worker::spawn).collect();
         let running = !workers.is_empty();
@@ -514,12 +567,6 @@ impl Worker {
         let spawned = std::thread::Builder::new()
             .name(format!("victory-pipelines-{index}"))
             .spawn(move || {
-                // Below the title's own threads (loading, recording).
-                // SAFETY: a plain call on our own thread.
-                unsafe {
-                    use windows::Win32::System::Threading::*;
-                    let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-                }
                 loop {
                     let p = next();
                     *mine.lock().unwrap_or_else(|e| e.into_inner()) = Some((p.clone(), Instant::now()));
@@ -680,6 +727,24 @@ fn drained() {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_panicking_pipeline_is_refused_and_the_worker_continues() {
+        let bad = Arc::new(Pending::new(Vec::new(), None));
+        let good = Arc::new(Pending::new(Vec::new(), None));
+        let failed = bad.clone();
+        let next = good.clone();
+        let worker = std::thread::spawn(move || {
+            failed.make_with(|| panic!("synthetic pipeline build panic"));
+            next.make_with(|| None);
+        });
+
+        worker.join().expect("the pipeline worker should survive");
+        assert!(matches!(bad.made.get(), Some(None)));
+        assert!(matches!(good.made.get(), Some(None)));
+
+        bad.make_with(|| panic!("the refused pipeline should stay complete"));
+    }
+
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).
     #[test]
@@ -727,8 +792,10 @@ mod tests {
         let p = Arc::new(p);
 
         assert!(!super::super::library::wanted_early(&p.key));
+        // A compute pipeline is made at once when dispatches wait for theirs
+        // (#1312, the default; it has no shaders here, so nothing comes of
+        // it); either way it is noted for the next launch.
         assert!(ready(&p).is_none());
-        assert!(p.made.get().is_none());
         assert!(super::super::library::wanted_early(&p.key));
     }
 
