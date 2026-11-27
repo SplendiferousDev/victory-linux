@@ -37,6 +37,13 @@ Usage: run.sh --game <folder> --exe <file name> [options]
                        a killed run left there. Needs free disk space of about
                        the pool's size (6-7 GB). Off unless given; see
                        docs/linux.md
+  --no-fault-watch     do not follow the kernel's log for faults of the card.
+                       By default fault-watch.sh appends each NVIDIA Xid and
+                       amdgpu reset/timeout/page-fault line to <log>.faults
+                       and the layer reads it (VICTORY_HOST_FAULT_FILE), so
+                       the paths that switch off at the driver's first error
+                       do so under Wine too. Skipped when the journal cannot
+                       be read or VICTORY_HOST_FAULT_FILE is already set
 
 Memory guard (needs systemd; the title uses more than 10 GB, and a limit
 stops it from taking the whole desktop down when memory runs out):
@@ -52,7 +59,7 @@ USAGE
 
 game= exe= console=series-x diag=0 proton=${VICTORY_PROTON:-} prefix=
 wserver= stock=0 stockwine=0 measure= config= name=$(date +%Y%m%d-%H%M%S) scope=0 mhigh= mmax= swapmax=
-pool_dir=
+pool_dir= fault_watch=1
 
 while (($#)); do
   case $1 in
@@ -69,6 +76,7 @@ while (($#)); do
     --stock-wine) stockwine=1; stock=1; shift ;;
     --measure) measure=${2:?--measure needs a file}; shift 2 ;;
     --pool-dir) pool_dir=${2:?--pool-dir needs a directory}; shift 2 ;;
+    --no-fault-watch) fault_watch=0; shift ;;
     --scope) scope=1; shift ;;
     --memory-high) mhigh=${2:?}; shift 2 ;;
     --memory-max) mmax=${2:?}; shift 2 ;;
@@ -279,11 +287,30 @@ if ((scope)); then
 fi
 
 cd "$run_dir"
+sampler= watcher=
+stop_helpers() {
+  [[ -z $sampler ]] || kill "$sampler" 2>/dev/null || true
+  # The watcher runs in a process group of its own (journalctl | grep | loop).
+  [[ -z $watcher ]] || kill -- "-$watcher" 2>/dev/null || true
+}
+trap stop_helpers EXIT
 if [[ -n $measure ]]; then
   "$here/measure.sh" "$measure" $$ &
   sampler=$!
-  trap 'kill "$sampler" 2>/dev/null || true' EXIT
   echo "measure:  $measure"
+fi
+if ((fault_watch)) && [[ -z ${VICTORY_HOST_FAULT_FILE:-} ]]; then
+  if command -v journalctl >/dev/null && command -v setsid >/dev/null && journalctl -k -n 1 -q >/dev/null 2>&1; then
+    faults=$log_dir/$name.faults
+    : >"$faults"
+    setsid "$here/fault-watch.sh" "$faults" &
+    watcher=$!
+    export VICTORY_HOST_FAULT_FILE
+    VICTORY_HOST_FAULT_FILE=$(winpath "$faults")
+    echo "faults:   $faults (the card's faults from the kernel's log)"
+  else
+    warn "the kernel's log cannot be read (journalctl -k): the card's faults are not watched"
+  fi
 fi
 set +e
 "${cmd[@]}" 2>&1 | tee "$log"

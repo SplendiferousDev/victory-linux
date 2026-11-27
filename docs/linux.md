@@ -212,7 +212,8 @@ choice is ambiguous, `VICTORY_AMBIENT_TINT=r,g,b`, `VICTORY_AMBIENT_SHADE=s,r,n,
 - **No DXIL hash check.** A Windows driver refuses a DXIL container with a
   wrong hash; vkd3d-proton accepts it.
 - **No driver event watch.** The Windows event log that the runtime reads for
-  driver resets does not exist under Wine.
+  driver resets does not exist under Wine; the kernel's log stands in for it
+  (see "The card's faults from the kernel's log").
 - **Descriptor heaps are capped at 1,000,000 views** by vkd3d-proton. The title
   asks for 1,245,184. What this costs is not measured yet.
 - **Wave64 compute is refused on NVIDIA.** Some compute pipelines need 64-lane
@@ -278,6 +279,29 @@ Also avoid `VKD3D_CONFIG=fault` in unattended runs: it makes vkd3d-proton
 wait for the device to be lost after a fault, which was part of the same
 hang. After every run, check the kernel log:
 `journalctl -k --since "-10 min" | grep Xid`.
+
+### The card's faults from the kernel's log
+
+On Windows the layer subscribes to the display driver's entries in the
+system's event log, and the first one switches off the paths under suspicion
+for the rest of the run (today: the indirect draw windows of
+`VICTORY_INDIRECT_WINDOW=1`). Under Wine the driver reports to the Linux
+kernel instead, so `run.sh` starts `scripts/linux/fault-watch.sh` beside the
+title. It follows `journalctl -k -f` (no root, but the user must be allowed
+to read the system journal, e.g. as a member of `wheel`, `adm` or
+`systemd-journal`) and appends each NVIDIA `NVRM: Xid` line and each amdgpu
+ring timeout, `GPU reset begin!` and page fault line to `<log>.faults` next
+to the log. The layer gets that file as a Windows path in
+`VICTORY_HOST_FAULT_FILE`, looks at its size every 250 ms, takes the lines of
+one fault (same vendor and kind within 2 s) as one event, logs a `WARN` line
+per event and treats it as a driver error: the same counter and switch as the
+event log. Lines the file held when the layer started, or stamped before it,
+are ignored. Faults of any process on the card count, as on Windows.
+
+The watcher costs nothing measurable (one idle `journalctl`). `--no-fault-watch`
+turns it off; with `VICTORY_HOST_FAULT_FILE` already set, `run.sh` starts no
+watcher and the layer reads the given file (run `fault-watch.sh <file>`
+yourself). Without journal access `run.sh` warns and runs without it.
 
 ## Measuring a run
 

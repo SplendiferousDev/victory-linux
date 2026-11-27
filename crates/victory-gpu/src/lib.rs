@@ -37,6 +37,8 @@ pub mod device;
 #[cfg(windows)]
 mod drvwatch;
 #[cfg(windows)]
+mod hostfault;
+#[cfg(windows)]
 mod fpsbox;
 #[cfg(windows)]
 mod stats;

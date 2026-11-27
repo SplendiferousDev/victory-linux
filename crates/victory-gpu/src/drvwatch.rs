@@ -16,6 +16,9 @@
 //! slower frame from then on, and not the card.
 //!
 //! On by default; `VICTORY_DRIVER_WATCH=0` subscribes to nothing.
+//!
+//! Under Wine there is no such log; the host's kernel reports the card's
+//! faults instead, and `crate::hostfault` feeds them here.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
@@ -39,10 +42,18 @@ pub(crate) fn errors() -> u64 {
     ERRORS.load(Relaxed)
 }
 
+/// Counts an error of the card's driver and trips the switch; whether it
+/// was the first. Also fed by the host's kernel under Wine
+/// (`crate::hostfault`), which logs its own line.
+pub(crate) fn report() -> bool {
+    ERRORS.fetch_add(1, Relaxed);
+    !TRIPPED.swap(true, Relaxed)
+}
+
 /// An entry of a display driver was recorded.
 fn seen() {
-    let n = ERRORS.fetch_add(1, Relaxed) + 1;
-    let first = !TRIPPED.swap(true, Relaxed);
+    let first = report();
+    let n = errors();
     tracing::error!(
         n,
         "the graphics driver reported an error to the system's event log{}",
