@@ -1573,6 +1573,21 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     if !view_guard() {
         return;
     }
+    if ONE_LOOK.on() {
+        // The same blocks and views, from one look at the views.
+        for (block, shown) in crate::inplace::shared_pages_of_blocks(from, to, MANY_VIEWS) {
+            #[cfg(feature = "diagnostics")]
+            ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            for alias in shown {
+                let alias = alias / BLOCK;
+                g.aliased.insert(alias);
+                if alias != block {
+                    protect_alias(g, alias);
+                }
+            }
+        }
+        return;
+    }
     for (base, bytes) in crate::inplace::views_between(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK)) {
         let first = (base / BLOCK).max(from);
         let last = (base.saturating_add(bytes).div_ceil(BLOCK)).min(to);
@@ -1596,6 +1611,15 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
         }
     }
 }
+
+/// [`protect`] finds the other views of a run of blocks with one look at
+/// the views, under the guards' lock (`crate::inplace::shared_pages_of_blocks`).
+static ONE_LOOK: crate::alt::Switch = crate::alt::Switch::new(
+    "VICTORY_GUARD_ONE_LOOK",
+    "the guards look at the views once for a run of blocks, and pages with one view make no list",
+);
+// (`shared_pages_of_blocks` counts in 64 KiB pages.)
+const _: () = assert!(BLOCK == 64 << 10);
 
 /// Views of one page past which its views are not guarded together.
 pub(crate) const MANY_VIEWS: usize = 64;
