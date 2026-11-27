@@ -93,6 +93,12 @@ fn step(now: u64, last_present: u64, threshold_us: u64, reported: u64, reported_
     }
 }
 
+/// Presents of the title since the start.
+#[cfg(windows)]
+pub(crate) fn presents() -> u64 {
+    PRESENTS.load(Ordering::Relaxed)
+}
+
 /// A present of the title (called once per present): starts the watch on the
 /// first one.
 #[cfg(windows)]

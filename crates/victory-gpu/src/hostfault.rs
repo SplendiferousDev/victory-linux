@@ -202,6 +202,45 @@ fn unix_now() -> f64 {
         .map_or(0.0, |d| d.as_secs_f64())
 }
 
+/// Whether `fault` says the kernel driver's own records of the card's
+/// address space are broken: a mapping it could not insert, or an
+/// assertion in its address-space code. In the driver's source
+/// (`mapping_list.c`, `intermapRegisterDmaMapping`) a failed insert also
+/// takes the whole address range out of the device's table although other
+/// mappings still live in it; once, the process then spun inside the driver
+/// with its lock held and the desktop hung until a reboot. A run stopped
+/// within seconds of the same lines left the machine healthy.
+pub(crate) fn breaks_driver(fault: &Fault) -> bool {
+    fault.vendor == Vendor::Nvidia
+        && (fault.kind == "mapping failed" || (fault.kind == "driver assertion" && fault.text.contains("gpu_vaspace.c")))
+}
+
+/// Whether the run ends at once on such a fault ([`breaks_driver`];
+/// `VICTORY_DRIVER_BROKEN_EXIT=0` keeps running; on by default, and only
+/// with `VICTORY_HOST_FAULT_FILE`).
+fn broken_exit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DRIVER_BROKEN_EXIT").is_none_or(|v| v != "0"))
+}
+
+/// Ends the process without its exit handlers (they would talk to the
+/// driver again: give the card's objects back, wait for its fences), so the
+/// kernel frees what the process held before anything else is asked of it.
+fn end_now(fault: &Fault) -> ! {
+    tracing::error!(
+        "the card's kernel driver reported its address-space records broken ({}): the run ends now, before more is asked \
+         of it (VICTORY_DRIVER_BROKEN_EXIT=0 keeps running)",
+        fault.kind
+    );
+    // Time for the log line to reach its file.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    // SAFETY: ends this process; the pseudo handle needs no closing.
+    unsafe {
+        windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), 0xDEAD);
+    }
+    std::process::abort()
+}
+
 /// Starts following `VICTORY_HOST_FAULT_FILE`, once, if it is set.
 pub(crate) fn start() {
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -235,6 +274,9 @@ pub(crate) fn start() {
                         fault.text.chars().take(200).collect::<String>(),
                         if first { "; from now on the paths under suspicion are off for this run" } else { "" }
                     );
+                    if breaks_driver(&fault) && broken_exit() {
+                        end_now(&fault);
+                    }
                 }
             }
         });
@@ -267,6 +309,12 @@ mod tests {
         let a = parse("box kernel: NVRM: GPU0 nvAssertFailedNoLog: Assertion failed: NV_OK == status @ gpu_vaspace.c:4155").unwrap();
         assert_eq!(a.kind, "driver assertion");
         assert!(a.text.starts_with("NVRM: GPU0"));
+        // Both break the driver's address-space records; an Xid or another
+        // assertion does not.
+        assert!(breaks_driver(&m) && breaks_driver(&a));
+        assert!(!breaks_driver(&f));
+        let other = parse("NVRM: GPU0 nvAssertFailedNoLog: Assertion failed: x @ kern_fifo.c:10").unwrap();
+        assert!(!breaks_driver(&other));
         assert_eq!(f.time, Some(1764100000.25));
         assert!(f.text.starts_with("NVRM: Xid"));
         // Raw journal line with a host name, no stamp of ours.
