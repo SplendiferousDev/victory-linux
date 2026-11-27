@@ -21,6 +21,7 @@ use windows::core::{Interface, PCWSTR, w};
 mod card_merge;
 mod card_ports;
 mod gpu_once;
+mod pooled_staging;
 mod slot_wait;
 mod stall_report;
 mod twin_ring;
