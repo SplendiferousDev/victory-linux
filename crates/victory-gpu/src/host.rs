@@ -19,6 +19,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
 mod card_merge;
+mod card_ports;
 mod slot_wait;
 mod stall_report;
 mod twin_ring;
@@ -5592,10 +5593,12 @@ impl Host {
                     // the declared pieces and flags those whose hash is another.
                     let hashes = |list: &ID3D12GraphicsCommandList, group: &[Synced]| {
                         // (a copy promoted the buffer to a copy destination;
-                        // the merge left it an unordered-access one)
+                        // the merge left it an unordered-access one; once a buffer, `card_ports::first_of_buffer`)
+                        let mut seen = Vec::new();
                         let moves: Vec<_> = group
                             .iter()
                             .filter(|w| w.before.is_some() && (w.merged.is_some() || !w.ranges.is_empty()))
+                            .filter(|w| card_ports::first_of_buffer(&mut seen, &w.shadow.buffer))
                             .map(|w| {
                                 let from = if w.merged.is_some() {
                                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS
