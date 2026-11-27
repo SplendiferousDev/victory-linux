@@ -70,6 +70,7 @@ mod indirect;
 mod inplace;
 mod launch;
 pub mod list;
+mod lockmeter;
 pub mod object;
 #[cfg(windows)]
 mod over;
@@ -115,6 +116,8 @@ mod threeway;
 mod patchspan;
 #[cfg(windows)]
 mod shadow;
+#[cfg(windows)]
+mod shared_lookups;
 #[cfg(windows)]
 mod stretch;
 #[cfg(windows)]

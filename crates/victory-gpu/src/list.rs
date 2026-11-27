@@ -147,9 +147,10 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     let timed = victory_core::timeline::on().then(std::time::Instant::now);
+    crate::lockmeter::set_class(crate::lockmeter::RECORDER);
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
-    f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
+    f(list, &mut crate::lockmeter::lock("li:state", &state));
     if let Some(timed) = timed {
         victory_core::timeline::recorded(timed.elapsed().as_nanos() as u64);
     }
@@ -171,7 +172,7 @@ pub(crate) fn tables_done(lists: &[This]) {
         // SAFETY: the title passes our lists.
         let list = unsafe { &*this.cast::<List>() };
         if list.earlier.is_empty() {
-            list.state.lock().unwrap_or_else(|e| e.into_inner()).tables_done();
+            crate::lockmeter::lock("li:state", &list.state).tables_done();
         }
     }
 }
@@ -253,7 +254,7 @@ fn pools() -> bool {
 #[cfg(windows)]
 pub(crate) fn fresh_list() -> Option<crate::host::HostList> {
     let idle = {
-        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut idle = crate::lockmeter::lock("li:IDLE", &IDLE);
         let taken = idle.0.pop();
         if let Some(Idle(_, bytes)) = &taken {
             idle.1 -= bytes;
@@ -279,14 +280,14 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        if !ran.contains(&i) || crate::lockmeter::lock("li:IDLE", &IDLE).0.len() >= IDLE_MOST.0 {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
         // goes, its allocators stay.
         host.reset();
         let bytes = host.scratch_kept();
-        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut idle = crate::lockmeter::lock("li:IDLE", &IDLE);
         if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
             idle.0.push(Idle(host, bytes));
             idle.1 += bytes;
@@ -417,8 +418,8 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
         };
         let earlier = std::mem::take(&mut list.earlier);
         let gate = std::mem::take(&mut list.gate);
-        let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
-        let state = std::mem::take(&mut *list.state.lock().unwrap_or_else(|e| e.into_inner()));
+        let uploads = std::mem::take(&mut *crate::lockmeter::lock("li:uploads", &list.uploads));
+        let state = std::mem::take(&mut *crate::lockmeter::lock("li:state", &list.state));
         let single = earlier.is_empty() && gate.is_empty();
         let mut pieces: Vec<(Vec<ValueWait>, Detached)> = earlier
             .into_iter()
@@ -489,9 +490,9 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
                 continue;
             };
             let uploads =
-                std::mem::take(&mut *(*list).uploads.lock().unwrap_or_else(|e| e.into_inner()));
+                std::mem::take(&mut *crate::lockmeter::lock("li:uploads", &(*list).uploads));
             let state =
-                std::mem::take(&mut *(*list).state.lock().unwrap_or_else(|e| e.into_inner()));
+                std::mem::take(&mut *crate::lockmeter::lock("li:state", &(*list).state));
             (host, uploads, state)
         };
         order.push(taken.len());
@@ -652,7 +653,7 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     // Every submission of the list has run (submissions are waited for).
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
-    uploads.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    crate::lockmeter::lock("li:uploads", &uploads).clear();
     // The parts of a recording that was cut and never submitted go with it
     // (a submission takes the parts it runs).
     #[cfg(windows)]
@@ -1607,7 +1608,7 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
     // Moving the vector keeps its heap block where it is.
-    uploads.lock().unwrap_or_else(|e| e.into_inner()).push(block);
+    crate::lockmeter::lock("li:uploads", &uploads).push(block);
     at
 }
 
@@ -1899,7 +1900,7 @@ extern "system" fn execute_indirect(
     }
     INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
-    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut seen = crate::lockmeter::lock("li:SEEN", &SEEN);
     if !seen.contains(&(signature as usize)) {
         seen.push(signature as usize);
         tracing::info!(
@@ -2034,7 +2035,7 @@ static VALUE_WAITS: std::sync::Mutex<Vec<(usize, ValueWait)>> = std::sync::Mutex
 /// shortcut: a wait holds its whole list (and submission) back, not only
 /// the commands after it.
 pub(crate) fn unmet_waits(lists: &[This]) -> Vec<ValueWait> {
-    let mut waits = VALUE_WAITS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut waits = crate::lockmeter::lock("li:VALUE_WAITS", &VALUE_WAITS);
     let mut unmet = Vec::new();
     waits.retain(|&(list, wait)| {
         if !lists.iter().any(|&l| l as usize == list) {
@@ -2052,7 +2053,7 @@ pub(crate) fn unmet_waits(lists: &[This]) -> Vec<ValueWait> {
 /// met or not, at the list's first place in the submission.
 #[cfg(windows)]
 pub(crate) fn waits_by_list(lists: &[This]) -> Vec<Vec<ValueWait>> {
-    let mut waits = VALUE_WAITS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut waits = crate::lockmeter::lock("li:VALUE_WAITS", &VALUE_WAITS);
     let mut by = vec![Vec::new(); lists.len()];
     waits.retain(|&(list, wait)| {
         match lists.iter().position(|&l| l as usize == list) {

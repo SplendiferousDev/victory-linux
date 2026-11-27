@@ -27,7 +27,7 @@ impl HostList {
             let (buffer, data) = self.upload(host, size)?;
             return Some((buffer, 0, data));
         }
-        let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+        let mut s = crate::lockmeter::lock("h_:scratch", &self.scratch);
         let len = size.max(1).next_multiple_of(256);
         // As `scratch`: the chunk in use while the bytes fit in what is left
         // of it (from a placement boundary), else the next one.

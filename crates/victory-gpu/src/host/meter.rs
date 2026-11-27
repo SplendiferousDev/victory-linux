@@ -331,13 +331,13 @@ impl Meter {
         // presenting never waits; it takes the newest text when free.
         static PENDING: Mutex<Option<(usize, Vec<u16>)>> = Mutex::new(None);
         static SETTER: std::sync::Once = std::sync::Once::new();
-        *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some((hwnd.0 as usize, text));
+        *crate::lockmeter::lock("h_:PENDING", &PENDING) = Some((hwnd.0 as usize, text));
         SETTER.call_once(|| {
             let _ = std::thread::Builder::new()
                 .name("victory-caption".into())
                 .spawn(|| {
                     loop {
-                        let next = PENDING.lock().unwrap_or_else(|e| e.into_inner()).take();
+                        let next = crate::lockmeter::lock("h_:PENDING", &PENDING).take();
                         match next {
                             // SAFETY: a window handle and a NUL-terminated text.
                             Some((hwnd, text)) => unsafe {

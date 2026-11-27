@@ -107,7 +107,7 @@ pub(crate) fn kept() -> [u64; 7] {
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
-    let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut shaders = crate::lockmeter::lock("pi:SHADERS", &SHADERS);
     shaders
         .get_or_insert_with(HashMap::new)
         .entry(*full.as_bytes())
@@ -387,7 +387,7 @@ pub(crate) fn walk_held(this: This) -> bool {
         return false;
     }
     // (Asked only for the few programs that walk: the lock is the builder's.)
-    if BUILDER.lock().unwrap_or_else(|e| e.into_inner()).whole {
+    if crate::lockmeter::lock("pi:BUILDER", &BUILDER).whole {
         return false;
     }
     if WALKS_HELD.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
@@ -411,7 +411,7 @@ pub(crate) fn is_builder(this: This) -> bool {
 /// A stage of the builder was dropped after all: none runs from here on.
 #[cfg(windows)]
 pub(crate) fn builder_off(why: &'static str) {
-    let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+    let mut b = crate::lockmeter::lock("pi:BUILDER", &BUILDER);
     if !b.off {
         b.off = true;
         tracing::warn!(why, "the ray-tracing structure builder is turned off for the rest of the run: its stages run all or none");
@@ -429,7 +429,7 @@ pub(crate) fn builder_runs() -> bool {
     if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
         return false;
     }
-    let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+    let mut b = crate::lockmeter::lock("pi:BUILDER", &BUILDER);
     if b.off {
         return false;
     }
@@ -640,14 +640,14 @@ pub(crate) fn note_drop(this: This) {
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_why(why: String) {
     crate::capture::op(0, || format!("DROPPED {why}"));
-    let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut drops = crate::lockmeter::lock("pi:DROPS", &DROPS);
     *drops.get_or_insert_with(HashMap::new).entry(why).or_default() += 1;
 }
 
 /// The drops counted since the last call, most first (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn take_drops() -> Vec<(String, u64)> {
-    let drops = DROPS.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let drops = crate::lockmeter::lock("pi:DROPS", &DROPS).take();
     let mut drops: Vec<(String, u64)> = drops.into_iter().flatten().collect();
     // Frame reports only show the first 40 reasons. Keep ties ordered so
     // a HashMap iteration order change cannot change which reasons appear.
@@ -683,7 +683,7 @@ fn hand_out(
     #[cfg(windows)]
     if builder {
         // Another stage: the group is looked at again at its next dispatch.
-        let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+        let mut b = crate::lockmeter::lock("pi:BUILDER", &BUILDER);
         b.pipelines.push(host.clone());
         b.whole = false;
         // Named once each (gfx41): which programs are the builder's, to

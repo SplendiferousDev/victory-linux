@@ -113,7 +113,7 @@ fn linear_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resource
         return host.uav_buffer(total).map(|b| (b, 0));
     }
     let spare = {
-        let mut all = SPARE_LINEAR.lock().unwrap_or_else(|e| e.into_inner());
+        let mut all = crate::lockmeter::lock("tx:SPARE_LINEAR", &SPARE_LINEAR);
         let taken = all.0.get_mut(&size).and_then(Vec::pop);
         if taken.is_some() {
             all.1 -= size;
@@ -174,7 +174,7 @@ fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resourc
         return host.upload_buffer(total).map(|(buffer, data)| (buffer, data, 0));
     }
     let spare = {
-        let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut all = crate::lockmeter::lock("tx:SPARE", &SPARE);
         let taken = all.0.get_mut(&size).and_then(Vec::pop);
         if taken.is_some() {
             all.1 -= size;
@@ -295,7 +295,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     };
     let Some(host) = host() else { return false };
     let through = {
-        let mut map = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = crate::lockmeter::lock("tx:THROUGH", &THROUGH);
         let map = map.get_or_insert_with(HashMap::new);
         match map.get(&(placed as usize)) {
             Some(through) => through.clone(),
@@ -601,7 +601,7 @@ impl Drop for Staging {
         // Nothing holds the staging any more (lists keep it until they are
         // reset, after their submission has run): its buffer is spare.
         if self.pooled != 0 {
-            let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+            let mut all = crate::lockmeter::lock("tx:SPARE", &SPARE);
             if all.1 + self.pooled <= spare_most() {
                 all.1 += self.pooled;
                 all.0.entry(self.pooled).or_default().push(Spare(self.buffer.clone(), self.data as usize));
@@ -610,7 +610,7 @@ impl Drop for Staging {
         if let Some(gpu) = &self.gpu
             && gpu.pooled != 0
         {
-            let mut all = SPARE_LINEAR.lock().unwrap_or_else(|e| e.into_inner());
+            let mut all = crate::lockmeter::lock("tx:SPARE_LINEAR", &SPARE_LINEAR);
             if all.1 + gpu.pooled <= spare_most() {
                 all.1 += gpu.pooled;
                 all.0.entry(gpu.pooled).or_default().push(SpareLinear(gpu.linear.clone()));
@@ -626,7 +626,7 @@ pub(crate) fn staged_bytes() -> u64 {
 
 /// For the memory line of every build: the bytes of spare staging buffers.
 pub(crate) fn spare_bytes() -> u64 {
-    SPARE.lock().unwrap_or_else(|e| e.into_inner()).1
+    crate::lockmeter::lock("tx:SPARE", &SPARE).1
 }
 
 /// For the memory line: staging buffers alive, their bytes, and how many
@@ -662,7 +662,7 @@ pub(crate) fn let_go() -> [u64; 2] {
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = crate::lockmeter::lock("tx:STAGING", &STAGING);
     let Some(map) = map.as_mut() else {
         return;
     };
@@ -697,7 +697,7 @@ static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::ne
 /// A host copy or resolve writes `resource`.
 pub(crate) fn host_written(resource: This) {
     let new = {
-        let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        let mut set = crate::lockmeter::lock("tx:HOST_WRITTEN", &HOST_WRITTEN);
         set.get_or_insert_with(Default::default).insert(resource as usize)
     };
     // Diagnostics (run 177): where its title memory is, for placed views
@@ -729,7 +729,7 @@ static HOST_WRITTEN_AT: Mutex<std::collections::BTreeMap<u64, (u64, u32, u32, u3
 /// them.
 pub(crate) fn placed_in_host_written(address: u64, desc: &[u32; 14]) {
     let hit = {
-        let map = HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner());
+        let map = crate::lockmeter::lock("tx:HOST_WRITTEN_AT", &HOST_WRITTEN_AT);
         map.range(..=address)
             .next_back()
             .filter(|(at, d)| address < **at + d.0)
@@ -770,18 +770,18 @@ pub(crate) fn host_wrote(resource: usize) -> bool {
 
 /// The title released a resource.
 pub(crate) fn forget(resource: usize) {
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = crate::lockmeter::lock("tx:STAGING", &STAGING);
     if let Some(map) = map.as_mut() {
         map.remove(&resource);
     }
-    let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut set = crate::lockmeter::lock("tx:HOST_WRITTEN", &HOST_WRITTEN);
     if let Some(set) = set.as_mut() {
         set.remove(&resource);
     }
     // Its memory may be given to other textures now (run 177: most of the
     // "HERO LEAD" lines were views in memory a released texture had held).
-    HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, d| d.5 != resource);
-    let mut through = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
+    crate::lockmeter::lock("tx:HOST_WRITTEN_AT", &HOST_WRITTEN_AT).retain(|_, d| d.5 != resource);
+    let mut through = crate::lockmeter::lock("tx:THROUGH", &THROUGH);
     if let Some(through) = through.as_mut() {
         through.remove(&resource);
     }
@@ -1141,7 +1141,7 @@ impl Staging {
     /// Forgets what the staging buffer was last filled from: the next
     /// refresh detiles anew, whether the memory changed or not.
     fn forget(&self) {
-        *self.last.lock().unwrap_or_else(|e| e.into_inner()) = Last::default();
+        *crate::lockmeter::lock("tx:last", &self.last) = Last::default();
     }
 
     /// The title memory the texture is read from: address and bytes.
@@ -1173,7 +1173,7 @@ impl Staging {
     fn refresh_timed(&self) -> usize {
         let size = self.layout.size as usize;
         let start = self.memory as usize;
-        let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut last = waited(0, || crate::lockmeter::lock("tx:last", &self.last));
         let last = &mut *last;
         if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
@@ -1305,7 +1305,7 @@ impl Staging {
     pub(crate) fn refresh_ahead(&self) -> bool {
         let size = self.layout.size as usize;
         let start = self.memory as usize;
-        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        let mut last = crate::lockmeter::lock("tx:last", &self.last);
         let last = &mut *last;
         if last.hash.is_some() || last.asked != 0 {
             // Detiled before: the submission's check is cheap.
@@ -1425,7 +1425,7 @@ impl Drop for DetileTimed {
 /// upload from it hold it until they have run); the next upload makes one
 /// anew.
 pub(crate) fn unstage(resource: This) {
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = crate::lockmeter::lock("tx:STAGING", &STAGING);
     if let Some(map) = map.as_mut() {
         map.remove(&(resource as usize));
     }
@@ -1433,7 +1433,7 @@ pub(crate) fn unstage(resource: This) {
 
 /// Where a staged title texture's memory is: address and bytes.
 pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
-    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let map = crate::lockmeter::lock("tx:STAGING", &STAGING);
     let (at, len) = map.as_ref()?.get(&(resource as usize))?.memory();
     Some((at as u64, len as u64))
 }
@@ -1478,13 +1478,13 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn staged_state(resource: This) -> Option<(bool, bool)> {
     use std::sync::atomic::Ordering::Relaxed;
-    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let map = crate::lockmeter::lock("tx:STAGING", &STAGING);
     let staging = map.as_ref()?.get(&(resource as usize))?;
     Some((staging.uploaded.load(Relaxed), staging.dirty.load(Relaxed)))
 }
 
 pub(crate) fn is_staged(resource: This) -> bool {
-    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let map = crate::lockmeter::lock("tx:STAGING", &STAGING);
     map.as_ref().is_some_and(|map| map.contains_key(&(resource as usize)))
 }
 
@@ -1492,7 +1492,7 @@ pub(crate) fn is_staged(resource: This) -> bool {
 /// if the texture has been staged for upload.
 pub(crate) fn staged(resource: This) -> Option<(u64, bool)> {
     let s = {
-        let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        let map = crate::lockmeter::lock("tx:STAGING", &STAGING);
         map.as_ref()?.get(&(resource as usize))?.clone()
     };
     let size = s.layout.size as usize;
@@ -1656,7 +1656,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     // Asked before the table is locked: the sweep lets go of a staging
     // buffer with its texture's host side locked, in that order.
     let on_demand = crate::resource::host_tiled(resource).is_some();
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = crate::lockmeter::lock("tx:STAGING", &STAGING);
     let map = map.get_or_insert_with(HashMap::new);
     if let Some(s) = map.get(&(resource as usize)) {
         return Some(s.clone());

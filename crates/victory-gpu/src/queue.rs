@@ -525,6 +525,7 @@ fn wake() {
 #[cfg(windows)]
 fn worker() {
     crate::framelog::keep_on_fast_cores("victory-submit");
+    crate::lockmeter::set_class(crate::lockmeter::SUBMIT);
     loop {
         {
             let idle = std::time::Instant::now();
@@ -1429,8 +1430,12 @@ extern "system" fn present(
     let presenting = std::time::Instant::now();
     victory_core::timeline::present_call();
     let hr = present_now(this, planes, plane_parameters);
+    crate::lockmeter::frame();
     if let Some(line) = victory_core::timeline::present_return() {
         tracing::info!("{line}");
+        if let Some(locks) = crate::lockmeter::line() {
+            tracing::info!("{locks}");
+        }
     }
     #[cfg(windows)]
     {

@@ -101,7 +101,7 @@ unsafe impl Send for Ready {}
 static READY: Mutex<Vec<Ready>> = Mutex::new(Vec::new());
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
+    crate::lockmeter::lock("hw:m", &m)
 }
 
 /// What a pass on the worker's thread records into: one upload list after

@@ -17,7 +17,7 @@ pub(super) fn blocked(written: &[(usize, usize)], src: usize, len: usize) {
     let at = written.partition_point(|r| r.1 <= src);
     let touched = written.get(at).copied().unwrap_or((0, 0));
     let key = (src & !0xfff, len);
-    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut seen = crate::lockmeter::lock("h_:SEEN", &SEEN);
     let known = seen.iter().position(|s| (s.0, s.1) == key);
     match known {
         Some(k) => seen[k].2 += 1,
@@ -38,13 +38,13 @@ pub(super) fn blocked(written: &[(usize, usize)], src: usize, len: usize) {
     drop(seen);
     let mut bytes = vec![0u8; len.min(1 << 20)];
     if super::read_into(src as *const u8, &mut bytes) {
-        *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some((src, len, bytes));
+        *crate::lockmeter::lock("h_:PENDING", &PENDING) = Some((src, len, bytes));
     }
 }
 
 /// The fill of `len` bytes at `src` runs now.
 pub(super) fn runs(src: usize, len: usize) {
-    let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    let mut pending = crate::lockmeter::lock("h_:PENDING", &PENDING);
     if !pending.as_ref().is_some_and(|p| (p.0, p.1) == (src, len)) {
         return;
     }
@@ -84,7 +84,7 @@ pub(super) fn blocked_copy(written: &[(usize, usize)], dst: usize, src: usize, l
     let by_src = super::touches(written, src, src + len);
     let by_dst = super::touches(written, dst, dst + len);
     let key = (src & !0xfff, dst & !0xfff, len);
-    let mut seen = SEEN_COPIES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut seen = crate::lockmeter::lock("h_:SEEN_COPIES", &SEEN_COPIES);
     let known = seen.iter().position(|s| (s.0, s.1, s.2) == key);
     match known {
         Some(k) => seen[k].3 += 1,
@@ -113,13 +113,13 @@ pub(super) fn blocked_copy(written: &[(usize, usize)], dst: usize, src: usize, l
     let n = len.min(1 << 20);
     let (mut a, mut b) = (vec![0u8; n], vec![0u8; n]);
     if super::read_into(src as *const u8, &mut a) && super::read_into(dst as *const u8, &mut b) {
-        *PENDING_COPY.lock().unwrap_or_else(|e| e.into_inner()) = Some((dst, src, len, a, b));
+        *crate::lockmeter::lock("h_:PENDING_COPY", &PENDING_COPY) = Some((dst, src, len, a, b));
     }
 }
 
 /// The title buffer copy runs now.
 pub(super) fn copy_runs(dst: usize, src: usize, len: usize) {
-    let mut pending = PENDING_COPY.lock().unwrap_or_else(|e| e.into_inner());
+    let mut pending = crate::lockmeter::lock("h_:PENDING_COPY", &PENDING_COPY);
     if !pending.as_ref().is_some_and(|p| (p.0, p.1, p.2) == (dst, src, len)) {
         return;
     }
@@ -152,7 +152,7 @@ pub(super) fn copy_runs(dst: usize, src: usize, len: usize) {
 pub(super) fn line() {
     let copies = COPIES[0].load(Relaxed);
     if copies > 0 {
-        let seen = SEEN_COPIES.lock().unwrap_or_else(|e| e.into_inner());
+        let seen = crate::lockmeter::lock("h_:SEEN_COPIES", &SEEN_COPIES);
         let mut most: Vec<_> = seen.clone();
         most.sort_unstable_by_key(|s| std::cmp::Reverse(s.3));
         let most: Vec<String> =
@@ -169,7 +169,7 @@ pub(super) fn line() {
     if n == 0 {
         return;
     }
-    let seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let seen = crate::lockmeter::lock("h_:SEEN", &SEEN);
     let mut most: Vec<_> = seen.clone();
     most.sort_unstable_by_key(|s| std::cmp::Reverse(s.2));
     let most: Vec<String> = most.iter().take(6).map(|s| format!("{:#x}+{:#x} {}x", s.0, s.1, s.2)).collect();

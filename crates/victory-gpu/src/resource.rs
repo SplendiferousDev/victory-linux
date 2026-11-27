@@ -1194,7 +1194,7 @@ static TEXTURES: std::sync::Mutex<std::collections::BTreeSet<usize>> =
 
 #[cfg(windows)]
 fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize>> {
-    TEXTURES.lock().unwrap_or_else(|e| e.into_inner())
+    crate::lockmeter::lock("rs:TEXTURES", &TEXTURES)
 }
 
 /// A title texture held alive ([`hold`], [`alias_of`]).
@@ -1278,7 +1278,7 @@ pub(crate) fn alias_of(this: This) -> Option<Held> {
         return None;
     }
     // Under the table's lock: a texture leaves it before it is freed.
-    let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+    let targets = crate::lockmeter::lock("rs:TARGETS_AT", &TARGETS_AT);
     let other = *targets.get(&(r.data() as u64))? as This;
     let o = resource(other);
     const DEPTH: u32 = 0x2;
@@ -1335,7 +1335,7 @@ pub(crate) fn host_waits(this: This) -> bool {
     let r = resource(this);
     r.desc.dimension != BUFFER
         && !r.host.refused.load(std::sync::atomic::Ordering::Relaxed)
-        && r.host.made.lock().unwrap_or_else(|e| e.into_inner()).is_none()
+        && crate::lockmeter::lock("rs:made", &r.host.made).is_none()
 }
 
 /// The host side of title texture `this`: made now if it is not there and
@@ -1347,7 +1347,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
     if r.desc.dimension == BUFFER {
         return None;
     }
-    let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+    let mut made = crate::lockmeter::lock("rs:made", &r.host.made);
     if made.is_none() {
         if !make || r.host.refused.load(Relaxed) {
             return None;
@@ -1597,7 +1597,7 @@ pub(crate) fn placed_known(address: u64, desc: &[u32; 14]) -> Option<This> {
     let mut key = *desc;
     key[1] = 0;
     key[13] = 0;
-    let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    let map = crate::lockmeter::lock("rs:PLACED_TEXTURES", &PLACED_TEXTURES);
     map.get(&(address, key)).or_else(|| map.get(&(address, *desc))).map(|&r| r as This)
 }
 
@@ -1617,7 +1617,7 @@ pub(crate) fn copy_state(this: This) -> Option<(u8, u64, u64)> {
         return None;
     }
     let memory = r.data() as u64;
-    let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+    let made = crate::lockmeter::lock("rs:made", &r.host.made);
     Some(match made.as_ref() {
         Some((host, _)) => (2, host.bytes, memory),
         None => (u8::from(r.host.gone.load(Relaxed)), footprint(&r.desc).map_or(0, |f| f.size), memory),
@@ -1672,7 +1672,7 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
             if !fills(&r.desc) {
                 continue;
             }
-            let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            let made = crate::lockmeter::lock("rs:made", &r.host.made);
             match made.as_ref() {
                 Some((host, _)) => copies.push(match &host.tiled {
                     Some(tiled) => (r.data() as usize, r.desc, tiled.given_bytes(), true),
@@ -1849,7 +1849,7 @@ pub(crate) fn let_go_idle() {
             continue;
         }
         let gone = {
-            let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            let mut made = crate::lockmeter::lock("rs:made", &r.host.made);
             let idle = made.as_ref().is_some_and(|(host, _)| {
                 crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
                     && std::sync::Arc::strong_count(host) == 1
@@ -1907,7 +1907,7 @@ pub(crate) fn targets_census() -> [u64; 12] {
     for &at in all.iter() {
         // SAFETY: as in `let_go_idle`.
         let r = unsafe { &*(at as *const Resource) };
-        let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        let made = crate::lockmeter::lock("rs:made", &r.host.made);
         let Some((host, twin)) = made.as_ref() else {
             continue;
         };
@@ -1968,7 +1968,7 @@ pub(crate) fn census() -> [u64; 10] {
     for &at in all.iter() {
         // SAFETY: as in `let_go_idle`.
         let r = unsafe { &*(at as *const Resource) };
-        let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        let made = crate::lockmeter::lock("rs:made", &r.host.made);
         match made.as_ref() {
             Some((host, twin)) => {
                 let kind = if host.filled { 4 } else { 0 };
@@ -2070,7 +2070,7 @@ impl Drop for HostTexture {
 /// (never released), for the memory line.
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn placed_textures() -> u64 {
-    PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner()).len() as u64
+    crate::lockmeter::lock("rs:PLACED_TEXTURES", &PLACED_TEXTURES).len() as u64
 }
 
 /// Moves the host texture to `wanted` (a host texture state); the host
@@ -2443,7 +2443,7 @@ impl Drop for Resource {
             crate::texback::released(address);
             textures().remove(&address);
             if !fills(&self.desc) {
-                let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+                let mut targets = crate::lockmeter::lock("rs:TARGETS_AT", &TARGETS_AT);
                 let at = self.data() as u64;
                 if targets.get(&at) == Some(&(std::ptr::from_ref::<Resource>(self) as usize)) {
                     targets.remove(&at);
@@ -2562,7 +2562,7 @@ pub(crate) extern "system" fn create_committed3(
 static PAGE_POOLS: std::sync::Mutex<Vec<Option<(u64, u32)>>> = std::sync::Mutex::new(Vec::new());
 
 fn page_pools() -> std::sync::MutexGuard<'static, Vec<Option<(u64, u32)>>> {
-    PAGE_POOLS.lock().unwrap_or_else(|e| e.into_inner())
+    crate::lockmeter::lock("rs:PAGE_POOLS", &PAGE_POOLS)
 }
 
 /// Device method 0x250: `(address, page count, handle out)`.
@@ -2726,7 +2726,7 @@ pub(crate) fn texture_at_made(address: u64, desc: &[u32; 14]) -> Option<This> {
     let mut key = *desc;
     key[1] = 0;
     key[13] = 0;
-    let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    let map = crate::lockmeter::lock("rs:PLACED_TEXTURES", &PLACED_TEXTURES);
     let found = map.get(&(address, key)).or_else(|| map.get(&(address, *desc)))?;
     Some(*found as This)
 }
@@ -2749,11 +2749,11 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         key[13] = 0;
     }
     let desc = &key;
-    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = crate::lockmeter::lock("rs:PLACED_TEXTURES", &PLACED_TEXTURES);
     // How many resources the filler alone would have added (a count for
     // the log: `placed_filler_twins`).
     if raw != key {
-        let mut seen = PLACED_RAW.lock().unwrap_or_else(|e| e.into_inner());
+        let mut seen = crate::lockmeter::lock("rs:PLACED_RAW", &PLACED_RAW);
         if seen.insert((address, raw)) {
             let others = seen.range((address, [0; 14])..=(address, [u32::MAX; 14])).filter(|(_, r)| {
                 let mut blank = *r;
@@ -2830,7 +2830,7 @@ pub(crate) fn uav_texture_at(address: u64, desc: &[u32; 14], view_format: u32) -
         pc_format(view_format)
     };
     {
-        let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+        let targets = crate::lockmeter::lock("rs:TARGETS_AT", &TARGETS_AT);
         if let Some(&other) = targets.get(&address) {
             let o = resource(other as This);
             let o_fmt = target_format(pc_format(o.desc.format));
@@ -2861,7 +2861,7 @@ pub(crate) fn uav_texture_at(address: u64, desc: &[u32; 14], view_format: u32) -
             r[8] = wanted;
         }
     }
-    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = crate::lockmeter::lock("rs:PLACED_TEXTURES", &PLACED_TEXTURES);
     if let Some(&existing) = map.get(&(address, r)) {
         // A temporary target at this address may have replaced this texture
         // and since been released. Restore the alias only if the slot is vacant.

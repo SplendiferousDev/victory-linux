@@ -59,7 +59,7 @@ pub(crate) fn note_written(at: usize, len: usize) {
     if super::card_fills_mode() == 0 || len == 0 {
         return;
     }
-    let mut learned = LEARNED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut learned = crate::lockmeter::lock("h_:LEARNED", &LEARNED);
     learned.get_or_insert_with(Default::default).extend(at / PIECE..=(at + len - 1) / PIECE);
 }
 
@@ -69,7 +69,7 @@ pub(crate) fn shaders_wrote(src: usize, len: usize) -> bool {
     if super::card_fills_mode() == 0 || len == 0 {
         return false;
     }
-    let learned = LEARNED.lock().unwrap_or_else(|e| e.into_inner());
+    let learned = crate::lockmeter::lock("h_:LEARNED", &LEARNED);
     learned.as_ref().is_some_and(|set| (src / PIECE..=(src + len - 1) / PIECE).any(|p| set.contains(&p)))
 }
 
@@ -81,7 +81,7 @@ pub(super) fn read(src: usize, len: usize) {
     }
     COUNT[0].fetch_add(1, Relaxed);
     let frame = crate::frame::current();
-    let mut read = READ.lock().unwrap_or_else(|e| e.into_inner());
+    let mut read = crate::lockmeter::lock("h_:READ", &READ);
     let map = read.get_or_insert_with(HashMap::new);
     for piece in src / PIECE..=(src + len - 1) / PIECE {
         let p = map.entry(piece).or_default();
@@ -103,7 +103,7 @@ pub(crate) fn wrote(at: usize, new: &[u8]) {
     let frame = crate::frame::current();
     let landing = LANDING.load(Relaxed);
     let hits: Vec<(usize, usize, u64)> = {
-        let read = READ.lock().unwrap_or_else(|e| e.into_inner());
+        let read = crate::lockmeter::lock("h_:READ", &READ);
         let Some(map) = read.as_ref() else { return };
         let end = at + new.len();
         (at / PIECE..=(end - 1) / PIECE)
@@ -146,7 +146,7 @@ pub(crate) fn wrote(at: usize, new: &[u8]) {
 pub(super) fn line(frames: f64) {
     let [fills, copies, bytes] = [0, 1, 2].map(|i| super::CARD_FILLS[i].swap(0, Relaxed));
     if super::card_fills_mode() != 0 {
-        let learned = LEARNED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |s| s.len());
+        let learned = crate::lockmeter::lock("h_:LEARNED", &LEARNED).as_ref().map_or(0, |s| s.len());
         tracing::info!(
             "copies on the card where shaders wrote (VICTORY_CARD_FILLS), per frame: {:.1} constant buffers, {:.1} title \
              buffer copies, {:.3} MB; {learned} pieces of 64 KiB known written by shaders",
@@ -161,7 +161,7 @@ pub(super) fn line(frames: f64) {
     }
     let kept = {
         let frame = crate::frame::current();
-        let mut read = READ.lock().unwrap_or_else(|e| e.into_inner());
+        let mut read = crate::lockmeter::lock("h_:READ", &READ);
         read.as_mut().map_or(0, |map| {
             map.retain(|_, p| {
                 p.fills.retain(|f| f.2 + KEEP >= frame);

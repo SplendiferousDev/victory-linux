@@ -438,20 +438,20 @@ fn bury(finished: u64) {
     if retire_lean() {
         // Taken out whole, sorted with no lock held, what still waits put
         // back (beside what was retired meanwhile; the order means nothing).
-        let all = std::mem::take(&mut *RETIRED.lock().unwrap_or_else(|e| e.into_inner()));
+        let all = std::mem::take(&mut *crate::lockmeter::lock("ho:RETIRED", &RETIRED));
         if all.is_empty() {
             return;
         }
         let (done, keep): (Vec<(u64, Retired)>, Vec<(u64, Retired)>) =
             all.into_iter().partition(|(at, _)| *at <= finished);
         if !keep.is_empty() {
-            RETIRED.lock().unwrap_or_else(|e| e.into_inner()).extend(keep);
+            crate::lockmeter::lock("ho:RETIRED", &RETIRED).extend(keep);
         }
         reap(done.into_iter().map(|(_, object)| object).collect());
         return;
     }
     let done: Vec<(u64, Retired)> = {
-        let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+        let mut retired = crate::lockmeter::lock("ho:RETIRED", &RETIRED);
         if retired.is_empty() {
             return;
         }
@@ -613,7 +613,7 @@ pub(crate) fn trail(what: impl FnOnce() -> String) {
     if entry.2.starts_with("sweep:") {
         tracing::info!("{}", entry.2);
     }
-    let mut trail = TRAIL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut trail = crate::lockmeter::lock("ho:TRAIL", &TRAIL);
     if trail.len() >= TRAIL_MOST {
         trail.pop_front();
     }
@@ -657,7 +657,7 @@ pub(crate) fn removal_context() -> String {
         STARTED.load(Ordering::Relaxed),
         FINISHED.load(Ordering::Relaxed),
     );
-    let trail = TRAIL.lock().unwrap_or_else(|e| e.into_inner());
+    let trail = crate::lockmeter::lock("ho:TRAIL", &TRAIL);
     let _ = write!(text, "; the last {} things done, newest last:", trail.len());
     for (at, thread, what) in trail.iter() {
         let _ = write!(text, "\n  {:.1} ms before, thread {thread}: {what}", ms(*at));
@@ -961,7 +961,7 @@ static FIRST_USES: Mutex<std::collections::VecDeque<(u64, u64, u64, String)>> = 
 pub(crate) fn first_use(name: &str) {
     FIRST_USED.fetch_add(1, Ordering::Relaxed);
     let entry = (now_us(), STARTED.load(Ordering::Relaxed), crate::frame::current(), name.to_owned());
-    let mut uses = FIRST_USES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut uses = crate::lockmeter::lock("ho:FIRST_USES", &FIRST_USES);
     if uses.len() >= 48 {
         uses.pop_front();
     }
@@ -974,7 +974,7 @@ pub(crate) fn first_use(name: &str) {
 fn first_uses_text(runs: &[&HostList], bound: bool) -> String {
     use std::fmt::Write;
     let now = now_us();
-    let uses = FIRST_USES.lock().unwrap_or_else(|e| e.into_inner());
+    let uses = crate::lockmeter::lock("ho:FIRST_USES", &FIRST_USES);
     let mut text = format!(
         "; pipelines first handed to a draw or dispatch: {} since the start; submissions started {} finished {}; of the last {}{}:",
         FIRST_USED.load(Ordering::Relaxed),
@@ -987,7 +987,7 @@ fn first_uses_text(runs: &[&HostList], bound: bool) -> String {
         let lists: Vec<usize> = runs
             .iter()
             .enumerate()
-            .filter(|(_, r)| r.pipelines.lock().unwrap_or_else(|e| e.into_inner()).contains(name.as_str()))
+            .filter(|(_, r)| crate::lockmeter::lock("ho:pipelines", &r.pipelines).contains(name.as_str()))
             .map(|(i, _)| i)
             .collect();
         if bound && lists.is_empty() {
@@ -1237,7 +1237,7 @@ fn card_clock_watch(clock: &'static CardClock) {
     let mut seen = 0;
     loop {
         let target = {
-            let mut state = clock.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = crate::lockmeter::lock("ho:state", &clock.state);
             while state.0 == seen {
                 state = clock.sent.wait(state).unwrap_or_else(|e| e.into_inner());
             }
@@ -1250,7 +1250,7 @@ fn card_clock_watch(clock: &'static CardClock) {
             }
         }
         seen = target;
-        let mut state = clock.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = crate::lockmeter::lock("ho:state", &clock.state);
         if state.0 == target && state.1.is_none() {
             state.1 = Some((std::time::Instant::now(), worked()));
             timeline::mark(timeline::Mark::CardDry);
@@ -1884,7 +1884,7 @@ impl PlanePass {
     /// The root signature and pipeline for a twin of 16-bit steps (`steps`)
     /// or of floats and the depth format `format`.
     fn pipeline(&self, steps: bool, format: DXGI_FORMAT) -> Option<PlanePipeline> {
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let mut made = crate::lockmeter::lock("ho:made", &self.made);
         if let Some((_, _, pipeline)) = made.iter().find(|m| (m.0, m.1) == (steps, format.0)) {
             return pipeline.clone();
         }
@@ -2411,7 +2411,7 @@ static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
 /// committed upload buffer).
 fn take_chunk(host: &Host, size: u64) -> Option<(Chunk, u64)> {
     if scratch_pool() {
-        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut spare = crate::lockmeter::lock("ho:SPARE", &SPARE);
         let kept = spare.take(size).map(|c| (c, size)).or_else(|| {
             let any = size == SCRATCH_FIRST && scratch_any_size();
             any.then(|| spare.take(SCRATCH_CHUNK).map(|c| (c, SCRATCH_CHUNK))).flatten()
@@ -2470,7 +2470,7 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     }
     let mut freed = Vec::new();
     {
-        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut spare = crate::lockmeter::lock("ho:SPARE", &SPARE);
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
                 spare.give(chunk, size, spare_most())
@@ -3403,7 +3403,7 @@ pub(crate) fn inflight_raise(landed: u32, k: u32) -> u32 {
 /// 0xffff_ffff reads as [`INFLIGHT_NONE`]; a flagged piece that draws it
 /// copies nothing and its landing goes the old way, once every 2^32.
 fn inflight_tickets_landed(plans: &[&CardPlan]) {
-    let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut work = crate::lockmeter::lock("ho:CARD_WORK", &CARD_WORK);
     let Some(work) = work.as_mut() else {
         return;
     };
@@ -3667,7 +3667,7 @@ static LINE: Mutex<Line> = Mutex::new(Line {
 static LINE_MOVED: std::sync::Condvar = std::sync::Condvar::new();
 
 fn line() -> std::sync::MutexGuard<'static, Line> {
-    LINE.lock().unwrap_or_else(|e| e.into_inner())
+    crate::lockmeter::lock("ho:LINE", &LINE)
 }
 
 /// Why flights were settled ([`LATE_STATS`]' places from 2 on).
@@ -4236,7 +4236,7 @@ pub(crate) fn settle_now(why: usize) {
     let Some(host) = host() else {
         return;
     };
-    let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+    let mut submitted = crate::lockmeter::lock("ho:submitted", &host.submitted);
     host.settle(&mut submitted, why);
 }
 
@@ -4345,7 +4345,7 @@ fn late_helper() {
             wait_host_fence(&host.fence, target, event, "late helper");
         }
         {
-            let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+            let mut submitted = crate::lockmeter::lock("ho:submitted", &host.submitted);
             // Something newer went up meanwhile: the card is waited for
             // again, the submitting thread is not held up for it.
             if line().target != target {
@@ -4460,6 +4460,7 @@ fn relay_worker() {
         return;
     };
     crate::framelog::keep_on_fast_cores("victory-relay");
+    crate::lockmeter::set_class(crate::lockmeter::RELAY);
     // SAFETY: a plain event of our own.
     let Ok(event) = (unsafe { CreateEventW(None, false, false, None) }) else {
         fail(format_args!("no event for the thread that lands submissions sent ahead (VICTORY_RELAY=1)"));
@@ -4937,7 +4938,7 @@ impl Host {
         let Some(clock) = self.card_clock() else {
             return;
         };
-        let mut state = clock.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = crate::lockmeter::lock("ho:state", &clock.state);
         state.0 += 1;
         // SAFETY: our queue and the clock's fence.
         let _ = crate::hostq::signal(&self.queue, &clock.fence, state.0);
@@ -4956,7 +4957,7 @@ impl Host {
         static READY: OnceLock<bool> = OnceLock::new();
         *READY.get_or_init(|| match self.make_card_work() {
             Ok(work) => {
-                *CARD_WORK.lock().unwrap_or_else(|e| e.into_inner()) = Some(work);
+                *crate::lockmeter::lock("ho:CARD_WORK", &CARD_WORK) = Some(work);
                 true
             }
             Err(e) => {
@@ -5236,7 +5237,7 @@ impl Host {
         timed = card_part(0, timed);
         // With the relay: the order of the queue is held from here until
         // what is taken is on the queue, and the taking is numbered.
-        let mut order = relay().then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut order = relay().then(|| crate::lockmeter::lock("ho:QUEUE_ORDER", &QUEUE_ORDER));
         let sent_as = match order.as_mut() {
             Some(order) => {
                 **order += 1;
@@ -5267,7 +5268,7 @@ impl Host {
             numbered();
             return None;
         }
-        let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut work = crate::lockmeter::lock("ho:CARD_WORK", &CARD_WORK);
         let work = work.as_mut()?;
         // The merges on the card of this submission, per copy the
         // stretches they go over, and the buffer their masks are in. A
@@ -5909,7 +5910,7 @@ impl Host {
     /// when nothing of ours is on the card, so the compare's results start
     /// from the beginning again.
     fn card_done(&self, plan: CardPlan) {
-        let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut work = crate::lockmeter::lock("ho:CARD_WORK", &CARD_WORK);
         let Some(work) = work.as_mut() else {
             return;
         };
@@ -5990,7 +5991,7 @@ impl Host {
         // earlier landings: looked at for these plans, renewed below.
         let beside = lane.is_some() && refetch();
         let noted: std::collections::HashMap<(usize, u32), u64> = if beside {
-            BESIDE.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default()
+            crate::lockmeter::lock("ho:BESIDE", &BESIDE).clone().unwrap_or_default()
         } else {
             Default::default()
         };
@@ -5998,7 +5999,7 @@ impl Host {
         // Every piece fetched now: (copy, piece number).
         let mut numbers: Vec<(usize, u32)> = Vec::new();
         let differs = {
-            let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
+            let work = crate::lockmeter::lock("ho:CARD_WORK", &CARD_WORK);
             work.as_ref().map(|work| (work.differs.1, (work.differs.2 / 4) as usize))
         };
         let mut pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
@@ -6059,14 +6060,14 @@ impl Host {
             }
             if beside {
                 // Notes whose flights have all landed are done with.
-                let mut all = BESIDE.lock().unwrap_or_else(|e| e.into_inner());
+                let mut all = crate::lockmeter::lock("ho:BESIDE", &BESIDE);
                 note_beside(all.get_or_insert_with(Default::default), &[], landed, landed);
             }
             // Nothing to fetch: every send so far is older than the next
             // fetch (on a copy queue: every send the card has finished).
             crate::shadow::relay_fetched(match lane {
                 Some(second) => second.order_done(),
-                None => *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()),
+                None => *crate::lockmeter::lock("ho:QUEUE_ORDER", &QUEUE_ORDER),
             });
             return;
         }
@@ -6120,7 +6121,7 @@ impl Host {
                         // (counted before a submission's lists go to the
                         // queue, `Host::submit`: nothing later ran yet).
                         let started = STARTED.load(Ordering::Acquire);
-                        let mut all = BESIDE.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut all = crate::lockmeter::lock("ho:BESIDE", &BESIDE);
                         let noted = note_beside(all.get_or_insert_with(Default::default), &numbers, landed, started);
                         BESIDE_STATS[1].fetch_add(noted, Ordering::Relaxed);
                     }
@@ -6136,7 +6137,7 @@ impl Host {
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
                 // In the order of the queue: the sends of title bytes so
                 // far are ahead of this fetch, every later one behind it.
-                let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+                let order = crate::lockmeter::lock("ho:QUEUE_ORDER", &QUEUE_ORDER);
                 crate::hostq::execute(&self.queue, &lists);
                 let after = *order;
                 drop(order);
@@ -6161,7 +6162,7 @@ impl Host {
         // yet; every one before it has (the submission lock).
         if inflight_fetch()
             && after > 1
-            && let Some(inflight) = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|w| w.inflight.as_mut())
+            && let Some(inflight) = crate::lockmeter::lock("ho:CARD_WORK", &CARD_WORK).as_mut().and_then(|w| w.inflight.as_mut())
         {
             inflight.brought.extend(pieces.iter().map(|(shadow, lo, hi, _)| (shadow.clone(), *lo, *hi, after - 1)));
         }
@@ -6234,7 +6235,7 @@ impl Host {
         type Piece = (Arc<crate::shadow::Shadow>, usize, usize, usize, u64);
         let mut pieces: Vec<Piece> = Vec::new();
         {
-            let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
+            let work = crate::lockmeter::lock("ho:CARD_WORK", &CARD_WORK);
             let Some(work) = work.as_ref() else {
                 return false;
             };
@@ -6484,7 +6485,7 @@ impl Host {
         if plan.ranges.is_empty() {
             return;
         }
-        let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut work = crate::lockmeter::lock("ho:CARD_WORK", &CARD_WORK);
         let Some(work) = work.as_mut() else {
             return;
         };
@@ -6912,7 +6913,7 @@ impl Host {
         crate::profile::seen(crate::profile::Seen::Submit);
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
-        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let mut submitted = crate::lockmeter::lock("ho:submitted", &self.submitted);
         let was_working = working(true);
         submitting(1, runs.len());
         self.video_memory_look();
@@ -7167,7 +7168,7 @@ impl Host {
         crate::copystat::card_waited(gpu.as_micros() as u64, || {
             let pipelines: std::collections::BTreeSet<String> = runs
                 .iter()
-                .flat_map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                .flat_map(|l| crate::lockmeter::lock("ho:pipelines", &l.pipelines).clone())
                 .collect();
             let text = format!("{} lists, pipelines {pipelines:?}", runs.len());
             text.chars().take(1200).collect()
@@ -7176,7 +7177,7 @@ impl Host {
         if gpu > std::time::Duration::from_millis(250) {
             let pipelines: std::collections::BTreeSet<String> = runs
                 .iter()
-                .flat_map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                .flat_map(|l| crate::lockmeter::lock("ho:pipelines", &l.pipelines).clone())
                 .collect();
             tracing::warn!(ms = gpu.as_millis(), lists = runs.len(), ?pipelines, "slow host submission");
         }
@@ -7235,7 +7236,7 @@ impl Host {
         // be merged is older than the sends to card copies so far, and
         // their notes can go.
         if relay() {
-            crate::shadow::relay_fetched(*QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
+            crate::shadow::relay_fetched(*crate::lockmeter::lock("ho:QUEUE_ORDER", &QUEUE_ORDER));
         }
         working(was_working);
         None
@@ -7420,7 +7421,7 @@ impl Host {
                     // The k-th marker command is the k-th note.
                     #[cfg(feature = "diagnostics")]
                     let markers: Vec<(u32, String)> = run.map_or_else(Vec::new, |r| {
-                        let notes = r.notes.lock().unwrap_or_else(|e| e.into_inner());
+                        let notes = crate::lockmeter::lock("ho:notes", &r.notes);
                         history
                             .iter()
                             .enumerate()
@@ -7444,7 +7445,7 @@ impl Host {
                     if (done == 0 || dred_mode() == Dred::Light)
                         && let Some(r) = run
                     {
-                        let pipelines = r.pipelines.lock().unwrap_or_else(|e| e.into_inner());
+                        let pipelines = crate::lockmeter::lock("ho:pipelines", &r.pipelines);
                         text.push_str(&format!(", its pipelines {pipelines:?}"));
                     }
                 }
@@ -7469,7 +7470,7 @@ impl Host {
             return;
         };
         static SEEN: Mutex<std::collections::BTreeMap<i32, (u64, i32)>> = Mutex::new(std::collections::BTreeMap::new());
-        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let mut seen = crate::lockmeter::lock("ho:SEEN", &SEEN);
         // SAFETY: each message is read into a buffer of the size the queue
         // reports, then the queue is emptied.
         let stored = unsafe {
@@ -7653,7 +7654,7 @@ impl HostList {
     /// (milliseconds, text) (diagnostics, timing on, after the list ran).
     #[cfg(feature = "diagnostics")]
     fn slowest(&self, frequency: u64, n: usize) -> Vec<(f64, String)> {
-        let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+        let notes = crate::lockmeter::lock("ho:notes", &self.notes);
         let (Some((_, back)), count) = (self.stamps(), notes.len().min(STAMPS as usize - 1)) else {
             return Vec::new();
         };
@@ -7683,13 +7684,13 @@ impl HostList {
         // The copies below write buffers on the card: no draw after them joins a window.
         crate::indirect::end_window(self);
         // Host queries begun in this list and never ended here: ended now, answered "visible".
-        let open = std::mem::take(&mut *self.open_queries.lock().unwrap_or_else(|e| e.into_inner()));
+        let open = std::mem::take(&mut *crate::lockmeter::lock("ho:open_queries", &self.open_queries));
         if !open.is_empty() {
             crate::query::close_open(open, self);
         }
         self.twins_to_depth();
         self.textures_back();
-        let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let scratch = crate::lockmeter::lock("ho:indirect_args", &self.indirect_args).clone();
         if let Some((scratch, _)) = scratch {
             self.indirect_common(&scratch);
         }
@@ -7697,7 +7698,7 @@ impl HostList {
         // The scratch buffers its prelude fills and leaves readable as
         // arguments: common again behind the list, as every scratch buffer.
         {
-            let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+            let mut gather = crate::lockmeter::lock("ho:gather", &self.gather);
             for set in gather.sets.iter().filter(|s| s.records() > 0) {
                 // SAFETY: an open list and a live buffer.
                 unsafe {
@@ -7728,13 +7729,13 @@ impl HostList {
         crate::cardmeter::end_named(
             &self.list,
             crate::cardmeter::Span::from_raw(self.meter.swap(u32::MAX, Ordering::Relaxed)),
-            &self.pipelines.lock().unwrap_or_else(|e| e.into_inner()),
+            &crate::lockmeter::lock("ho:pipelines", &self.pipelines),
         );
         #[cfg(feature = "diagnostics")]
         crate::shot::close(self);
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
-            let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
+            let count = crate::lockmeter::lock("ho:notes", &(self.notes).len() as u32).min(STAMPS - 1);
             // SAFETY: an open list, our heap and read-back buffer.
             unsafe {
                 self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, count);
@@ -7755,13 +7756,13 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();
-        *self.clamp_window.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *crate::lockmeter::lock("ho:clamp_window", &self.clamp_window) = None;
         *self.deferred() = Deferred::default();
-        self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        crate::lockmeter::lock("ho:states", &self.states).clear();
+        crate::lockmeter::lock("ho:twins", &self.twins).clear();
+        crate::lockmeter::lock("ho:pipelines", &self.pipelines).clear();
         {
-            let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+            let mut gather = crate::lockmeter::lock("ho:gather", &self.gather);
             let Gather { closed, written, sets, spare, segments, .. } = &mut *gather;
             *closed = false;
             written.clear();
@@ -7776,14 +7777,14 @@ impl HostList {
             }
         }
         #[cfg(feature = "diagnostics")]
-        self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        crate::lockmeter::lock("ho:notes", &self.notes).clear();
         #[cfg(feature = "diagnostics")]
         {
-            *self.shot_block.lock().unwrap_or_else(|e| e.into_inner()) = (0, 0, 0);
-            *self.shot_mark.lock().unwrap_or_else(|e| e.into_inner()) = (0, 0);
+            *crate::lockmeter::lock("ho:shot_block", &self.shot_block) = (0, 0, 0);
+            *crate::lockmeter::lock("ho:shot_mark", &self.shot_mark) = (0, 0);
         }
         {
-            let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+            let mut scratch = crate::lockmeter::lock("ho:scratch", &self.scratch);
             (scratch.current, scratch.used) = (0, 0);
             // Every submission of the list has run: nothing reads its
             // scratch memory any more, and the next list to ask takes it.
@@ -7791,7 +7792,7 @@ impl HostList {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
         }
-        if let Some(fills) = self.card_fills.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        if let Some(fills) = crate::lockmeter::lock("ho:card_fills", &self.card_fills).as_mut() {
             (fills.1, fills.2) = (0, false);
         }
         // SAFETY: the list is not executing.
@@ -7836,7 +7837,7 @@ impl HostList {
             crate::shot::known(std::sync::Arc::as_ptr(&copy) as usize, resource as usize);
         }
         let before = {
-            let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+            let mut states = crate::lockmeter::lock("ho:states", &self.states);
             match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
                 std::collections::hash_map::Entry::Vacant(v) => {
                     v.insert((wanted, wanted, copy.clone()));
@@ -7864,7 +7865,7 @@ impl HostList {
     /// host copy (colour twins) and for the copies between the two.
     fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
         let wanted = legal_state(&copy.texture, wanted);
-        let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        let mut states = crate::lockmeter::lock("ho:states", &self.states);
         let before = match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
                 v.insert((wanted, wanted, copy.clone()));
@@ -7916,7 +7917,7 @@ impl HostList {
             return false;
         };
         let side = usize::from(colour);
-        let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+        let mut twins = crate::lockmeter::lock("ho:twins", &self.twins);
         let u = twins
             .entry(std::sync::Arc::as_ptr(&twin) as usize)
             .or_insert_with(|| TwinUse {
@@ -8016,7 +8017,7 @@ impl HostList {
     /// map for reading but the pass that fills the next one).
     fn twins_to_depth(&self) {
         const SHADER_RESOURCE: u32 = 0x40 | 0x80;
-        let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+        let mut twins = crate::lockmeter::lock("ho:twins", &self.twins);
         let written: Vec<_> = twins
             .values_mut()
             .filter(|u| u.behind[0] == Some(true) || u.late)
@@ -8093,7 +8094,7 @@ impl HostList {
     /// The draw or dispatch just prepared is recorded: the twins it writes
     /// now hold what their depth textures lack.
     pub(crate) fn twins_written(&self) {
-        let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+        let mut twins = crate::lockmeter::lock("ho:twins", &self.twins);
         for u in twins.values_mut().filter(|u| u.writing) {
             u.writing = false;
             u.behind[0] = Some(true);
@@ -8131,11 +8132,11 @@ impl HostList {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
-        let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        let states = crate::lockmeter::lock("ho:states", &self.states);
         // The copies (depth texture, twin, whether into the twin); the
         // sides are then as this list leaves them.
         let mut syncs = Vec::new();
-        let twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+        let twins = crate::lockmeter::lock("ho:twins", &self.twins);
         for u in twins.values() {
             let real = u.twin.behind.load(Ordering::Relaxed);
             let mut behind = [real & 1 != 0, real & 2 != 0];
@@ -8203,7 +8204,7 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         leaving.sort_by_key(|l| std::sync::Arc::as_ptr(&l.0) as usize);
         // The records the list's draws read from slots (`crate::indirect::gather`).
-        let gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+        let gather = crate::lockmeter::lock("ho:gather", &self.gather);
         let gathered = gather.sets.iter().any(|s| s.records() > 0);
         if barriers.is_empty() && syncs.is_empty() && !gathered && detiles.is_empty() {
             return None;
@@ -8273,7 +8274,7 @@ impl HostList {
     /// From here on the list gathers no records (`crate::indirect::gather`):
     /// what is about to be recorded may write arguments.
     pub(crate) fn gather_close(&self) {
-        let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+        let mut gather = crate::lockmeter::lock("ho:gather", &self.gather);
         gather.closed = true;
         gather.segments.open.clear();
         gather.segments.dispatched = false;
@@ -8283,13 +8284,13 @@ impl HostList {
     /// `crate::indirect::segments_across`: the prelude's gathering ends, the
     /// open segment stays and is marked ([`HostList::segments_dispatched`]).
     pub(crate) fn gather_close_prelude(&self) {
-        self.gather.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
+        crate::lockmeter::lock("ho:gather", &self.gather).closed = true;
     }
 
     /// What is about to be recorded may write arguments: the segment open now ends
     /// (`crate::indirect::gather_segments`), whatever the prelude's gathering does.
     pub(crate) fn segments_end(&self) {
-        let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+        let mut gather = crate::lockmeter::lock("ho:gather", &self.gather);
         gather.segments.open.clear();
         gather.segments.dispatched = false;
     }
@@ -8299,7 +8300,7 @@ impl HostList {
     /// (D3D12's rule), so the open segment stays open until that barrier or
     /// the next indirect draw, whichever comes first.
     pub(crate) fn segments_dispatched(&self) {
-        let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+        let mut gather = crate::lockmeter::lock("ho:gather", &self.gather);
         if !gather.segments.open.is_empty() {
             gather.segments.dispatched = true;
         }
@@ -8311,7 +8312,7 @@ impl HostList {
     /// gathered from here on. (Without the switch nothing is noted: the
     /// list stops gathering whole, as before.)
     pub(crate) fn gather_wrote(&self, copy: u64) {
-        let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+        let mut gather = crate::lockmeter::lock("ho:gather", &self.gather);
         // Shaders about to write: the open segment ends (`crate::indirect::gather_segments`).
         gather.segments.open.clear();
         if crate::indirect::gather_by_copy_kept() {
@@ -8330,7 +8331,7 @@ impl HostList {
             crate::indirect::GATHER_NONE[why].fetch_add(1, Ordering::Relaxed);
             None
         };
-        let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+        let mut gather = crate::lockmeter::lock("ho:gather", &self.gather);
         if gather.closed || gather.written.contains(&src_id) {
             drop(gather);
             if !crate::indirect::gather_segments() {
@@ -8413,7 +8414,7 @@ impl HostList {
             (buffer.clone(), u64::from(pass.pass) * pass_bytes + u64::from(i) * u64::from(stride))
         };
         {
-            let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+            let mut gather = crate::lockmeter::lock("ho:gather", &self.gather);
             // A draw after a dispatch the open segment outlived
             // (`crate::indirect::segments_across`): that dispatch may have
             // written its record, so the segment ends before it.
@@ -8438,7 +8439,7 @@ impl HostList {
         let Some(table) = self.scratch(4 + u64::from(SEGMENT_PASS) * 4) else {
             return fell_back();
         };
-        let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+        let mut gather = crate::lockmeter::lock("ho:gather", &self.gather);
         let segments = &mut gather.segments;
         if segments.passes >= SEGMENT_PASSES {
             return fell_back();
@@ -8504,7 +8505,7 @@ impl HostList {
         }
         {
             let started = std::time::Instant::now();
-            let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
+            let at = crate::lockmeter::lock("ho:notes", &self.notes).len() as u32;
             if let Some((heap, _)) = self.stamps() && at < STAMPS - 1 {
                 // SAFETY: an open list and our query heap.
                 unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
@@ -8543,14 +8544,14 @@ impl HostList {
                 return false;
             }
         }
-        self.states.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
-            && self.twins.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        crate::lockmeter::lock("ho:states", &self.states).is_empty()
+            && crate::lockmeter::lock("ho:twins", &self.twins).is_empty()
     }
 
     /// Notes a pipeline the list binds; called where it is bound.
     pub(crate) fn used_pipeline(&self, name: &str) {
         {
-            let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
+            let mut pipelines = crate::lockmeter::lock("ho:pipelines", &self.pipelines);
             if !pipelines.contains(name) {
                 pipelines.insert(name.to_owned());
             }
@@ -8590,7 +8591,7 @@ impl HostList {
     }
 
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
-        self.deferred.lock().unwrap_or_else(|e| e.into_inner())
+        crate::lockmeter::lock("ho:deferred", &self.deferred)
     }
 
     /// A constant buffer at `address` (`len` bytes, in `shadow`) the list
@@ -8620,7 +8621,7 @@ impl HostList {
         if from + len > width {
             return None;
         }
-        let mut fills = self.card_fills.lock().unwrap_or_else(|e| e.into_inner());
+        let mut fills = crate::lockmeter::lock("ho:card_fills", &self.card_fills);
         if fills.is_none() {
             let buffer = host()?.uav_buffer(ROOM)?;
             name(&buffer, || "list card fills".to_owned());
@@ -8828,7 +8829,7 @@ impl HostList {
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
         let host = host()?;
-        let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+        let mut s = crate::lockmeter::lock("ho:scratch", &self.scratch);
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
             let (buffer, data) = host.upload_buffer(len)?;
@@ -8862,7 +8863,7 @@ impl HostList {
     /// The bytes of scratch chunks the list holds now (after a reset:
     /// none while lists share their chunks).
     pub(crate) fn scratch_kept(&self) -> u64 {
-        let scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+        let scratch = crate::lockmeter::lock("ho:scratch", &self.scratch);
         scratch.chunks.iter().map(|c| c.1).sum()
     }
 
@@ -8870,17 +8871,17 @@ impl HostList {
     /// submission of the list from the first use after a reset on.
     /// The list's window of indirect draws clamped together (`crate::indirect::windowed`).
     pub(crate) fn clamp_window(&self) -> std::sync::MutexGuard<'_, Option<crate::indirect::Window>> {
-        self.clamp_window.lock().unwrap_or_else(|e| e.into_inner())
+        crate::lockmeter::lock("ho:clamp_window", &self.clamp_window)
     }
 
     /// An occlusion query begun on the host in this list ([`crate::query::begin`]).
     pub(crate) fn query_opened(&self, host: ID3D12QueryHeap, kind: u32, index: u32, console: usize) {
-        self.open_queries.lock().unwrap_or_else(|e| e.into_inner()).push((host, kind, index, console));
+        crate::lockmeter::lock("ho:open_queries", &self.open_queries).push((host, kind, index, console));
     }
 
     /// The query `index` of the console heap `console` was ended in this list ([`crate::query::end`]).
     pub(crate) fn query_closed(&self, console: usize, index: u32) {
-        self.open_queries.lock().unwrap_or_else(|e| e.into_inner()).retain(|q| !(q.3 == console && q.2 == index));
+        crate::lockmeter::lock("ho:open_queries", &self.open_queries).retain(|q| !(q.3 == console && q.2 == index));
     }
 
     pub(crate) fn budget(&self) -> Option<u64> {
@@ -9004,7 +9005,7 @@ impl HostList {
     /// [`HostList::reset`].
     pub(crate) fn indirect_scratch(&self, size: u64) -> Option<ID3D12Resource> {
         let needed = size.max(64 << 10);
-        let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
+        let mut slot = crate::lockmeter::lock("ho:indirect_args", &self.indirect_args);
         if let Some((buffer, cap)) = &*slot
             && *cap >= needed
         {
@@ -10372,7 +10373,7 @@ impl Host {
             return None;
         };
         let (width, height) = (desc.Width as u32, desc.Height);
-        let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
+        let mut presenter = crate::lockmeter::lock("ho:presenter", &self.presenter);
         if presenter.is_none() {
             *presenter = match self.presenter(width, height, format) {
                 Ok(p) => Some(p),
@@ -10908,7 +10909,7 @@ fn last_notes(runs: &[&HostList]) -> String {
     {
         let mut text = String::new();
         for (i, r) in runs.iter().enumerate() {
-            let notes = r.notes.lock().unwrap_or_else(|e| e.into_inner());
+            let notes = crate::lockmeter::lock("ho:notes", &r.notes);
             for (n, _) in notes.iter().rev().take(6).rev() {
                 text.push_str(&format!("; list {i} of {}, of its {}: {n}", runs.len(), notes.len()));
             }

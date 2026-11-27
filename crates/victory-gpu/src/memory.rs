@@ -488,7 +488,7 @@ pub(crate) fn ready(
     constants: &[u32],
     writes: bool,
 ) -> Option<Ready> {
-    let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = crate::lockmeter::lock("me:MEMORY", &MEMORY);
     if guard.is_none() {
         *guard = Memory::new();
     }
@@ -637,7 +637,7 @@ pub(crate) fn ready(
 /// request #589, AscilCH.)
 pub(crate) fn forget_heap(heap: &HostHeap) {
     let key = std::ptr::from_ref(heap) as usize;
-    if let Some(m) = MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+    if let Some(m) = crate::lockmeter::lock("me:MEMORY", &MEMORY).as_mut() {
         m.heaps.remove(&key);
     }
 }
@@ -646,5 +646,5 @@ pub(crate) fn forget_heap(heap: &HostHeap) {
 /// address `key` (tests).
 #[cfg(test)]
 pub(crate) fn has_run(key: usize) -> bool {
-    MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|m| m.heaps.contains_key(&key))
+    crate::lockmeter::lock("me:MEMORY", &MEMORY).as_ref().is_some_and(|m| m.heaps.contains_key(&key))
 }

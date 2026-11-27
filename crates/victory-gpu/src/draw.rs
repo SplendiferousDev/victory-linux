@@ -938,7 +938,7 @@ static FRAME: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 /// The draws traced since the last call.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn take_frame() -> Vec<String> {
-    std::mem::take(&mut *FRAME.lock().unwrap_or_else(|e| e.into_inner()))
+    std::mem::take(&mut *crate::lockmeter::lock("dr:FRAME", &FRAME))
 }
 
 /// Draws, mesh dispatches and dispatches recorded but not run on the host
@@ -1087,7 +1087,7 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "diagnostics")]
 fn dropped(pipeline: usize) {
     crate::pipeline::note_drop(pipeline as This);
-    if let Some(last) = FRAME.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
+    if let Some(last) = crate::lockmeter::lock("dr:FRAME", &FRAME).last_mut() {
         last.push_str(" DROPPED");
     }
 }
@@ -2227,7 +2227,7 @@ impl State {
         // (`alt`, the marked pass's turn just over: the host copies it
         // kept are let go.)
         if crate::heap_pass::marked_paused() {
-            *MARKED.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *crate::lockmeter::lock("dr:MARKED", &MARKED) = None;
         }
         let started = std::time::Instant::now();
         // Per host heap: the host copy and range each slot's buffer view
@@ -2245,7 +2245,7 @@ impl State {
                 .filter(|&n: &u64| n > 0)
                 .unwrap_or(64)
         });
-        let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut kept = crate::lockmeter::lock("dr:RANGES", &RANGES);
         let (passes, ranges) = kept
             .get_or_insert_with(Default::default)
             .entry(std::ptr::from_ref(host) as usize)
@@ -2317,7 +2317,7 @@ impl State {
         // into the opening cutscene; with every frame it ran on). The pass
         // costs some 30 ms a frame this way.
         static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
-        let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut whole = crate::lockmeter::lock("dr:WHOLE", &WHOLE);
         let whole = whole.get_or_insert_with(Default::default);
         for (shadow, from, to) in spans.values() {
             if shadow.unwatched() {
@@ -2382,7 +2382,7 @@ impl State {
         frame: u64,
     ) {
         let started = std::time::Instant::now();
-        let mut kept = MARKED.lock().unwrap_or_else(|e| e.into_inner());
+        let mut kept = crate::lockmeter::lock("dr:MARKED", &MARKED);
         let heaps = kept.get_or_insert_with(Default::default);
         // `alt`, back from the other pass's turn: what is kept here is from
         // before it, and it took the heap's changes meanwhile. Both start
@@ -2390,7 +2390,7 @@ impl State {
         // begins at pass 0, which looks at every slot).
         if crate::heap_pass::RESUMED.swap(false, Ordering::Relaxed) {
             heaps.clear();
-            *RANGES.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *crate::lockmeter::lock("dr:RANGES", &RANGES) = None;
         }
         // One list of freed table entries for all heaps: each heap's pass is told.
         let forgotten = crate::descriptor::take_forgotten();
@@ -2463,7 +2463,7 @@ impl State {
         // Memory that is not write-watched is copied whole by every refresh
         // (see the other pass).
         static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
-        let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut whole = crate::lockmeter::lock("dr:WHOLE", &WHOLE);
         let whole = whole.get_or_insert_with(Default::default);
         for (shadow, from, to) in &spans {
             if shadow.unwatched() {
@@ -3907,7 +3907,7 @@ impl State {
         static CENSUS: std::sync::Mutex<Census> =
             std::sync::Mutex::new((u64::MAX, std::collections::BTreeMap::new(), [0; 9]));
         let frame = crate::frame::current();
-        let mut census = CENSUS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut census = crate::lockmeter::lock("dr:CENSUS", &CENSUS);
         if census.0 != frame {
             let draws: u32 = census.1.values().sum();
             if draws > 0 {
@@ -4473,7 +4473,7 @@ impl State {
         if logged {
             tracing::debug!("draw {line}");
         }
-        let mut frame = FRAME.lock().unwrap_or_else(|e| e.into_inner());
+        let mut frame = crate::lockmeter::lock("dr:FRAME", &FRAME);
         if frame.len() < 256 {
             frame.push(line);
         }
@@ -5266,7 +5266,7 @@ fn host_spread_signature(root: &ID3D12RootSignature, param: u32, index: u32) -> 
     type Key = (usize, u32, u32);
     static MADE: std::sync::Mutex<Vec<(Key, ID3D12CommandSignature)>> = std::sync::Mutex::new(Vec::new());
     let key = (root.as_raw() as usize, param, index);
-    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut made = crate::lockmeter::lock("dr:MADE", &MADE);
     if let Some((_, s)) = made.iter().find(|(k, _)| *k == key) {
         return Some(s.clone());
     }
@@ -5307,7 +5307,7 @@ fn host_spread_signature(root: &ID3D12RootSignature, param: u32, index: u32) -> 
 fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
         std::sync::Mutex::new(Vec::new());
-    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut made = crate::lockmeter::lock("dr:MADE", &MADE);
     if let Some((_, s)) = made.iter().find(|(k, _)| *k == (kind, stride)) {
         return Some(s.clone());
     }

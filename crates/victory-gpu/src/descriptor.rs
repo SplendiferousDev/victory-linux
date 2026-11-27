@@ -88,7 +88,7 @@ impl Heap {
         {
             return None;
         }
-        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pending = crate::lockmeter::lock("de:pending", &self.pending);
         // A recorder can take the fast path as soon as the OnceLock is
         // initialized. Publish only after replaying the queued writes.
         self.host
@@ -142,7 +142,7 @@ static SYNCING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// The shader-visible heap holding `handle`, and the descriptor's index.
 #[cfg(windows)]
 fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
-    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let heaps = crate::lockmeter::read("de:SHADER_HEAPS", &SHADER_HEAPS);
     let &(_, _, at) = heaps
         .iter()
         .find(|&&(start, end, _)| (start..end).contains(&handle))?;
@@ -158,7 +158,7 @@ fn mirror(handle: u64) {
     let Some((heap, index)) = shader_slot(handle) else {
         return;
     };
-    let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
+    let mut pending = crate::lockmeter::lock("de:pending", &heap.pending);
     match heap.host.get() {
         None => pending.push(index),
         Some(host) => {
@@ -189,8 +189,8 @@ pub(crate) fn sync_heaps() {
     let started = std::time::Instant::now();
     let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
     let mut page_bytes: Vec<u8> = Vec::new();
-    let _one = SYNCING.lock().unwrap_or_else(|e| e.into_inner());
-    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let _one = crate::lockmeter::lock("de:SYNCING", &SYNCING);
+    let heaps = crate::lockmeter::read("de:SHADER_HEAPS", &SHADER_HEAPS);
     for &(start, end, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
@@ -524,7 +524,7 @@ fn changed_slots(
 /// same address before the list is reset.
 #[cfg(windows)]
 pub(crate) fn release_dynamic(heap: usize, id: u64, first: u32, n: u32) {
-    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let heaps = crate::lockmeter::read("de:SHADER_HEAPS", &SHADER_HEAPS);
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
@@ -537,7 +537,7 @@ pub(crate) fn release_dynamic(heap: usize, id: u64, first: u32, n: u32) {
 impl Drop for Heap {
     fn drop(&mut self) {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
-        let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
+        let mut heaps = crate::lockmeter::write("de:SHADER_HEAPS", &SHADER_HEAPS);
         heaps.retain(|&(_, _, h)| h != at);
         drop(heaps);
         // Its run of title-memory views goes with it: a heap made later at
@@ -928,11 +928,11 @@ fn words_for(view: View) -> [u32; 2] {
 }
 
 fn views_read() -> std::sync::RwLockReadGuard<'static, Views> {
-    VIEWS.read().unwrap_or_else(|e| e.into_inner())
+    crate::lockmeter::read("de:VIEWS", &VIEWS)
 }
 
 fn views_write() -> std::sync::RwLockWriteGuard<'static, Views> {
-    VIEWS.write().unwrap_or_else(|e| e.into_inner())
+    crate::lockmeter::write("de:VIEWS", &VIEWS)
 }
 
 /// For the memory line: the distinct views kept ([`Views`]), those of them
@@ -1031,7 +1031,7 @@ fn wait_for(resource: usize, handle: u64) {
     /// know (its views are being copied about): its host copy is made.
     const MOST: usize = 64;
     let many = {
-        let mut waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner());
+        let mut waiting = crate::lockmeter::lock("de:WAITING", &WAITING);
         let slots = waiting.entry(resource).or_default();
         if !slots.contains(&handle) {
             slots.push(handle);
@@ -1053,7 +1053,7 @@ fn wait_for(resource: usize, handle: u64) {
 /// the thread that submits: a slot is read when a list runs.
 #[cfg(windows)]
 pub(crate) fn make_waiting() {
-    let made = std::mem::take(&mut *MADE_LATE.lock().unwrap_or_else(|e| e.into_inner()));
+    let made = std::mem::take(&mut *crate::lockmeter::lock("de:MADE_LATE", &MADE_LATE));
     for resource in made {
         let handles = WAITING
             .lock()
@@ -1131,7 +1131,7 @@ static FORGOTTEN: std::sync::Mutex<(bool, bool, Vec<u32>)> = std::sync::Mutex::n
 const FORGOTTEN_MOST: usize = 1 << 20;
 
 fn note_forgotten(i: u32) {
-    let mut forgotten = FORGOTTEN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut forgotten = crate::lockmeter::lock("de:FORGOTTEN", &FORGOTTEN);
     let (asked, overflowed, list) = &mut *forgotten;
     if !*asked || *overflowed {
         return;
@@ -1147,7 +1147,7 @@ fn note_forgotten(i: u32) {
 /// The table entries freed since the last call (in any order, maybe
 /// twice); `None` on the first call and when too many were to be kept.
 pub(crate) fn take_forgotten() -> Option<Vec<u32>> {
-    let mut forgotten = FORGOTTEN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut forgotten = crate::lockmeter::lock("de:FORGOTTEN", &FORGOTTEN);
     let (asked, overflowed, list) = &mut *forgotten;
     let known = *asked && !*overflowed;
     *asked = true;
@@ -1423,7 +1423,7 @@ pub(crate) extern "system" fn create_heap(
     #[cfg(windows)]
     if visible {
         let at = std::ptr::from_ref::<Heap>(&heap) as usize;
-        let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
+        let mut heaps = crate::lockmeter::write("de:SHADER_HEAPS", &SHADER_HEAPS);
         heaps.push((start, start + size, at));
     }
     #[cfg(not(windows))]
