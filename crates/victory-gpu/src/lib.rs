@@ -99,6 +99,8 @@ mod tablekey;
 #[cfg(windows)]
 mod memory;
 #[cfg(windows)]
+mod mergecap;
+#[cfg(windows)]
 mod shadow;
 #[cfg(windows)]
 mod stretch;
