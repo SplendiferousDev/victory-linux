@@ -8757,7 +8757,6 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
-        deferred.gpu_written.clear();
         if list_reuse_set() {
             deferred.filled.clear();
         }
@@ -9117,11 +9116,11 @@ impl HostList {
         let mut deferred = self.deferred();
         deferred.copies.push(Step::Run(Box::new(work), Some((at, len))));
         deferred.refreshed.clear();
-        deferred.gpu_written.clear();
         if list_reuse_set() {
             deferred.filled.clear();
         }
-        self.deferred().forget_gpu_writes();
+        // Through the guard held above: the list's lock is not reentrant.
+        deferred.forget_gpu_writes();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
