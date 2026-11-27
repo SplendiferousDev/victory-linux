@@ -230,6 +230,7 @@ impl Meter {
                 slow[2] as f64 / 1e3
             );
             video_memory_line();
+            crate::windowstat::line();
             if crate::shadow::cards() {
                 let per_frame = |i: usize| card[i] as f64 / frames;
                 tracing::info!(

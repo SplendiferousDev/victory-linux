@@ -8372,8 +8372,10 @@ impl HostList {
                         return none(4);
                     };
                     name(&budget, || "indirect budget of gathered records".to_owned());
+                    crate::windowstat::budget_made();
                     gather.budget = Some(budget);
                 }
+                crate::windowstat::gather_set(gather.spare.is_empty());
                 let scratch = match gather.spare.pop() {
                     Some(scratch) => scratch,
                     None => {
@@ -9027,6 +9029,7 @@ impl HostList {
             .max(needed)
             .next_multiple_of(64 << 10);
         let buffer = host()?.uav_buffer(alloc)?;
+        crate::windowstat::scratch_made(alloc);
         name(&buffer, || format!("indirect arguments {alloc:#x}"));
         let old = slot.replace((buffer.clone(), alloc));
         drop(slot);

@@ -119,6 +119,8 @@ mod tight;
 #[cfg(windows)]
 mod watch;
 #[cfg(windows)]
+mod windowstat;
+#[cfg(windows)]
 mod texback;
 
 #[cfg(windows)]

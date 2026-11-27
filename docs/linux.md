@@ -298,6 +298,15 @@ per event and treats it as a driver error: the same counter and switch as the
 event log. Lines the file held when the layer started, or stamped before it,
 are ignored. Faults of any process on the card count, as on Windows.
 
+NVIDIA's kernel driver can also fail inside its own records of the card's
+address space with no Xid: `intermapRegisterDmaMapping: Failed to insert new
+mapping node`, then assertions in `gpu_vaspace.c`. Its error path leaves those
+records inconsistent; once the process went on and later spun inside the
+driver with its lock held, which hung the desktop until a reboot. On these
+lines the layer ends the process at once (`TerminateProcess`, no exit
+handlers), so the kernel frees what it held before anything else is asked of
+the driver. `VICTORY_DRIVER_BROKEN_EXIT=0` keeps running instead.
+
 The watcher costs nothing measurable (one idle `journalctl`). `--no-fault-watch`
 turns it off; with `VICTORY_HOST_FAULT_FILE` already set, `run.sh` starts no
 watcher and the layer reads the given file (run `fault-watch.sh <file>`
