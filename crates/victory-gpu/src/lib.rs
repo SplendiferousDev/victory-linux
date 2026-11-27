@@ -101,6 +101,8 @@ mod memory;
 #[cfg(windows)]
 mod mergecap;
 #[cfg(windows)]
+mod threeway;
+#[cfg(windows)]
 mod shadow;
 #[cfg(windows)]
 mod stretch;
