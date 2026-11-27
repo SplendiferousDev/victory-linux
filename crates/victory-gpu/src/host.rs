@@ -4714,12 +4714,20 @@ fn late_line(frames: f64) {
         if crate::shadow::merge_on_card_wanted() {
             let [submissions, dispatches, mask, copies, plain, past] =
                 [0, 1, 2, 3, 4, 5].map(|i| CARD_MERGES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            let torn = crate::mergecap::taken(frames);
             tracing::info!(
                 "of them through the merge on the card per frame (VICTORY_MERGE_ON_CARD=1 turned it on): {submissions:.1} submissions with \
                  {dispatches:.1} dispatches and {:.0} KiB of masks; {copies:.1} submissions sent theirs up as copies; plain CPU sides \
-                 (VICTORY_CARD_TWIN_PLAIN): {:.0} KiB of title bytes beside the masks, {past:.1} copies sent as copies (past the most a submission)",
+                 (VICTORY_CARD_TWIN_PLAIN): {:.0} KiB of title bytes beside the masks, {past:.1} copies sent as copies (past the most a submission); \
+                 MERGE TORN WORDS (a title byte merged beside a shader's byte) in {:.1} landed pieces: {:.1} of 4 bytes, {:.1} of 8, {:.1} of 16; \
+                 cap of changed runs (VICTORY_MERGE_CAP) {}",
                 mask / 1024.0,
-                plain / 1024.0
+                plain / 1024.0,
+                torn[0],
+                torn[1],
+                torn[2],
+                torn[3],
+                crate::mergecap::cap_said()
             );
         }
     }

@@ -4561,6 +4561,16 @@ impl Shadow {
                     // Through the merge on the card: every changed byte,
                     // however many runs they are, and no other.
                     if let Some(card) = self.card.as_ref().filter(|_| merge_on_card()) {
+                        // With the cap (`VICTORY_MERGE_CAP`): as the copies
+                        // of the runs below, the flights are settled past it.
+                        if crate::mergecap::cap_on() {
+                            let runs = joined_over(changed_runs(title, held), merge_gap()).len();
+                            if runs > *runs_left {
+                                MERGE_GAVE_UP[2].fetch_add(1, Ordering::Relaxed);
+                                return true;
+                            }
+                            *runs_left -= runs;
+                        }
                         let (runs, bytes) = card.masked.lock().unwrap_or_else(|e| e.into_inner()).take(at, title, held);
                         MERGED[1].fetch_add(runs, Ordering::Relaxed);
                         MERGED[2].fetch_add(bytes, Ordering::Relaxed);
@@ -5246,15 +5256,22 @@ impl Shadow {
         // byte is taken for what the CPU's side holds, so the merge below
         // finds no write in it.
         let mut patched: Option<Vec<u8>> = None;
+        // The masked bytes, as offsets of `gpu`, for the torn words' count
+        // (`crate::mergecap`).
+        let mut marks: Vec<usize> = Vec::new();
         {
             let masked = card.masked.lock().unwrap_or_else(|e| e.into_inner());
             let sent = masked.sent.iter().filter(|s| s.0 > fetched_after).map(|s| &*s.1);
             for blocks in std::iter::once(&masked.pending).chain(sent) {
                 masked_in(blocks, at, at + gpu.len(), |i| {
                     patched.get_or_insert_with(|| gpu.to_vec())[i - at] = held[i - at];
+                    marks.push(i - at);
                 });
             }
         }
+        // What the card's side held, before the masked bytes were taken
+        // for the CPU's; and where the piece starts.
+        let (card_bytes, piece_at) = (gpu, at);
         let gpu = patched.as_deref().unwrap_or(gpu);
         let Some(first) = first_difference(gpu, held) else {
             return 0;
@@ -5272,6 +5289,19 @@ impl Shadow {
                 .filter(|&(a, b)| a < at + n && b > at)
                 .collect()
         };
+        // Torn words: a masked byte (the title's, on the card through the
+        // merge) beside a byte a shader wrote there.
+        if !marks.is_empty() {
+            marks.sort_unstable();
+            marks.dedup();
+            let wrote = |i: usize| {
+                i >= first
+                    && i <= last
+                    && card_bytes[i] != held[i - first]
+                    && !skip.iter().any(|&(a, b)| piece_at + i >= a && piece_at + i < b)
+            };
+            crate::mergecap::count(crate::mergecap::torn_words(start + piece_at, card_bytes.len(), &marks, wrote));
+        }
         read_room(title, n);
         // Who touched the page since its last store is looked at before our
         // own read of it (`VICTORY_BACK_READS`): counted only.
