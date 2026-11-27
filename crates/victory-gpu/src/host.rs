@@ -7,6 +7,7 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
+use victory_core::timeline;
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
@@ -1129,6 +1130,7 @@ static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
 /// Adds to [`SUBMISSION_US`] and to the frame log's totals.
 fn submission_us(i: usize, us: u64) {
     SUBMISSION_US[i].fetch_add(us, Ordering::Relaxed);
+    timeline::span([timeline::Span::Prepare, timeline::Span::CardWait][i], us);
     crate::framelog::add([crate::framelog::T::PrepareUs, crate::framelog::T::CardWaitUs][i], us);
     if i == 0 {
         crate::framelog::add(crate::framelog::T::Submissions, 1);
@@ -1144,6 +1146,9 @@ fn preparing(i: usize, n: u64) {
 /// Adds to [`COPY_BACK`] and to the frame log's totals.
 fn copy_back(i: usize, n: u64) {
     COPY_BACK[i].fetch_add(n, Ordering::Relaxed);
+    if i == 0 {
+        timeline::span(timeline::Span::Landing, n);
+    }
     crate::framelog::add([crate::framelog::T::CopyBackUs, crate::framelog::T::CopyBackBytes][i], n);
 }
 
@@ -1152,7 +1157,10 @@ fn copy_back(i: usize, n: u64) {
 fn card_clock_us(i: usize, us: u64) {
     CARD_CLOCK_US[i].fetch_add(us, Ordering::Relaxed);
     match i {
-        0 => crate::framelog::add(crate::framelog::T::CardIdleUs, us),
+        0 => {
+            crate::framelog::add(crate::framelog::T::CardIdleUs, us);
+            timeline::span(timeline::Span::CardIdle, us);
+        }
         1 => crate::framelog::add(crate::framelog::T::CardIdleBehindUs, us),
         _ => {}
     }
@@ -1245,6 +1253,7 @@ fn card_clock_watch(clock: &'static CardClock) {
         let mut state = clock.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.0 == target && state.1.is_none() {
             state.1 = Some((std::time::Instant::now(), worked()));
+            timeline::mark(timeline::Mark::CardDry);
         }
     }
 }

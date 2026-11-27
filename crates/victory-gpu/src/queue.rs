@@ -527,11 +527,14 @@ fn worker() {
     crate::framelog::keep_on_fast_cores("victory-submit");
     loop {
         {
+            let idle = std::time::Instant::now();
             let mut work = lock(&WORK.0);
             while !*work {
                 work = WORK.1.wait(work).unwrap_or_else(|e| e.into_inner());
             }
             *work = false;
+            drop(work);
+            victory_core::timeline::span(victory_core::timeline::Span::Idle, idle.elapsed().as_micros() as u64);
         }
         let started = std::time::Instant::now();
         let (user, kernel) = crate::framelog::thread_times();
@@ -1158,6 +1161,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     #[cfg(windows)]
     let started = std::time::Instant::now();
     execute_now(this, count, lists);
+    victory_core::timeline::mark(victory_core::timeline::Mark::TitleSubmit);
     #[cfg(windows)]
     {
         let us = started.elapsed().as_micros() as u64;
@@ -1423,7 +1427,11 @@ extern "system" fn present(
 ) -> HRESULT {
     #[cfg(windows)]
     let presenting = std::time::Instant::now();
+    victory_core::timeline::present_call();
     let hr = present_now(this, planes, plane_parameters);
+    if let Some(line) = victory_core::timeline::present_return() {
+        tracing::info!("{line}");
+    }
     #[cfg(windows)]
     {
         crate::framelog::add(crate::framelog::T::PresentUs, presenting.elapsed().as_micros() as u64);

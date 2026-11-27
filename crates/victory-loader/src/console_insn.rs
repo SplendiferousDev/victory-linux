@@ -119,6 +119,7 @@ fn loop15() -> bool {
 /// A wait of this thread has ended: counted, and said if it is one to say.
 fn wait_ended(begin: u64, last: u64, address: usize, wanted: u64, spins: u32) {
     let us = last.saturating_sub(begin);
+    victory_core::timeline::title_wait(us, clock_us().saturating_sub(last));
     for (i, least) in [0u64, 1_000, 5_000, 20_000].into_iter().enumerate() {
         if us >= least {
             WAITS[2 * i].fetch_add(1, Relaxed);

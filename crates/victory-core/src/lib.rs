@@ -4,11 +4,13 @@
 //! * [`policy`]: the runtime half of rule #1, refusing to write
 //!   game-derived data into the source tree.
 //! * [`logging`]: one tracing setup for all binaries.
+//! * [`timeline`]: a frame's hand-offs stamped (`VICTORY_FRAME_TIMELINE=1`).
 //! * [`wake`]: blocking waits for values in the title's memory, and the runtime's wakes.
 
 pub mod config;
 pub mod logging;
 pub mod policy;
+pub mod timeline;
 pub mod wake;
 
 pub use config::Config;
