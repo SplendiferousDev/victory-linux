@@ -278,6 +278,16 @@ impl Lane {
         }
     }
 
+    /// The lane's fence: it reaches a job's number when the card has run it.
+    pub(crate) fn fence(&self) -> &ID3D12Fence {
+        &self.fence
+    }
+
+    /// The number of the last job sent (0: none).
+    pub(crate) fn last_sent(&self) -> u64 {
+        lock(&self.state).sent
+    }
+
     /// Whether the card has run `job`.
     pub(crate) fn done(&self, job: u64) -> bool {
         // SAFETY: a plain query.
@@ -447,6 +457,11 @@ impl Second {
     pub(crate) fn sent_up(&self, direct: &ID3D12CommandQueue, number: u64) {
         // SAFETY: a live queue and our fence.
         let _ = crate::hostq::signal(direct, &self.order, number);
+    }
+
+    /// The fence [`Second::sent_up`] signals on the direct queue.
+    pub(crate) fn order_fence(&self) -> &ID3D12Fence {
+        &self.order
     }
 
     /// The last numbered send of title bytes the card has finished: every

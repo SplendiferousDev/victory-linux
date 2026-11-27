@@ -4715,19 +4715,22 @@ fn late_line(frames: f64) {
             let [submissions, dispatches, mask, copies, plain, past] =
                 [0, 1, 2, 3, 4, 5].map(|i| CARD_MERGES[i].swap(0, Ordering::Relaxed) as f64 / frames);
             let torn = crate::mergecap::taken(frames);
+            let qsync = crate::mergecap::qsync_taken(frames);
             tracing::info!(
                 "of them through the merge on the card per frame (VICTORY_MERGE_ON_CARD=1 turned it on): {submissions:.1} submissions with \
                  {dispatches:.1} dispatches and {:.0} KiB of masks; {copies:.1} submissions sent theirs up as copies; plain CPU sides \
                  (VICTORY_CARD_TWIN_PLAIN): {:.0} KiB of title bytes beside the masks, {past:.1} copies sent as copies (past the most a submission); \
                  MERGE TORN WORDS (a title byte merged beside a shader's byte) in {:.1} landed pieces: {:.1} of 4 bytes, {:.1} of 8, {:.1} of 16; \
-                 cap of changed runs (VICTORY_MERGE_CAP) {}",
+                 cap of changed runs (VICTORY_MERGE_CAP) {}; VICTORY_MERGE_QSYNC: {:.1} merges waited for copy-queue fetches, {:.1} fetches behind a merge",
                 mask / 1024.0,
                 plain / 1024.0,
                 torn[0],
                 torn[1],
                 torn[2],
                 torn[3],
-                crate::mergecap::cap_said()
+                crate::mergecap::cap_said(),
+                qsync[0],
+                qsync[1]
             );
         }
     }
@@ -5742,6 +5745,9 @@ impl Host {
                                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                                     )]);
                                 }
+                                if crate::mergecap::barrier_on() {
+                                    crate::mergecap::ahead(list);
+                                }
                                 list.SetComputeRootSignature(&merge.root);
                                 list.SetPipelineState(&merge.pso);
                                 let source = match (title, staging) {
@@ -5773,6 +5779,9 @@ impl Host {
                                     }
                                     laid_at += stretch.bytes;
                                 }
+                                if crate::mergecap::barrier_on() {
+                                    crate::mergecap::behind(list, &shadow.buffer, before.is_some());
+                                }
                                 Some(stretches)
                             }
                             _ => None,
@@ -5791,6 +5800,9 @@ impl Host {
                     #[cfg(feature = "diagnostics")]
                     crate::shot::span_end(list, shot_span, 0, || "SYNC LIST (changed bytes go up to the card's copies and are hashed)".to_string());
                     list.Close()?;
+                    if !merges.is_empty() && crate::mergecap::qsync_on() {
+                        crate::mergecap::before_merge_send(&self.queue, sent_as)?;
+                    }
                     crate::hostq::execute(&self.queue, &[Some(list.cast()?)]);
                     Ok(())
                 })()
@@ -5960,6 +5972,7 @@ impl Host {
             if check { work.check.push(list) } else { work.sync.push(list) }
         }
         work.out = work.out.saturating_sub(1);
+        crate::shadow::relay_landed(plan.sent_as);
         // With the relay other plans may be on the card, their results
         // not read yet: the area starts again only when none is out.
         if !relay() || work.out == 0 {
@@ -6140,7 +6153,14 @@ impl Host {
                     for (shadow, lo, hi, at) in &pieces {
                         copy.1.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
                     }
-                    let job = second.down.send(copy, &[(&self.fence, behind)], total)?;
+                    let job = if crate::mergecap::qsync_on() {
+                        crate::mergecap::fetch_after_merges(second, |merged| match merged {
+                            Some(m) => second.down.send(copy, &[(&self.fence, behind), m], total),
+                            None => second.down.send(copy, &[(&self.fence, behind)], total),
+                        })?
+                    } else {
+                        second.down.send(copy, &[(&self.fence, behind)], total)?
+                    };
                     second.down.wait(job, event)?;
                     if beside {
                         // Whatever had started by now may have been
@@ -6204,11 +6224,13 @@ impl Host {
         }
         let mut title = Vec::new();
         let mut written = 0;
+        // The oldest flight landed here: merges sent after it ran over its writes.
+        let oldest = plans.iter().map(|p| p.1.sent_as).min().unwrap_or(0);
         for (shadow, lo, hi, at) in &pieces {
             // SAFETY: the mapping of the fetched bytes, `total` of them;
             // the copy into it has run.
             let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-            let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
+            let merged = shadow.card_merge_relay(*lo, gpu, after, oldest, &mut title);
             shadow.walls_merged(gpu.len(), merged);
             written += merged;
         }
@@ -6352,7 +6374,7 @@ impl Host {
             // SAFETY: inside the mapping of the slots (checked above); the
             // copy into it ran in the plan's flight, which the card has run.
             let gpu = unsafe { std::slice::from_raw_parts(*at as *const u8, hi - lo) };
-            written += shadow.card_merge_relay(*lo, gpu, *after, &mut title);
+            written += shadow.card_merge_relay(*lo, gpu, *after, *after, &mut title);
             bytes += (hi - lo) as u64;
         }
         for plan in plans {
