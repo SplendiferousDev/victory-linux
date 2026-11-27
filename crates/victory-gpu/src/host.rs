@@ -1280,6 +1280,7 @@ pub(crate) fn host() -> Option<&'static Host> {
 
 fn create() -> windows::core::Result<Host> {
     crate::drvwatch::start();
+    crate::hostfault::start();
     crate::spread::start();
     // Diagnostics: RenderDoc, if asked for, before any graphics interface
     // is made (`VICTORY_RENDERDOC`).
