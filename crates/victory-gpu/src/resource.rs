@@ -1499,10 +1499,16 @@ pub(crate) fn room() -> bool {
     if let Some(limit) = limit {
         return filled < limit;
     }
+    // `VICTORY_VRAM_HEADROOM_MB`: held back over the line (before the
+    // floor: in a world the copies the title fills can stay under it),
+    // and the rule below plans against the budget less the headroom.
+    if crate::headroom::holds(crate::headroom::Hold::Textures, 0) {
+        return false;
+    }
     if filled < FLOOR {
         return true;
     }
-    match crate::host::host().and_then(|h| h.video_memory()) {
+    match crate::headroom::planned(crate::host::host().and_then(|h| h.video_memory())) {
         // What is kept for card copies of title buffers not made yet
         // (`crate::shadow::card_room_kept`) and for the render targets a
         // world makes in its first frame ([`targets_room_kept`]) counts as
@@ -1830,7 +1836,7 @@ pub(crate) fn let_go_idle() {
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
     }
-    let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
+    let idle_ms = crate::host::vram_idle_ms(crate::headroom::planned(crate::host::host().and_then(|h| h.video_memory())));
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);

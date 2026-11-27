@@ -50,6 +50,8 @@ pub mod dxgi;
 mod fastcopy;
 pub mod fence;
 pub mod frame;
+#[cfg(windows)]
+mod headroom;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod heap_pass;
 #[cfg(windows)]

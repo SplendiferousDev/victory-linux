@@ -675,6 +675,7 @@ fn video_memory_line() {
         now[4].saturating_sub(then[4]) >> 20,
     );
     at_budget_note(most, least, now, then, at.saturating_sub(before));
+    crate::headroom::memory_line(most, least, at);
 }
 
 /// Memory lines in a row whose card use reached its budget ([`at_budget`]).

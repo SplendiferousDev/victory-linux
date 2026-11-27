@@ -917,7 +917,15 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     // (With `card_room_kept_on` the texture queue kept this copy's room
     // free, and the copy may go up to the queue's own line.)
     let hundredths = if card_room_kept_on() { 97 } else { 80 };
-    if let Some([budget, used, ..]) = host.video_memory()
+    // `VICTORY_VRAM_HEADROOM_MB` (`crate::headroom`): held back over its
+    // line, and planned against the budget less it. Turned down like a
+    // copy without room: its room is no longer kept.
+    if crate::headroom::holds(crate::headroom::Hold::CardCopies, size) {
+        CARD_REFUSED[0].fetch_add(1, Ordering::Relaxed);
+        CARD_REFUSED[1].fetch_add(size, Ordering::Relaxed);
+        return None;
+    }
+    if let Some([budget, used, ..]) = crate::headroom::planned(host.video_memory())
         && used + size > budget / 100 * hundredths
     {
         // Said, with the numbers it was decided by: run 193 made 31 copies
@@ -1077,7 +1085,11 @@ fn window_card_room(size: u64, how: &str) -> bool {
             );
         }
     };
-    if let Some([budget, used, ..]) = host.video_memory()
+    if crate::headroom::holds(crate::headroom::Hold::Windows, size) {
+        say(1, "held back over the headroom line (VICTORY_VRAM_HEADROOM_MB) from the card:");
+        return false;
+    }
+    if let Some([budget, used, ..]) = crate::headroom::planned(host.video_memory())
         && used + size > budget / 10 * 8
     {
         say(1, "no room on the card for");
