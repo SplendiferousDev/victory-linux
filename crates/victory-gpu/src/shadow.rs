@@ -1199,6 +1199,14 @@ pub(crate) fn masked_patch_now() -> bool {
     if !PATCH_READY.load(Ordering::Relaxed) {
         return false;
     }
+    // While the card's memory is at its budget (`crate::host::at_budget`)
+    // the flights are settled as without the switch: no words buffers are
+    // asked for in the state the driver's mapping records broke in.
+    // `VICTORY_MASKED_PATCH_AT_BUDGET=1` patches all the same.
+    static AT_BUDGET_TOO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if crate::host::at_budget() && !*AT_BUDGET_TOO.get_or_init(|| std::env::var_os("VICTORY_MASKED_PATCH_AT_BUDGET").is_some_and(|v| v == "1")) {
+        return false;
+    }
     match masked_patch_mode() {
         0 => false,
         1 => true,

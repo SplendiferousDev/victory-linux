@@ -674,6 +674,67 @@ fn video_memory_line() {
         then[3] >> 20,
         now[4].saturating_sub(then[4]) >> 20,
     );
+    at_budget_note(most, least, now, then, at.saturating_sub(before));
+}
+
+/// Memory lines in a row whose card use reached its budget ([`at_budget`]).
+static AT_BUDGET_LINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether the card's own memory was at its budget at the last memory line
+/// (use at most >= budget at least, less `VICTORY_AT_BUDGET_MARGIN_MB`,
+/// default 32). Every NVIDIA "intermapRegisterDmaMapping: Failed to insert
+/// new mapping node" of 2026-11-26/27 (qWs-s2, qM1-ab, b10-Y4nosweep) came
+/// in a run whose memory lines stood at the budget for half or more of the
+/// run's world time (other runs: under a third, nearly all 0): the driver
+/// then moves allocations out of the card's memory, remapping their
+/// addresses, while we make and let go of buffers.
+pub(crate) fn at_budget() -> bool {
+    AT_BUDGET_LINES.load(Ordering::Relaxed) > 0
+}
+
+/// Said with the memory line: the card's memory at its budget (the first
+/// line of a streak, then every sixth, ~30 s), and buffers made per second
+/// past `VICTORY_MAPPING_CHURN_WARN` (MB a second of upload + shared + card
+/// buffers made, default 150; 0 off). `VICTORY_AT_BUDGET_EXIT=<lines>`
+/// ends the run (as a broken driver does, `crate::hostfault`) after that
+/// many lines in a row at the budget: for unattended soaks.
+fn at_budget_note(most: u64, least: u64, now: [u64; 6], then: [u64; 6], ms: u64) {
+    static MARGIN: OnceLock<u64> = OnceLock::new();
+    static CHURN: OnceLock<u64> = OnceLock::new();
+    static EXIT: OnceLock<u64> = OnceLock::new();
+    let env = |name: &str, default: u64| std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default);
+    let margin = *MARGIN.get_or_init(|| env("VICTORY_AT_BUDGET_MARGIN_MB", 32)) << 20;
+    let churn_mb = *CHURN.get_or_init(|| env("VICTORY_MAPPING_CHURN_WARN", 150));
+    let exit_after = *EXIT.get_or_init(|| env("VICTORY_AT_BUDGET_EXIT", 0));
+    let made_mb = (0..3).map(|i| now[i].saturating_sub(then[i])).sum::<u64>() >> 20;
+    if churn_mb != 0 && made_mb * 1000 / ms.max(1) > churn_mb {
+        tracing::warn!(
+            "buffers made in the last {ms} ms: {made_mb} MB (upload + shared + card), more than VICTORY_MAPPING_CHURN_WARN={churn_mb} MB a second: \
+             each one a mapping the card's driver makes and takes down"
+        );
+    }
+    if least != u64::MAX && most + margin >= least {
+        let n = AT_BUDGET_LINES.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 || n.is_multiple_of(6) {
+            tracing::warn!(
+                "the card's memory is at its budget ({} MB in use, budget {} MB; {n} memory lines in a row): the driver moves allocations \
+                 out of it, the state every NVIDIA mapping-record failure so far came in",
+                most >> 20,
+                least >> 20
+            );
+        }
+        if exit_after != 0 && n >= exit_after {
+            tracing::error!("the card's memory stood at its budget for {n} memory lines (VICTORY_AT_BUDGET_EXIT={exit_after}): the run ends now");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            // SAFETY: ends this process, as `crate::hostfault` does.
+            unsafe {
+                windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), 0xB0D6);
+            }
+            std::process::abort();
+        }
+    } else if AT_BUDGET_LINES.swap(0, Ordering::Relaxed) > 0 {
+        tracing::info!("the card's memory is under its budget again ({} MB in use, budget {} MB)", most >> 20, least >> 20);
+    }
 }
 
 /// Whether the card's memory is looked at between the memory lines
@@ -2421,6 +2482,12 @@ struct CardWork {
     pso_eight: Option<ID3D12PipelineState>,
     /// With `VICTORY_MASKED_PATCH`: [`MASKED_PATCH`]'s pipeline, with `root`.
     patch_pso: Option<ID3D12PipelineState>,
+    /// The masked patch's word buffers, kept for the run and given out
+    /// again once the host's fence has passed the submission that read
+    /// them (buffer, mapping, bytes, fence value): no buffer is made and
+    /// let go per submission (each one a mapping the card's driver makes
+    /// and takes down). At most [`PATCH_POOL_MOST`].
+    patch_pool: Vec<(ID3D12Resource, usize, u64, u64)>,
     /// One dword per piece compared, set where the piece differs: PC
     /// memory, mapped (buffer, mapping, bytes).
     differs: (ID3D12Resource, usize, u64),
@@ -2529,6 +2596,49 @@ fn masked_patch_code() -> windows::core::Result<windows::Win32::Graphics::Direct
     }
     code.ok_or_else(windows::core::Error::empty)
 }
+
+/// Word buffers the masked patch keeps ([`CardWork::patch_pool`]): with
+/// one submission in four or so sending a patch and the flights in the air
+/// few, eight are more than are ever out at once.
+const PATCH_POOL_MOST: usize = 8;
+
+impl Host {
+    /// PC memory for `bytes` bytes of masked patch words, mapped: a pooled
+    /// buffer the card has finished with (`completed`, the host fence's
+    /// value) of that size or more, else a new one of `bytes` rounded up to
+    /// 1 MiB (4 MiB at least), kept for the run. Not given out again before
+    /// the fence reaches `until`. With the pool full and every buffer out, a
+    /// free one too small is let go to make room; with none free, `None`
+    /// (the caller then fails the plan as before).
+    fn patch_words_buffer(&self, work: &mut CardWork, bytes: u64, completed: u64, until: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let free = work
+            .patch_pool
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.3 <= completed && p.2 >= bytes)
+            .min_by_key(|(_, p)| p.2)
+            .map(|(at, _)| at);
+        if let Some(at) = free {
+            work.patch_pool[at].3 = until;
+            return Some((work.patch_pool[at].0.clone(), work.patch_pool[at].1 as *mut u8));
+        }
+        if work.patch_pool.len() >= PATCH_POOL_MOST {
+            // The smallest free one goes (it was too small for this one).
+            let small = work.patch_pool.iter().enumerate().filter(|(_, p)| p.3 <= completed).min_by_key(|(_, p)| p.2).map(|(at, _)| at)?;
+            work.patch_pool.swap_remove(small);
+            PATCH_POOL_GONE.fetch_add(1, Ordering::Relaxed);
+        }
+        let size = bytes.max(4 << 20).next_multiple_of(1 << 20);
+        let (buffer, data) = self.shared_buffer(size)?;
+        name(&buffer, || "masked patch words (kept)".into());
+        work.patch_pool.push((buffer.clone(), data as usize, size, until));
+        Some((buffer, data))
+    }
+}
+
+/// Pooled patch word buffers let go to make room for a bigger one (should
+/// stay near 0; the frame line can say it beside `PATCHED`).
+pub(crate) static PATCH_POOL_GONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub(crate) const CARD_COMPARE: &str = r#"
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
@@ -5107,6 +5217,7 @@ impl Host {
                 pso_wide,
                 pso_eight,
                 patch_pso,
+                patch_pool: Vec::new(),
                 differs: (differs, data as usize, RESULTS),
                 fetched: None,
                 taken: 0,
@@ -5460,7 +5571,10 @@ impl Host {
         let mut patch_at: Vec<(Arc<crate::shadow::Shadow>, u32, u32)> = Vec::new();
         if !patches.is_empty() {
             let words: usize = patches.iter().map(|(_, w, _)| w.len()).sum();
-            match (work.patch_pso.is_some(), self.shared_buffer((words * 12).max(16) as u64)) {
+            // SAFETY: a plain query.
+            let completed = unsafe { self.fence.GetCompletedValue() };
+            let pooled = if work.patch_pso.is_some() { self.patch_words_buffer(work, (words * 12).max(16) as u64, completed, sent + 1) } else { None };
+            match (work.patch_pso.is_some(), pooled) {
                 (true, Some((buffer, data))) => {
                     name(&buffer, || "masked patch words".into());
                     let mut first = 0u32;
