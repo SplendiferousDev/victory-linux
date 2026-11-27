@@ -28,6 +28,7 @@ mod cardmeter;
 #[cfg(windows)]
 mod coarseclock;
 mod fasthash;
+mod shardlock;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod renderdoc;
 #[cfg(all(windows, feature = "diagnostics"))]

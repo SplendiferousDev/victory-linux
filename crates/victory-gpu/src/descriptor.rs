@@ -732,8 +732,9 @@ struct Views {
 /// Read far more often than written: every slot a draw reads through a
 /// table is looked up here, on several recording threads at once in the
 /// world. Readers share it; only a view not seen before (a new table entry
-/// or shape) and a released resource take it alone.
-static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
+/// or shape) and a released resource take it alone. (Readers by shard
+/// with `VICTORY_VIEWS_SHARDED`: `crate::shardlock`.)
+static VIEWS: crate::shardlock::Sharded<Views> = crate::shardlock::Sharded::new("de:VIEWS", Views {
     list: Vec::new(),
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
@@ -927,12 +928,14 @@ fn words_for(view: View) -> [u32; 2] {
     views_write().entry(view)
 }
 
-fn views_read() -> std::sync::RwLockReadGuard<'static, Views> {
-    crate::lockmeter::read("de:VIEWS", &VIEWS)
+#[track_caller]
+fn views_read() -> crate::shardlock::ReadGuard<'static, Views> {
+    VIEWS.read()
 }
 
-fn views_write() -> std::sync::RwLockWriteGuard<'static, Views> {
-    crate::lockmeter::write("de:VIEWS", &VIEWS)
+#[track_caller]
+fn views_write() -> crate::shardlock::WriteGuard<'static, Views> {
+    VIEWS.write()
 }
 
 /// For the memory line: the distinct views kept ([`Views`]), those of them
@@ -1822,8 +1825,8 @@ mod tests {
             View::Placed(_, r, _) => *r == resource,
             _ => false,
         };
-        let entries = || VIEWS.read().unwrap().list.iter().filter(|(v, _)| mine(v)).count();
-        let shapes = || VIEWS.read().unwrap().shapes.iter().filter(|s| s.1 == resource).count();
+        let entries = || VIEWS.read().list.iter().filter(|(v, _)| mine(v)).count();
+        let shapes = || VIEWS.read().shapes.iter().filter(|s| s.1 == resource).count();
         for n in 0..20_000u64 {
             let address = 0x6_0000_0000 + n * 0x100;
             create_cbv(null, &[address as u32, (address >> 32) as u32, 512, 0], at);
