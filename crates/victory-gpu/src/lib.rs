@@ -110,6 +110,8 @@ mod mergecap;
 #[cfg(windows)]
 mod threeway;
 #[cfg(windows)]
+mod patchspan;
+#[cfg(windows)]
 mod shadow;
 #[cfg(windows)]
 mod stretch;

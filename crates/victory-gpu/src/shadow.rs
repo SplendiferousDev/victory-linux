@@ -1161,6 +1161,12 @@ pub(crate) type PatchWord = [u32; 3];
 struct Patch {
     words: Vec<PatchWord>,
     ranges: Vec<(usize, usize)>,
+    /// With `VICTORY_PATCH_SPANS` (`crate::patchspan`): pages patched and
+    /// noted once each, in place of their runs in `ranges`.
+    spans: Vec<crate::patchspan::PageSpan>,
+    /// With [`relay`]: those spans once taken, with the number of the send
+    /// that took them, as the copy's `sent` notes (kept as long).
+    sent: Vec<(crate::patchspan::PageSpan, u64)>,
 }
 
 /// `VICTORY_MASKED_PATCH`: 0 off, 1 on, 2 in turn (`alt`). Upstream turns
@@ -1405,19 +1411,37 @@ pub(crate) fn card_patches(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<PatchWord>, Ve
             if patch.words.is_empty() {
                 continue;
             }
-            let taken = std::mem::take(&mut *patch);
+            // The notes of spans sent (`crate::patchspan`) stay behind.
+            let taken = Patch {
+                words: std::mem::take(&mut patch.words),
+                ranges: std::mem::take(&mut patch.ranges),
+                spans: std::mem::take(&mut patch.spans),
+                sent: Vec::new(),
+            };
             if relay() {
                 let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
                 sent.retain(|s| s.2 > fetched);
                 sent.extend(taken.ranges.iter().map(|&(a, b)| (a, b, sent_as)));
+                drop(sent);
+                patch.sent.retain(|s| s.1 > fetched);
+                patch.sent.extend(taken.spans.iter().map(|s| (s.clone(), sent_as)));
+                crate::patchspan::count(1, taken.spans.len() as u64);
+            } else {
+                patch.sent.clear();
             }
             taken
         };
         // The runs are only hashed again (`Host::card_before`): lean, one
-        // span per piece ([`piece_spans`]), the same pieces.
-        let runs = joined(taken.ranges);
+        // span per piece ([`piece_spans`]), the same pieces. A span of a
+        // page (`crate::patchspan`) lies in one piece, as its runs do.
+        let mut ranges = taken.ranges;
+        ranges.extend(taken.spans.iter().map(|s| (s.from, s.to)));
+        let runs = joined(ranges);
         let runs = if patch_lean_now() { piece_spans(shadow.start as usize, &runs) } else { runs };
-        out.push((shadow.clone(), folded(taken.words), runs));
+        // Words of spans alone are made in order, one per dword: folding
+        // them would change nothing.
+        let words = if !taken.spans.is_empty() && crate::patchspan::strictly_rising(&taken.words) { taken.words } else { folded(taken.words) };
+        out.push((shadow.clone(), words, runs));
     }
     out
 }
@@ -5231,6 +5255,44 @@ impl Shadow {
                         }
                         continue;
                     }
+                    // `VICTORY_PATCH_SPANS` (`crate::patchspan`): one pass
+                    // makes the words, the runs counted beside; the page is
+                    // noted once.
+                    if merge_gap() == 0 && at + n <= u32::MAX as usize && crate::patchspan::on() && masked_patch_now() {
+                        let timed = std::time::Instant::now();
+                        let mut words = Vec::new();
+                        let (count, bytes) = crate::patchspan::page_words(at, title, held, &mut words);
+                        let lean = count <= *runs_left && count > patch_page_runs() && patch_lean_now();
+                        if count > *runs_left || lean {
+                            if lean {
+                                PATCH_LEAN[0].fetch_add(1, Ordering::Relaxed);
+                                PATCH_LEAN[1].fetch_add(count as u64, Ordering::Relaxed);
+                            }
+                            crate::patchspan::apply(&words, at, held);
+                            MERGED[1].fetch_add(count as u64, Ordering::Relaxed);
+                            MERGED[2].fetch_add(bytes as u64, Ordering::Relaxed);
+                            crate::patchspan::count(0, 1);
+                            crate::patchspan::count(2, words.len() as u64);
+                            self.card_patched_span(words);
+                            crate::patchspan::count(3, timed.elapsed().as_nanos() as u64);
+                        } else {
+                            *runs_left -= count;
+                            for (r, m) in crate::patchspan::page_runs(&words, at, n) {
+                                held[r..r + m].copy_from_slice(&title[r..r + m]);
+                                self.card_changed(at + r, at + r + m);
+                                MERGED[1].fetch_add(1, Ordering::Relaxed);
+                                MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                            }
+                        }
+                        drop(before);
+                        if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
+                            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                            if let Some(at) = copied.get_mut(page - base) {
+                                *at = now;
+                            }
+                        }
+                        continue;
+                    }
                     let runs = joined_over(changed_runs(title, held), merge_gap());
                     // Lean ([`patch_lean_now`]): a page of many runs is
                     // patched under the cap too.
@@ -5736,6 +5798,24 @@ impl Shadow {
         patch.ranges.extend(runs.iter().map(|&(r, m)| (at + r, at + r + m)));
     }
 
+    /// As [`Shadow::card_patched`], with the page's words made in one pass
+    /// (`crate::patchspan::page_words`): noted as one span, not run by run.
+    fn card_patched_span(&self, words: Vec<PatchWord>) {
+        let Some(card) = &self.card else {
+            return;
+        };
+        if words.is_empty() {
+            return;
+        }
+        PATCHED[0].fetch_add(1, Ordering::Relaxed);
+        PATCHED[1].fetch_add(words.len() as u64, Ordering::Relaxed);
+        let span = crate::patchspan::PageSpan::new(words);
+        let _dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        let mut patch = card.patch.lock().unwrap_or_else(|e| e.into_inner());
+        patch.words.extend_from_slice(&span.words);
+        patch.spans.push(span);
+    }
+
     /// Of a copy in the card's memory: the CPU's side as a buffer in the PC's
     /// memory (`None` where it is plain memory, [`plain_twins`]: see
     /// [`Shadow::plain_side`]), the card side's bytes from before if made
@@ -6009,13 +6089,25 @@ impl Shadow {
             let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
             let patch = card.patch.lock().unwrap_or_else(|e| e.into_inner());
             let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
-            dirty
+            let mut skip: Vec<(usize, usize)> = dirty
                 .iter()
                 .copied()
                 .chain(patch.ranges.iter().copied())
                 .chain(sent.iter().filter(|s| s.2 > fetched_after).map(|s| (s.0, s.1)))
                 .filter(|&(a, b)| a < at + n && b > at)
-                .collect()
+                .collect();
+            // Pages patched and noted as one span each
+            // (`crate::patchspan`): their exact changed bytes, not the
+            // span, since a byte between them may be a shader's write.
+            let spans = patch.spans.iter().chain(patch.sent.iter().filter(|s| s.1 > fetched_after).map(|s| &s.0));
+            let mut exact = 0;
+            for span in spans.filter(|s| s.overlaps(at, at + n)) {
+                exact += crate::patchspan::runs_in(&span.words, at, at + n, &mut skip);
+            }
+            if exact > 0 {
+                crate::patchspan::count(4, exact as u64);
+            }
+            skip
         };
         // Torn words: a masked byte (the title's, on the card through the
         // merge) beside a byte a shader wrote there.
@@ -6933,6 +7025,10 @@ mod window_tests {
 }
 
 #[cfg(test)]
+#[path = "patchspan_tests.rs"]
+mod patchspan_tests;
+
+#[cfg(test)]
 mod card_merge_tests {
     use super::{Card, Shadow, Side};
     use std::sync::Mutex;
@@ -6943,7 +7039,7 @@ mod card_merge_tests {
 
     /// A plain buffer on the software adapter: what a copy's `buffer` and
     /// its card's `staging` are; the merge never touches them.
-    fn warp_buffer() -> Option<ID3D12Resource> {
+    pub(super) fn warp_buffer() -> Option<ID3D12Resource> {
         // SAFETY: plain DXGI and D3D12 creation calls on the software adapter.
         unsafe {
             let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;

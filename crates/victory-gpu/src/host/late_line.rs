@@ -122,6 +122,18 @@ pub(super) fn late_line(frames: f64) {
                     made[1]
                 );
             }
+            if crate::patchspan::set() {
+                let m = [0, 1, 2, 3, 4].map(|i| crate::patchspan::METER[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                tracing::info!(
+                    "the masked patch by spans (VICTORY_PATCH_SPANS), per frame: {:.1} pages patched in one pass, {:.1} spans noted as sent, \
+                     {:.0} words, {:.2} ms making them and noting the pages, {:.0} exact runs read off spans by landings",
+                    m[0],
+                    m[1],
+                    m[2],
+                    m[3] / 1e6,
+                    m[4]
+                );
+            }
         }
     }
     {
