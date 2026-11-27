@@ -19,6 +19,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
 mod card_merge;
+mod gpu_once;
 mod slot_wait;
 mod stall_report;
 mod twin_ring;
@@ -2901,6 +2902,9 @@ struct Deferred {
     /// second fill would find holding the same bytes
     /// ([`HostList::fill_scratch`]).
     filled: std::collections::HashMap<(usize, usize), u64>,
+    /// Buffer ranges declared written by shaders since the last title copy
+    /// (host copy, address, bytes); see `gpu_once`.
+    gpu_written: std::collections::HashSet<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Last GPU source copied into each aliased host texture in this list.
@@ -8550,6 +8554,7 @@ impl HostList {
         if list_reuse_set() {
             deferred.filled.clear();
         }
+        deferred.forget_gpu_writes();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -8586,9 +8591,7 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        self.declare_gpu_write(shadow, address, len);
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
@@ -8898,6 +8901,7 @@ impl HostList {
         if list_reuse_set() {
             self.deferred().filled.clear();
         }
+        self.deferred().forget_gpu_writes();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
