@@ -2364,6 +2364,8 @@ struct CardWork {
     /// With `VICTORY_CARD_HASH_WIDE=alt` ([`card_hash_wide_now`]): the compare of [`CARD_COMPARE_WIDE`], `pso`
     /// being [`CARD_COMPARE`]'s. Both shaders declare the same root signature.
     pso_wide: Option<ID3D12PipelineState>,
+    /// The wide compare loading eight places at once (`card_ports`, `VICTORY_CARD_COMPARE_EIGHT`).
+    pso_eight: Option<ID3D12PipelineState>,
     /// One dword per piece compared, set where the piece differs: PC
     /// memory, mapped (buffer, mapping, bytes).
     differs: (ID3D12Resource, usize, u64),
@@ -2595,10 +2597,11 @@ fn card_hash_wide_now() -> bool {
 impl CardWork {
     /// The compare's pipeline for a submission ([`card_hash_wide_now`]) and whether it is the wide form.
     fn compare_for(&self, wide_now: bool) -> (&ID3D12PipelineState, bool) {
-        match (&self.pso_wide, wide_now) {
+        let chosen = match (&self.pso_wide, wide_now) {
             (Some(wide), true) => (wide, true),
             _ => (&self.pso, card_hash_wide()),
-        }
+        };
+        card_ports::compare_or_eight(chosen, &self.pso_eight)
     }
 }
 
@@ -5168,6 +5171,7 @@ impl Host {
             // With `alt`: the wide form's pipeline beside it (`pso` is then the thread-a-piece form, as
             // `card_compare_source` gives it without `=1`). None if it does not build: every submission keeps `pso`.
             let pso_wide = (card_hash_mode() == 2).then(|| self.make_card_compare_wide(&root)).flatten();
+            let pso_eight = self.make_card_compare_eight(&root);
             Ok(CardWork {
                 sync: vec![list()?],
                 check: vec![list()?],
@@ -5175,6 +5179,7 @@ impl Host {
                 root,
                 pso,
                 pso_wide,
+                pso_eight,
                 differs: (differs, data as usize, RESULTS),
                 fetched: None,
                 taken: 0,
