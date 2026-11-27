@@ -82,7 +82,7 @@ const SPANS: usize = 8;
 /// Threads that made list calls: their id and their nanoseconds inside them this frame, and
 /// calls this frame. A thread takes a slot at its first call; past the last slot it is counted
 /// in the sums only.
-const RECORDERS: usize = 32;
+const RECORDERS: usize = crate::recording::THREADS;
 static RECORDER_ID: [AtomicU64; RECORDERS] = [const { AtomicU64::new(0) }; RECORDERS];
 static RECORDER_NS: [AtomicU64; RECORDERS] = [const { AtomicU64::new(0) }; RECORDERS];
 static RECORD_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -94,7 +94,13 @@ thread_local! {
 }
 
 /// A list call of the title took `ns` nanoseconds and returned now.
+#[track_caller]
 pub fn recorded(ns: u64) {
+    recorded_at(ns, std::panic::Location::caller());
+}
+
+/// As [`recorded`], the call known by the place `at` that took it.
+pub fn recorded_at(ns: u64, at: &'static std::panic::Location<'static>) {
     if !on() {
         return;
     }
@@ -112,24 +118,32 @@ pub fn recorded(ns: u64) {
     if slot < RECORDERS {
         RECORDER_NS[slot].fetch_add(ns, Relaxed);
     }
+    crate::recording::call(slot, at, ns, now_us());
     RECORD_CALLS.fetch_add(1, Relaxed);
     span(Span::Record, ns / 1_000);
 }
 
 /// This frame's list calls: calls, threads that made any, the busiest thread's milliseconds.
+#[cfg(test)]
 fn take_recorders() -> [f64; 3] {
+    take_recorders_each().0
+}
+
+/// [`take_recorders`], and each thread's nanoseconds.
+fn take_recorders_each() -> ([f64; 3], [u64; RECORDERS]) {
     let mut threads = 0;
     let mut most = 0;
-    for ns in &RECORDER_NS {
-        let v = ns.swap(0, Relaxed);
+    let each: [u64; RECORDERS] = std::array::from_fn(|i| RECORDER_NS[i].swap(0, Relaxed));
+    for &v in &each {
         threads += u64::from(v > 0);
         most = most.max(v);
     }
-    [
+    let all = [
         RECORD_CALLS.swap(0, Relaxed) as f64,
         threads as f64,
         most as f64 / 1e6,
-    ]
+    ];
+    (all, each)
 }
 
 static FIRST: [AtomicU64; MARKS] = [const { AtomicU64::new(u64::MAX) }; MARKS];
@@ -384,7 +398,10 @@ pub fn present_return() -> Option<String> {
     let last = std::array::from_fn(|i| LAST[i].swap(0, Relaxed));
     let sum = std::array::from_fn(|i| SUM[i].swap(0, Relaxed));
     let in_present = std::array::from_fn(|i| IN_PRESENT[i].swap(0, Relaxed));
-    let recorders = take_recorders();
+    let (recorders, each) = take_recorders_each();
+    if start != 0 {
+        crate::recording::keep(crate::recording::frame(start, now, &each));
+    }
     if start == 0 {
         return None;
     }

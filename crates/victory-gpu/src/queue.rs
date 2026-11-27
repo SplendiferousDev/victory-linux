@@ -1436,6 +1436,7 @@ extern "system" fn present(
         if let Some(locks) = crate::lockmeter::line() {
             tracing::info!("{locks}");
         }
+        tracing::info!("{}", victory_core::recording::line());
     }
     #[cfg(windows)]
     {

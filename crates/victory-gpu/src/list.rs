@@ -142,6 +142,7 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
 #[cfg(windows)]
+#[track_caller]
 fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let Some(list) = host_list(this) else { return };
     #[cfg(feature = "diagnostics")]
@@ -152,7 +153,7 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     let state = unsafe { &(*this.cast::<List>()).state };
     f(list, &mut crate::lockmeter::lock("li:state", &state));
     if let Some(timed) = timed {
-        victory_core::timeline::recorded(timed.elapsed().as_nanos() as u64);
+        victory_core::timeline::recorded_at(timed.elapsed().as_nanos() as u64, std::panic::Location::caller());
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::recorded(started);

@@ -10,6 +10,7 @@
 pub mod config;
 pub mod logging;
 pub mod policy;
+pub mod recording;
 pub mod timeline;
 pub mod wake;
 
