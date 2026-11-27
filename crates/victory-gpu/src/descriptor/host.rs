@@ -1304,6 +1304,44 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     unsafe { host.device.CreateSampler(&desc, at) };
 }
 
+/// Whether failed searches for free dynamic slots are at most
+/// [`WALKS_MOST`] a frame (`VICTORY_DYNAMIC_WALKS`; off unless `1`, `alt`
+/// in turn). Each release allows a search again (`too_long`), and releases
+/// come all the time: where the slots ran out, each table of the frame that
+/// did not fit walked every slot again. Past the limit a table is refused
+/// until the next frame, as one no search has room for. (After Belobug
+/// 788ea467: frames of 7 to 11 seconds in a heavy place.)
+static WALKS_SWITCH: crate::alt::Switch = crate::alt::Switch::new(
+    "VICTORY_DYNAMIC_WALKS",
+    "failed searches for free dynamic descriptor slots are at most eight a frame",
+);
+
+/// Failed searches a frame past which none is made ([`WALKS_SWITCH`]).
+const WALKS_MOST: u64 = 8;
+
+/// The frame of the failed searches counted, and their number.
+static WALKS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether a search may be made now ([`WALKS_SWITCH`]): always with it off.
+fn walk_allowed(walks: &[std::sync::atomic::AtomicU64; 2]) -> bool {
+    !WALKS_SWITCH.on() || walks_left(walks, crate::queue::presented())
+}
+
+/// Whether fewer than [`WALKS_MOST`] searches failed in `frame` (`walks`:
+/// the frame counted and its count, started again in a new frame).
+fn walks_left(walks: &[std::sync::atomic::AtomicU64; 2], frame: u64) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if walks[0].swap(frame, Relaxed) != frame {
+        walks[1].store(0, Relaxed);
+    }
+    walks[1].load(Relaxed) < WALKS_MOST
+}
+
+/// A search found no run ([`walk_allowed`] allowed it).
+fn walked_in_vain(walks: &[std::sync::atomic::AtomicU64; 2]) {
+    walks[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
@@ -1321,7 +1359,7 @@ impl HostHeap {
         #[cfg(feature = "diagnostics")]
         DYNAMIC_LOW.fetch_min(free, std::sync::atomic::Ordering::Relaxed);
         let room = free >= n;
-        let enough = room && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
+        let enough = room && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed) && walk_allowed(&WALKS);
         let n = n as usize;
         // Search from `next` on, then from the start and on past `next` by
         // n - 1 slots: a free run that lies across `next` is found only
@@ -1356,6 +1394,7 @@ impl HostHeap {
         let Some(first) = found else {
             if enough {
                 self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
+                walked_in_vain(&WALKS);
             }
             #[cfg(feature = "diagnostics")]
             DYNAMIC_WHY[if !room {
@@ -4268,6 +4307,21 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Failed searches for dynamic slots: at most eight a frame, counted
+    /// again from none in the next.
+    #[test]
+    fn failed_slot_searches_are_at_most_eight_a_frame() {
+        let walks: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+        for _ in 0..WALKS_MOST {
+            assert!(walks_left(&walks, 5));
+            walked_in_vain(&walks);
+        }
+        assert!(!walks_left(&walks, 5));
+        assert!(walks_left(&walks, 6));
+        walked_in_vain(&walks);
+        assert!(walks_left(&walks, 6));
+    }
 
     /// A range of dynamic slots is given back only to the heap that took it:
     /// the title can release a heap while a list still holds slots of it,
