@@ -160,7 +160,8 @@ pub(crate) fn line(frames: f64) {
     let waits = [0, 1, 2, 3].map(|i| WAITS[0][i].swap(0, Ordering::Relaxed));
     let changes = [0, 1, 2].map(|i| CHANGES[0][i].swap(0, Ordering::Relaxed));
     let table = [0, 1, 2, 3].map(|i| TABLE[0][i].swap(0, Ordering::Relaxed));
-    if waits.iter().chain(&changes).chain(&table).all(|&n| n == 0) {
+    let readers = crate::readercheck::take();
+    if waits.iter().chain(&changes).chain(&table).chain(&readers).all(|&n| n == 0) {
         return;
     }
     let f = |n: u64| n as f64 / frames;
@@ -170,7 +171,9 @@ pub(crate) fn line(frames: f64) {
          (VICTORY_SLOT_KIND_WAIT; settles \"a view slot changed kind under flights\"): {:.2}, {:.2} ms waiting, {:.2} written under \
          flights all the same (not waitable there), {:.2} given up; table entries read as constant buffers made constant buffer \
          views (were a null texture view or their own kind): {:.1} without a view, {:.1} buffer views, {:.1} other views, {:.1} \
-         without room for their constants",
+         without room for their constants; reads as constant buffers of slots holding another kind (VICTORY_READER_CHECK): \
+         {:.2} in tables made afresh, {:.2} in tables found made, {:.2} in place; lists run again after their tables were given \
+         back: {:.2}",
         f(changes[0]),
         f(changes[1]),
         f(changes[2]),
@@ -182,6 +185,10 @@ pub(crate) fn line(frames: f64) {
         f(table[1]),
         f(table[2]),
         f(table[3]),
+        f(readers[0]),
+        f(readers[1]),
+        f(readers[2]),
+        f(readers[3]),
     );
 }
 
@@ -191,11 +198,14 @@ pub(crate) fn section(out: &mut String) {
     let w = [0, 1, 2, 3].map(|i| WAITS[1][i].load(Ordering::Relaxed));
     let c = [0, 1, 2].map(|i| CHANGES[1][i].load(Ordering::Relaxed));
     let t = [0, 1, 2, 3].map(|i| TABLE[1][i].load(Ordering::Relaxed));
+    let r = crate::readercheck::totals();
     let _ = write!(
         out,
         "; view slot kind (VICTORY_SLOT_KIND_WAIT={}): changes {} of title slots and {} of per-draw slots under flights, {} with none; \
          waits before a title slot changed kind {} ({} ms), {} written under flights all the same, {} given up; table entries read \
-         as constant buffers made constant buffer views: {} without a view, {} buffer views, {} other views, {} without room",
+         as constant buffers made constant buffer views: {} without a view, {} buffer views, {} other views, {} without room; \
+         reads as constant buffers of slots holding another kind (VICTORY_READER_CHECK={}): {} fresh, {} cache hit, {} in place; \
+         lists run again after their tables were given back: {}",
         u8::from(on()),
         c[0],
         c[1],
@@ -208,6 +218,11 @@ pub(crate) fn section(out: &mut String) {
         t[1],
         t[2],
         t[3],
+        u8::from(crate::readercheck::on()),
+        r[0],
+        r[1],
+        r[2],
+        r[3],
     );
 }
 

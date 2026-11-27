@@ -93,6 +93,8 @@ mod gpuwatch;
 #[cfg(windows)]
 mod slotkind;
 #[cfg(windows)]
+mod readercheck;
+#[cfg(windows)]
 mod memory;
 #[cfg(windows)]
 mod shadow;
