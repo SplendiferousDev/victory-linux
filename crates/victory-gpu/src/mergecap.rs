@@ -1,4 +1,4 @@
-//! Two checks of the merge on the card (`crate::shadow::merge_on_card`):
+//! Checks of the merge on the card (`crate::shadow::merge_on_card`):
 //!
 //! - `VICTORY_MERGE_CAP` (off by default; `1` on, `alt` in turn): the
 //!   title's bytes put in under flights' shader writes go through the
@@ -16,9 +16,141 @@
 //!   mask bit) and a byte a shader wrote on the card (the card's side
 //!   differs from the CPU's there, outside the title's bytes still on
 //!   their way up). Such a word ends up on the card part title, part
-//!   shader: a value no one wrote whole, if the word is one value.
+//!   shader: a value no one wrote whole, if the word is one value. The
+//!   title's bytes looked at are those of merges sent after the landing
+//!   flight's own send (they ran over its shader writes) and those still
+//!   to go up: the notes of sends are kept until the flights before them
+//!   have landed ([`crate::shadow::relay_landed`]).
+//! - `VICTORY_MERGE_QSYNC` (off by default; `1` on, `alt` in turn): with
+//!   fetches on a copy queue (`VICTORY_QUEUE2` bit 1) a fetch of the
+//!   card's copies there never runs beside a merge on the card on the
+//!   direct queue: a fetch waits for the last merge sent before it
+//!   (`Second::order`'s value behind that merge's send), and the direct
+//!   queue waits for the fetches sent before a merge goes to it.
+//! - `VICTORY_MERGE_BARRIER` (off by default; `1` on, `alt` in turn): a
+//!   barrier for every unordered access ahead of and behind each copy's
+//!   merge, and the copy leaves its send list in the state the copies of
+//!   the runs leave it in when nothing hashes it after the merge.
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use windows::Win32::Graphics::Direct3D12::*;
+
+static QSYNC: crate::alt::Switch = crate::alt::Switch::new(
+    "VICTORY_MERGE_QSYNC",
+    "fetches on the copy queue and merges on the card never run beside each other",
+);
+
+static BARRIER: crate::alt::Switch = crate::alt::Switch::new(
+    "VICTORY_MERGE_BARRIER",
+    "barriers for unordered access ahead of and behind each merge on the card",
+);
+
+/// Whether fetches on the copy queue are kept apart from merges now.
+pub(crate) fn qsync_on() -> bool {
+    QSYNC.on()
+}
+
+/// The number of the last send with a merge on the card (`Second::order`
+/// reaches it behind that send's list), 0: none yet. Under [`ORDERING`].
+static LAST_MERGE: AtomicU64 = AtomicU64::new(0);
+
+/// Held from the reading of [`LAST_MERGE`] until the fetch that waits for
+/// it is sent, and from its writing until the direct queue waits for the
+/// fetches sent so far: no fetch is sent between, so each fetch is either
+/// behind a merge or waited for by it.
+static ORDERING: Mutex<()> = Mutex::new(());
+
+/// The send numbered `number` has merges on the card and its list goes to
+/// `direct` next: the direct queue waits for the fetches sent so far on
+/// the copy queue first, and later fetches wait for this send.
+pub(crate) fn before_merge_send(direct: &ID3D12CommandQueue, number: u64) -> windows::core::Result<()> {
+    let Some(second) = crate::queue2::second().filter(|s| s.fetches()) else {
+        return Ok(());
+    };
+    if number == 0 {
+        return Ok(());
+    }
+    let _order = ORDERING.lock().unwrap_or_else(|e| e.into_inner());
+    LAST_MERGE.fetch_max(number, Ordering::AcqRel);
+    let job = second.down.last_sent();
+    if job != 0 && !second.down.done(job) {
+        QSYNC_STATS[0].fetch_add(1, Ordering::Relaxed);
+        crate::hostq::wait(direct, second.down.fence(), job)?;
+    }
+    Ok(())
+}
+
+/// A fetch on the copy queue: `send` sends it with the waits it is given,
+/// to which the last merge's send is added.
+pub(crate) fn fetch_after_merges<T>(
+    second: &crate::queue2::Second,
+    send: impl FnOnce(Option<(&ID3D12Fence, u64)>) -> windows::core::Result<T>,
+) -> windows::core::Result<T> {
+    let _order = ORDERING.lock().unwrap_or_else(|e| e.into_inner());
+    let last = LAST_MERGE.load(Ordering::Acquire);
+    if last != 0 && second.order_done() < last {
+        QSYNC_STATS[1].fetch_add(1, Ordering::Relaxed);
+    }
+    send((last != 0).then(|| (second.order_fence(), last)))
+}
+
+/// Since the last frame-rate line: merges whose send waited for fetches
+/// in the air; fetches that waited for a merge not run yet.
+static QSYNC_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// [`QSYNC_STATS`] since the last asking, per frame of `frames`.
+pub(crate) fn qsync_taken(frames: f64) -> [f64; 2] {
+    [0, 1].map(|i| QSYNC_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames)
+}
+
+/// Whether the merge's barriers are recorded now.
+pub(crate) fn barrier_on() -> bool {
+    BARRIER.on()
+}
+
+/// A barrier for every unordered access.
+fn uav_all() -> D3D12_RESOURCE_BARRIER {
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                pResource: std::mem::ManuallyDrop::new(None),
+            }),
+        },
+    }
+}
+
+/// Ahead of a copy's merge, with [`barrier_on`].
+///
+/// # Safety
+/// `list` is open.
+pub(crate) unsafe fn ahead(list: &ID3D12GraphicsCommandList) {
+    // SAFETY: an open list (the caller's).
+    unsafe { list.ResourceBarrier(&[uav_all()]) };
+}
+
+/// Behind a copy's merge on `buffer`, with [`barrier_on`]: a barrier for
+/// its writes and, if nothing hashes the copy behind it (`hashed`), the
+/// state the copies of the runs leave it in.
+///
+/// # Safety
+/// `list` is open and `buffer` is in the unordered-access state in it.
+pub(crate) unsafe fn behind(list: &ID3D12GraphicsCommandList, buffer: &ID3D12Resource, hashed: bool) {
+    // SAFETY: an open list (the caller's); a live buffer.
+    unsafe {
+        if hashed {
+            list.ResourceBarrier(&[uav_all()]);
+        } else {
+            list.ResourceBarrier(&[
+                uav_all(),
+                crate::host::transition(buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST),
+            ]);
+        }
+    }
+}
 
 static CAP: crate::alt::Switch = crate::alt::Switch::new(
     "VICTORY_MERGE_CAP",

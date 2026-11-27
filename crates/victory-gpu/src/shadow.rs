@@ -605,7 +605,8 @@ pub(crate) fn card_masked(sent_as: u64) -> Vec<(Arc<Shadow>, Arc<MaskBlocks>)> {
         return out;
     }
     let carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
-    let fetched = RELAY_FETCHED.load(Ordering::Acquire);
+    // Kept for the torn words' count until the flights before them landed.
+    let fetched = RELAY_FETCHED.load(Ordering::Acquire).min(RELAY_LANDED.load(Ordering::Acquire));
     for weak in carded.iter() {
         let Some(shadow) = weak.upgrade() else {
             continue;
@@ -1580,6 +1581,17 @@ pub(crate) fn preparing(number: u64) {
 /// card (`crate::host`'s order of the queue) that every fetch still to be
 /// merged came after. Notes of sends up to it are of no use any more.
 static RELAY_FETCHED: AtomicU64 = AtomicU64::new(0);
+
+/// With [`relay`]: the number of the newest flight's send landed so far.
+/// Notes of merges on the card sent up to it ran ahead of every flight
+/// still to land: of no use to the count of torn words
+/// (`crate::mergecap`) either.
+static RELAY_LANDED: AtomicU64 = AtomicU64::new(0);
+
+/// Flights up to the one whose send is numbered `number` have landed.
+pub(crate) fn relay_landed(number: u64) {
+    RELAY_LANDED.fetch_max(number, Ordering::AcqRel);
+}
 
 /// A fetch sent after send `number` is the oldest one that may still be
 /// merged ([`RELAY_FETCHED`]).
@@ -5237,7 +5249,10 @@ impl Shadow {
     /// a copy has no other use for), as [`Shadow::merge_under_writes`].
     /// `title` is scratch memory. Returns the bytes written to title
     /// memory.
-    pub(crate) fn card_merge_relay(&self, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>) -> usize {
+    /// `flight`: the send number of the oldest flight this landing is of;
+    /// the title's bytes of merges sent after it are those the count of
+    /// torn words looks at (`crate::mergecap`).
+    pub(crate) fn card_merge_relay(&self, at: usize, gpu: &[u8], fetched_after: u64, flight: u64, title: &mut Vec<u8>) -> usize {
         let start = self.start as usize;
         let Some(card) = &self.card else {
             return 0;
@@ -5265,8 +5280,12 @@ impl Shadow {
             for blocks in std::iter::once(&masked.pending).chain(sent) {
                 masked_in(blocks, at, at + gpu.len(), |i| {
                     patched.get_or_insert_with(|| gpu.to_vec())[i - at] = held[i - at];
-                    marks.push(i - at);
                 });
+            }
+            // Merges that ran over this flight's writes, and those to come.
+            let over = masked.sent.iter().filter(|s| s.0 > flight).map(|s| &*s.1);
+            for blocks in std::iter::once(&masked.pending).chain(over) {
+                masked_in(blocks, at, at + gpu.len(), |i| marks.push(i - at));
             }
         }
         // What the card's side held, before the masked bytes were taken
@@ -6264,7 +6283,7 @@ mod card_merge_tests {
             // Flight 6's slot: the card's bytes behind its lists, before send 7.
             let mut slot = content.clone();
             slot[shader_byte] ^= 0xc3;
-            let written = shadow.card_merge_relay(0, &slot, 6, &mut Vec::new());
+            let written = shadow.card_merge_relay(0, &slot, 6, 6, &mut Vec::new());
             assert!(written > 0);
             drop(shadow);
             title
@@ -6308,7 +6327,7 @@ mod card_merge_tests {
             });
             let mut slot = content.clone();
             slot[shader_byte] ^= 0xc3;
-            assert!(shadow.card_merge_relay(0, &slot, fetched_after, &mut Vec::new()) > 0);
+            assert!(shadow.card_merge_relay(0, &slot, fetched_after, fetched_after, &mut Vec::new()) > 0);
             drop(shadow);
             title
         };
