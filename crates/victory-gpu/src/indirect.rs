@@ -1930,6 +1930,87 @@ void main() {
         assert!(unsafe { std::slice::from_raw_parts(title_ptr.cast_const(), size) } == &title[..]);
     }
 
+    /// The three-way merge (`crate::host::CARD_MERGE3`), on the software
+    /// adapter: random card, title and old bytes, a shader's writes on the
+    /// card at some masked bytes and some others; afterwards each masked
+    /// byte the card still held the old value of is the title's, and every
+    /// other byte is the card's (`crate::threeway::pick_dword`, byte by byte).
+    #[test]
+    fn warp_three_way_merge_keeps_the_bytes_a_shader_wrote() {
+        use crate::shadow::{MASK_BLOCK, MaskBlocks, mask_fill, mask_stretches};
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let merge = compile_cs(&warp.device, crate::host::CARD_MERGE3).expect("the three-way merge must compile on WARP");
+        let size = MASK_BLOCK * 2;
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut random = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let old: Vec<u8> = (0..size).map(|_| random() as u8).collect();
+        let title: Vec<u8> = (0..size).map(|_| random() as u8).collect();
+        let mut was = old.clone();
+        let (mut blocks, mut olds) = (MaskBlocks::new(), MaskBlocks::new());
+        let mut masked = vec![false; size];
+        for i in 0..size {
+            if random() % 7 == 0 {
+                masked[i] = true;
+                blocks.entry(i / MASK_BLOCK).or_insert_with(|| vec![0u8; MASK_BLOCK / 8].into_boxed_slice())[i % MASK_BLOCK / 8] |= 1 << (i % 8);
+                olds.entry(i / MASK_BLOCK).or_insert_with(|| vec![0u8; MASK_BLOCK].into_boxed_slice())[i % MASK_BLOCK] = old[i];
+            }
+            // A shader's write, masked or not.
+            if random() % 5 == 0 {
+                was[i] = was[i].wrapping_add(1 + (random() % 255) as u8);
+            }
+        }
+        let (stretches, bytes) = mask_stretches(&blocks, 0);
+        let slots = crate::threeway::slots(&blocks);
+        let table_at = bytes.next_multiple_of(256);
+        let old_at = (table_at + bytes).next_multiple_of(256);
+        let len = old_at + slots * 32;
+        let (_card, card_ptr, card_gpu) = warp.shared_buffer(size as u64);
+        let (_title, title_ptr, title_gpu) = warp.shared_buffer(size as u64);
+        let (_mask, mask_ptr, mask_gpu) = warp.shared_buffer(len as u64);
+        // SAFETY: the mappings hold what is written.
+        unsafe {
+            std::ptr::copy_nonoverlapping(was.as_ptr(), card_ptr, size);
+            std::ptr::copy_nonoverlapping(title.as_ptr(), title_ptr, size);
+            let all = std::slice::from_raw_parts_mut(mask_ptr, len);
+            mask_fill(&mut all[..bytes], &stretches, &blocks);
+            let (table, rest) = all[table_at..].split_at_mut(old_at - table_at);
+            assert_eq!(crate::threeway::lay_old(&mut table[..bytes], rest, &stretches, &blocks, &olds, 0), slots);
+        }
+        // SAFETY: our open list, live buffers, the merge's own root signature.
+        unsafe {
+            warp.list.SetComputeRootSignature(&merge.root);
+            warp.list.SetPipelineState(&merge.pso);
+            warp.list.SetComputeRootShaderResourceView(1, title_gpu);
+            warp.list.SetComputeRootShaderResourceView(2, mask_gpu);
+            warp.list.SetComputeRootUnorderedAccessView(3, card_gpu);
+            for stretch in &stretches {
+                let words = (stretch.bytes / 32) as u32;
+                let constants = [stretch.at as u32, stretch.mask_at as u32, words, stretch.at as u32, table_at as u32, old_at as u32];
+                warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                warp.list.Dispatch(words.div_ceil(64), 1, 1);
+            }
+        }
+        warp.submit_and_wait();
+        // SAFETY: the mapping holds `size` bytes.
+        let now = unsafe { std::slice::from_raw_parts(card_ptr.cast_const(), size) };
+        let (mut taken, mut kept) = (0, 0);
+        for i in 0..size {
+            let wanted = if masked[i] && was[i] == old[i] { title[i] } else { was[i] };
+            assert_eq!(now[i], wanted, "byte {i:#x}: masked {}, card {:#x}, old {:#x}, title {:#x}", masked[i], was[i], old[i], title[i]);
+            if masked[i] {
+                if was[i] == old[i] { taken += 1 } else { kept += 1 }
+            }
+        }
+        assert!(taken > 1000 && kept > 100, "{taken} taken, {kept} kept");
+    }
+
     /// The fetch inside flights (`crate::host::CARD_FETCH`), on the software
     /// adapter, in one list behind the compare as `Host::card_before`
     /// records it: each flagged piece takes a ticket and, while it is

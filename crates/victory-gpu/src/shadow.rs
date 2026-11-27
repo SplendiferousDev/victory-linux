@@ -276,7 +276,11 @@ struct Masked {
     pending: MaskBlocks,
     /// With [`relay`]: those that went up, by the number of the send that
     /// took them; kept as `Card::sent`'s notes are, and for the same use.
-    sent: Vec<(u64, Arc<MaskBlocks>)>,
+    sent: Vec<(u64, Arc<MaskBlocks>, Arc<MaskBlocks>)>,
+    /// The CPU side's value of each byte of `pending` from before the
+    /// title's change, by block of [`MASK_BLOCK`] bytes
+    /// (`crate::threeway`); the third of each of `sent`.
+    old: MaskBlocks,
 }
 
 /// The masks of the blocks of a copy that hold a masked byte, by block
@@ -318,8 +322,10 @@ impl Masked {
                 continue;
             }
             let mask = self.pending.entry(block).or_insert_with(|| vec![0u8; MASK_BLOCK / 8].into_boxed_slice());
-            let mut put = |i: usize, bits: u8| {
+            let old = self.old.entry(block).or_insert_with(|| vec![0u8; MASK_BLOCK].into_boxed_slice());
+            let mut put = |i: usize, bits: u8, held: &[u8]| {
                 let bit = within + i;
+                crate::threeway::note_old(mask, old, bit, bits, held);
                 mask[bit / 8] |= bits << (bit % 8);
                 // What does not fit the byte belongs to later bytes of
                 // this part, so to this block.
@@ -338,7 +344,7 @@ impl Masked {
                     last = false;
                 } else {
                     let bits = nonzero_bytes(tw ^ hw);
-                    put(i, bits);
+                    put(i, bits, h);
                     // The equal bytes are written with what they hold.
                     h.copy_from_slice(t);
                     bytes += u64::from(bits.count_ones());
@@ -352,7 +358,7 @@ impl Masked {
                 if title[i] == held[i] {
                     last = false;
                 } else {
-                    put(i, 1);
+                    put(i, 1, &held[i..=i]);
                     held[i] = title[i];
                     bytes += 1;
                     runs += u64::from(!last);
@@ -599,7 +605,7 @@ pub(crate) fn mask_title_fill(out: &mut [u8], stretches: &[MaskStretch], blocks:
 /// sends their masks up (`Host::card_before`), or the bytes as copies
 /// where it cannot. With [`relay`] they are noted with `sent_as` as
 /// [`card_dirty`] notes ranges.
-pub(crate) fn card_masked(sent_as: u64) -> Vec<(Arc<Shadow>, Arc<MaskBlocks>)> {
+pub(crate) fn card_masked(sent_as: u64) -> Vec<(Arc<Shadow>, Arc<MaskBlocks>, Arc<MaskBlocks>)> {
     let mut out = Vec::new();
     if !merge_on_card_wanted() {
         return out;
@@ -620,11 +626,12 @@ pub(crate) fn card_masked(sent_as: u64) -> Vec<(Arc<Shadow>, Arc<MaskBlocks>)> {
             continue;
         }
         let blocks = Arc::new(std::mem::take(&mut masked.pending));
+        let old = Arc::new(std::mem::take(&mut masked.old));
         if relay() {
-            masked.sent.push((sent_as, blocks.clone()));
+            masked.sent.push((sent_as, blocks.clone(), old.clone()));
         }
         drop(masked);
-        out.push((shadow, blocks));
+        out.push((shadow, blocks, old));
     }
     out
 }
@@ -5276,12 +5283,34 @@ impl Shadow {
         let mut marks: Vec<usize> = Vec::new();
         {
             let masked = card.masked.lock().unwrap_or_else(|e| e.into_inner());
-            let sent = masked.sent.iter().filter(|s| s.0 > fetched_after).map(|s| &*s.1);
-            for blocks in std::iter::once(&masked.pending).chain(sent) {
+            // Merges the card had not run at the fetch: a byte whose card
+            // value is not the old one was written by a shader (a
+            // conflict); three-way it keeps the shader's value
+            // (`crate::threeway`), as the pass on the card will.
+            let three = crate::threeway::on();
+            let (mut conflicts, mut kept) = (0u64, 0u64);
+            let sent = masked.sent.iter().filter(|s| s.0 > fetched_after).map(|s| (&*s.1, &*s.2));
+            for (blocks, old) in std::iter::once((&masked.pending, &masked.old)).chain(sent) {
                 masked_in(blocks, at, at + gpu.len(), |i| {
+                    if crate::threeway::old_at(old, i).is_some_and(|o| o != gpu[i - at]) {
+                        conflicts += 1;
+                        if three {
+                            return;
+                        }
+                    }
                     patched.get_or_insert_with(|| gpu.to_vec())[i - at] = held[i - at];
                 });
             }
+            // Merges run before the fetch and after the flight: three-way,
+            // a masked byte that is not the title's is one left to a shader.
+            if three {
+                let ran = masked.sent.iter().filter(|s| s.0 > flight && s.0 <= fetched_after).map(|s| &*s.1);
+                for blocks in ran {
+                    masked_in(blocks, at, at + gpu.len(), |i| kept += u64::from(gpu[i - at] != held[i - at]));
+                }
+            }
+            crate::threeway::count(0, conflicts);
+            crate::threeway::count(1, kept);
             // Merges that ran over this flight's writes, and those to come.
             let over = masked.sent.iter().filter(|s| s.0 > flight).map(|s| &*s.1);
             for blocks in std::iter::once(&masked.pending).chain(over) {
@@ -6318,9 +6347,10 @@ mod card_merge_tests {
                 masked: Mutex::new(super::Masked {
                     pending: bits(&[(waiting, waiting + 1)]),
                     sent: vec![
-                        (3, std::sync::Arc::new(bits(&[(0, LEN)]))),
-                        (sent, std::sync::Arc::new(bits(&[(8, 9), (title_byte, title_byte + 1), (LEN - 1, LEN)]))),
+                        (3, std::sync::Arc::new(bits(&[(0, LEN)])), Default::default()),
+                        (sent, std::sync::Arc::new(bits(&[(8, 9), (title_byte, title_byte + 1), (LEN - 1, LEN)])), Default::default()),
                     ],
+                    old: Default::default(),
                 }),
                 size: 0,
                 me: std::sync::OnceLock::new(),

@@ -9,6 +9,9 @@ use super::*;
 pub(super) struct CardMerge {
     pub(super) root: ID3D12RootSignature,
     pub(super) pso: ID3D12PipelineState,
+    /// The three-way pass ([`CARD_MERGE3`], `crate::threeway`), with the
+    /// same root signature, if asked for.
+    pub(super) pso3: Option<ID3D12PipelineState>,
     /// PC memory, mapped, for the masks of a submission's merges (buffer,
     /// mapping, bytes), and the value of the host's fence that is reached
     /// when the card has run the merges that read it: not written again
@@ -51,12 +54,14 @@ impl CardMerge {
 /// (`shadow::mask_title_fill`) where the CPU side is plain memory
 /// (`shadow::plain_twins`). `title_at` is a multiple of 4.
 pub(crate) const CARD_MERGE: &str = r#"
-#define RS "RootConstants(num32BitConstants=4, b0), SRV(t0), SRV(t1), UAV(u0)"
+#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0)"
 cbuffer Stretch : register(b0) {
     uint at;       // the stretch's first byte in the copy
     uint mask_at;  // its first byte of mask
     uint words;    // its dwords of mask
     uint title_at; // its first byte in `title`
+    uint table_at; // (CARD_MERGE3) where the slot table starts in `mask`
+    uint old_at;   // (CARD_MERGE3) where the old bytes' slots start in `mask`
 };
 ByteAddressBuffer title : register(t0);
 ByteAddressBuffer mask : register(t1);
@@ -77,6 +82,53 @@ void main(uint3 id : SV_DispatchThreadID) {
         uint bytes = ((four & 1u) | ((four & 2u) << 7) | ((four & 4u) << 14) | ((four & 8u) << 21)) * 255u;
         uint to = from + k * 4u;
         card.Store(to, (card.Load(to) & ~bytes) | (title.Load(from_title + k * 4u) & bytes));
+    }
+}
+"#;
+
+/// [`CARD_MERGE`], three-way (`crate::threeway`): a masked byte takes the
+/// title's value only where the card still holds the CPU side's old one
+/// (`crate::threeway::pick_dword`). The old bytes are in `mask`: a dword
+/// per dword of mask from `table_at` on, at the mask's offsets, the slot of
+/// its 32 old bytes from `old_at` on (`crate::threeway::lay_old`).
+pub(crate) const CARD_MERGE3: &str = r#"
+#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0)"
+cbuffer Stretch : register(b0) {
+    uint at;
+    uint mask_at;
+    uint words;
+    uint title_at;
+    uint table_at;
+    uint old_at;
+};
+ByteAddressBuffer title : register(t0);
+ByteAddressBuffer mask : register(t1);
+RWByteAddressBuffer card : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= words) return;
+    uint bits = mask.Load(mask_at + id.x * 4u);
+    if (bits == 0u) return;
+    uint slot = mask.Load(table_at + mask_at + id.x * 4u);
+    uint from = at + id.x * 32u;
+    uint from_title = title_at + id.x * 32u;
+    uint from_old = old_at + slot * 32u;
+    [loop]
+    for (uint k = 0u; k < 8u; k++) {
+        uint four = (bits >> (k * 4u)) & 15u;
+        if (four == 0u) continue;
+        uint bytes = ((four & 1u) | ((four & 2u) << 7) | ((four & 4u) << 14) | ((four & 8u) << 21)) * 255u;
+        uint to = from + k * 4u;
+        uint c = card.Load(to);
+        // 0xff in each byte a shader changed from the old value.
+        uint d = c ^ mask.Load(from_old + k * 4u);
+        d |= d >> 4;
+        d |= d >> 2;
+        d |= d >> 1;
+        uint take = bytes & ~((d & 0x01010101u) * 255u);
+        if (take == 0u) continue;
+        card.Store(to, (c & ~take) | (title.Load(from_title + k * 4u) & take));
     }
 }
 "#;
@@ -111,14 +163,14 @@ impl Host {
     pub(super) fn make_card_merge(&self) -> Option<CardMerge> {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
-        let made = (|| -> windows::core::Result<CardMerge> {
+        let compile = |source: &str| -> windows::core::Result<ID3DBlob> {
             let mut code: Option<ID3DBlob> = None;
             // SAFETY: the source and names live through the call; the out
             // pointer is ours.
             unsafe {
                 D3DCompile(
-                    CARD_MERGE.as_ptr().cast(),
-                    CARD_MERGE.len(),
+                    source.as_ptr().cast(),
+                    source.len(),
                     windows::core::s!("card merge"),
                     None,
                     None,
@@ -130,23 +182,32 @@ impl Host {
                     None,
                 )?;
             }
-            let code = code.ok_or_else(windows::core::Error::empty)?;
-            // SAFETY: the blob's own bytes; the root signature is inside
-            // the shader.
+            code.ok_or_else(windows::core::Error::empty)
+        };
+        let made = (|| -> windows::core::Result<CardMerge> {
+            let code = compile(CARD_MERGE)?;
+            // SAFETY: the blobs' own bytes; the root signature is inside
+            // the shaders (the same in both).
             unsafe {
-                let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+                let blob = |code: &ID3DBlob| std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+                let bytes = blob(&code);
                 let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
-                let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                    pRootSignature: std::mem::transmute_copy(&root),
-                    CS: D3D12_SHADER_BYTECODE {
-                        pShaderBytecode: bytes.as_ptr().cast(),
-                        BytecodeLength: bytes.len(),
-                    },
-                    ..Default::default()
-                })?;
+                let pso_of = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineState> {
+                    self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute_copy(&root),
+                        CS: D3D12_SHADER_BYTECODE {
+                            pShaderBytecode: bytes.as_ptr().cast(),
+                            BytecodeLength: bytes.len(),
+                        },
+                        ..Default::default()
+                    })
+                };
+                let pso = pso_of(bytes)?;
+                let pso3 = if crate::threeway::on() { Some(pso_of(blob(&compile(CARD_MERGE3)?))?) } else { None };
                 Ok(CardMerge {
                     root,
                     pso,
+                    pso3,
                     masks: Vec::new(),
                 })
             }
@@ -188,7 +249,8 @@ impl Host {
         // [`card_merge_most`] each: free ones too small for this asking
         // are given back before a bigger one is made, so that PC memory
         // pinned for the merge stays near what the flights in the air use.
-        if merge.masks.len() >= CardMerge::MOST || crate::shadow::plain_twins() {
+        // (Three-way the buffers also hold old bytes, some MB a send.)
+        if merge.masks.len() >= CardMerge::MOST || crate::shadow::plain_twins() || crate::threeway::on() {
             // Free ones that are too small make room.
             merge.masks.retain(|m| m.3 > completed);
             if merge.masks.len() >= CardMerge::MOST {
@@ -200,5 +262,63 @@ impl Host {
         name(&buffer, || "card merge masks".into());
         merge.masks.push((buffer.clone(), data as usize, size, until));
         Some((buffer, data as usize))
+    }
+}
+
+/// Records one copy's merge on the card into `list`: `source` holds the
+/// title's bytes (the CPU side, or `mask` for a plain side whose bytes lie
+/// from `title` on), `buffer` is the copy's card side in the
+/// unordered-access state. `three`: where the slot table and the old
+/// bytes start in `mask` ([`CARD_MERGE3`]); `None`, the two-way pass.
+///
+/// # Safety
+/// `list` is open; the buffers are live and hold what the stretches name.
+pub(super) unsafe fn record_merge(
+    list: &ID3D12GraphicsCommandList,
+    merge: &CardMerge,
+    (source, mask, buffer): (&ID3D12Resource, &ID3D12Resource, &ID3D12Resource),
+    stretches: &[crate::shadow::MaskStretch],
+    title: Option<usize>,
+    three: Option<(usize, usize)>,
+) {
+    let pso = match (three, &merge.pso3) {
+        (Some(_), Some(pso3)) => pso3,
+        _ => &merge.pso,
+    };
+    let (table_at, old_at) = three.unwrap_or((0, 0));
+    // SAFETY: as the caller says.
+    unsafe {
+        list.SetComputeRootSignature(&merge.root);
+        list.SetPipelineState(pso);
+        list.SetComputeRootShaderResourceView(1, source.GetGPUVirtualAddress());
+        list.SetComputeRootShaderResourceView(2, mask.GetGPUVirtualAddress());
+        list.SetComputeRootUnorderedAccessView(3, buffer.GetGPUVirtualAddress());
+        // Where the next stretch's bytes are in a plain side's title bytes
+        // (`shadow::mask_title_fill`).
+        let mut laid_at = 0usize;
+        for stretch in stretches {
+            let mut done = 0;
+            while done < stretch.bytes {
+                let n = (stretch.bytes - done).min(CARD_MERGE_MOST);
+                let words = (n / 32) as u32;
+                let title_at = match title {
+                    Some(at) => at + laid_at + done,
+                    None => stretch.at + done,
+                };
+                let constants = [
+                    (stretch.at + done) as u32,
+                    (stretch.mask_at + done / 8) as u32,
+                    words,
+                    title_at as u32,
+                    table_at as u32,
+                    old_at as u32,
+                ];
+                list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                list.Dispatch(words.div_ceil(64), 1, 1);
+                CARD_MERGES[1].fetch_add(1, Ordering::Relaxed);
+                done += n;
+            }
+            laid_at += stretch.bytes;
+        }
     }
 }

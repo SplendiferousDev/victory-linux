@@ -28,8 +28,8 @@ mod twin_ring;
 pub(crate) use slot_wait::land_started;
 
 #[cfg(test)]
-pub(crate) use card_merge::CARD_MERGE;
-use card_merge::{CARD_MERGE_MOST, CARD_MERGES, CardMerge, card_merge_most};
+pub(crate) use card_merge::{CARD_MERGE, CARD_MERGE3};
+use card_merge::{CARD_MERGES, CardMerge, card_merge_most};
 pub(crate) use stall_report::{device_section, late_met_tried, peek, stall_section};
 pub(crate) use twin_ring::twin_ring;
 use twin_ring::{TWIN_RING, TwinRing};
@@ -4716,12 +4716,15 @@ fn late_line(frames: f64) {
                 [0, 1, 2, 3, 4, 5].map(|i| CARD_MERGES[i].swap(0, Ordering::Relaxed) as f64 / frames);
             let torn = crate::mergecap::taken(frames);
             let qsync = crate::mergecap::qsync_taken(frames);
+            let conflicts = crate::threeway::taken(frames);
             tracing::info!(
                 "of them through the merge on the card per frame (VICTORY_MERGE_ON_CARD=1 turned it on): {submissions:.1} submissions with \
                  {dispatches:.1} dispatches and {:.0} KiB of masks; {copies:.1} submissions sent theirs up as copies; plain CPU sides \
                  (VICTORY_CARD_TWIN_PLAIN): {:.0} KiB of title bytes beside the masks, {past:.1} copies sent as copies (past the most a submission); \
                  MERGE TORN WORDS (a title byte merged beside a shader's byte) in {:.1} landed pieces: {:.1} of 4 bytes, {:.1} of 8, {:.1} of 16; \
-                 cap of changed runs (VICTORY_MERGE_CAP) {}; VICTORY_MERGE_QSYNC: {:.1} merges waited for copy-queue fetches, {:.1} fetches behind a merge",
+                 cap of changed runs (VICTORY_MERGE_CAP) {}; VICTORY_MERGE_QSYNC: {:.1} merges waited for copy-queue fetches, {:.1} fetches behind a merge; \
+                 MERGE CONFLICT BYTES (a shader wrote a byte the title changed; VICTORY_MERGE_THREEWAY {}): {:.1} seen at landings, {:.1} kept for the shader, \
+                 {:.0} KiB of slot tables and old bytes sent up",
                 mask / 1024.0,
                 plain / 1024.0,
                 torn[0],
@@ -4730,7 +4733,11 @@ fn late_line(frames: f64) {
                 torn[3],
                 crate::mergecap::cap_said(),
                 qsync[0],
-                qsync[1]
+                qsync[1],
+                if crate::threeway::on() { "on: the shader's value kept" } else { "off: the title's value won" },
+                conflicts[0],
+                conflicts[1],
+                conflicts[2] / 1024.0
             );
         }
     }
@@ -5417,13 +5424,15 @@ impl Host {
         // where the merge reads them: (the offset there, from `title_base`).
         let mut merges: Vec<(Arc<crate::shadow::Shadow>, Vec<crate::shadow::MaskStretch>, Option<usize>)> = Vec::new();
         let mut mask: Option<ID3D12Resource> = None;
+        // Three-way (`crate::threeway`), and where its table and old bytes start in the mask buffer.
+        let (mut three, mut three_at) = (false, (0usize, 0usize));
         if !masked.is_empty() {
             let mut bytes = 0usize;
             let mut plain_bytes = 0usize;
             let most = card_merge_most();
             let laid: Vec<(Vec<crate::shadow::MaskStretch>, Option<usize>)> = masked
                 .iter()
-                .map(|(shadow, blocks)| {
+                .map(|(shadow, blocks, _)| {
                     let Some((cpu, _, size)) = shadow.card_sides() else {
                         return (Vec::new(), None);
                     };
@@ -5448,6 +5457,15 @@ impl Host {
             // The title bytes of plain CPU sides start here, behind the masks.
             let title_base = bytes.next_multiple_of(256);
             let total = if plain_bytes > 0 { title_base + plain_bytes } else { bytes };
+            // Three-way (`crate::threeway`): the slot table, then the old bytes.
+            three = crate::threeway::on() && work.merge.as_ref().is_some_and(|m| m.pso3.is_some());
+            let slots: usize = masked.iter().zip(&laid).filter(|(_, l)| three && !l.0.is_empty()).map(|(m, _)| crate::threeway::slots(&m.1)).sum();
+            let table_base = total.next_multiple_of(256);
+            let old_base = (table_base + bytes).next_multiple_of(256);
+            let total = if three { old_base + slots * 32 } else { total };
+            three_at = (table_base, old_base);
+            crate::threeway::count(2, if three { (bytes + slots * 32) as u64 } else { 0 });
+            let mut slot = 0;
             // SAFETY: a plain query.
             let completed = unsafe { self.fence.GetCompletedValue() };
             // Held until the card has passed this submission's signal: the
@@ -5462,13 +5480,17 @@ impl Host {
                 CARD_MERGES[0].fetch_add(1, Ordering::Relaxed);
                 CARD_MERGES[2].fetch_add(bytes as u64, Ordering::Relaxed);
             }
-            for ((shadow, blocks), (stretches, title)) in masked.into_iter().zip(laid) {
+            for ((shadow, blocks, olds), (stretches, title)) in masked.into_iter().zip(laid) {
                 match &buffer {
                     Some((_, data)) if !stretches.is_empty() => {
                         // SAFETY: the mapping holds `total` bytes and more,
                         // and nothing on the card reads it (`card_mask`).
                         let all = unsafe { std::slice::from_raw_parts_mut(*data as *mut u8, total) };
                         crate::shadow::mask_fill(&mut all[..bytes], &stretches, &blocks);
+                        if three {
+                            let (table, olds_at) = all[table_base..].split_at_mut(old_base - table_base);
+                            slot = crate::threeway::lay_old(&mut table[..bytes], olds_at, &stretches, &blocks, &olds, slot);
+                        }
                         let title = title.map(|at| title_base + at);
                         if let Some(at) = title {
                             // The CPU side's bytes the masks take, now: the
@@ -5748,37 +5770,12 @@ impl Host {
                                 if crate::mergecap::barrier_on() {
                                     crate::mergecap::ahead(list);
                                 }
-                                list.SetComputeRootSignature(&merge.root);
-                                list.SetPipelineState(&merge.pso);
                                 let source = match (title, staging) {
                                     (Some(_), _) => mask,
                                     (None, Some(staging)) => staging,
                                     (None, None) => unreachable!("guarded above"),
                                 };
-                                list.SetComputeRootShaderResourceView(1, source.GetGPUVirtualAddress());
-                                list.SetComputeRootShaderResourceView(2, mask.GetGPUVirtualAddress());
-                                list.SetComputeRootUnorderedAccessView(3, shadow.buffer.GetGPUVirtualAddress());
-                                // Where the next stretch's bytes are in a plain
-                                // side's title bytes (`shadow::mask_title_fill`).
-                                let mut laid_at = 0usize;
-                                for stretch in stretches {
-                                    let mut done = 0;
-                                    while done < stretch.bytes {
-                                        let n = (stretch.bytes - done).min(CARD_MERGE_MOST);
-                                        let words = (n / 32) as u32;
-                                        let title_at = match title {
-                                            Some(at) => at + laid_at + done,
-                                            None => stretch.at + done,
-                                        };
-                                        let constants =
-                                            [(stretch.at + done) as u32, (stretch.mask_at + done / 8) as u32, words, title_at as u32];
-                                        list.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
-                                        list.Dispatch(words.div_ceil(64), 1, 1);
-                                        CARD_MERGES[1].fetch_add(1, Ordering::Relaxed);
-                                        done += n;
-                                    }
-                                    laid_at += stretch.bytes;
-                                }
+                                card_merge::record_merge(list, merge, (source, mask, &shadow.buffer), stretches, *title, three.then_some(three_at));
                                 if crate::mergecap::barrier_on() {
                                     crate::mergecap::behind(list, &shadow.buffer, before.is_some());
                                 }
