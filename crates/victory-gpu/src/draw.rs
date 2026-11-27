@@ -1105,6 +1105,9 @@ struct Fresh {
     n: u32,
     /// Which slots the shader reads in the title's formats, in order.
     halves: Vec<u32>,
+    /// Which entries the shader reads as constant buffers while they hold
+    /// another view, made constant buffer views (`crate::tablekey`).
+    forced: Vec<u32>,
     at: usize,
     first: u32,
 }
@@ -4096,13 +4099,19 @@ impl State {
                 .collect();
             halves.sort_unstable();
             halves.dedup();
-            let key = halves.iter().fold(table_hash(table, n), |h, &k| {
-                (h.rotate_left(5) ^ u64::from(k + 1)).wrapping_mul(0x517c_c1b7_2722_0a95)
-            });
+            // And which entries it reads as constant buffers over another
+            // view (`VICTORY_TABLE_KEY_CBV`; off, none).
+            let forced = if crate::tablekey::key_cbv() {
+                crate::tablekey::forced(&entries, n, |k| crate::descriptor::view(table + u64::from(k) * 32))
+            } else {
+                Vec::new()
+            };
+            let key = crate::tablekey::key(table_hash(table, n), &halves, &forced);
             let same = self.fresh_tables.get(&key).filter(|f| {
                 f.table == table
                     && f.n == n
                     && f.halves == halves
+                    && f.forced == forced
                     && self.fresh_records[f.at..f.at + n as usize]
                         .iter()
                         .enumerate()
@@ -4169,7 +4178,7 @@ impl State {
             clock.lap(21);
             let at = self.fresh_records.len();
             self.fresh_records.extend((0..n).map(|k| record(table, k)));
-            self.fresh_tables.insert(key, Fresh { table, n, halves, at, first });
+            self.fresh_tables.insert(key, Fresh { table, n, halves, forced, at, first });
             if !spans.is_empty() {
                 staged.push((table, n));
             }
