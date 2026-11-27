@@ -391,13 +391,13 @@ pub(crate) struct Spans {
     /// When a newer view makes an older one stale.
     rule: Rule,
     by_start: std::collections::BTreeMap<u64, (u64, std::collections::BTreeSet<u32>)>,
-    by_slot: std::collections::HashMap<u32, u64>,
+    by_slot: crate::fasthash::FastMap<u32, u64>,
     /// The level each slot's view starts at ([`Spans::shows`]).
-    first: std::collections::HashMap<u32, u32>,
+    first: crate::fasthash::FastMap<u32, u32>,
     /// The bytes a placed texture takes, by resource description: worked
     /// out once for each (a title writes the views of a few thousand
     /// descriptions, thousands of times a frame).
-    sizes: std::collections::HashMap<[u32; 14], Option<u64>>,
+    sizes: crate::fasthash::FastMap<[u32; 14], Option<u64>>,
 }
 
 /// When a view the title writes makes an older view of other memory stale.
@@ -2359,6 +2359,12 @@ impl HostHeap {
             return;
         };
         let now = if constant { SLOT_CONSTANT } else { SLOT_OTHER };
+        // Read first: nearly every write keeps the kind, and a swap would
+        // take the line from the threads writing neighbouring slots. (The
+        // same as a swap that stored what was there.)
+        if kind.load(std::sync::atomic::Ordering::Relaxed) == now {
+            return;
+        }
         let was = kind.swap(now, std::sync::atomic::Ordering::Relaxed);
         if was != 0 && was != now {
             crate::gpuwatch::slot_kind_changed(index, index >= self.count, constant, crate::host::submissions_in_flight());

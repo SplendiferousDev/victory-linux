@@ -963,7 +963,7 @@ pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
 /// host copy and range each slot's buffer view reads. (At the module's
 /// level so that the marked pass can have this one start anew:
 /// [`State::heap_buffers_marked`].)
-type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
+type Ranges = crate::fasthash::FastMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
 static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
     std::sync::Mutex::new(None);
 /// Per host heap, for [`State::heap_buffers_marked`]: what the marked pass
@@ -2249,7 +2249,7 @@ impl State {
         let (passes, ranges) = kept
             .get_or_insert_with(Default::default)
             .entry(std::ptr::from_ref(host) as usize)
-            .or_insert_with(|| (0, Ranges::new()));
+            .or_insert_with(|| (0, Ranges::default()));
         let changed = host.buffer_changes();
         let slots = if passes.is_multiple_of(rescan) {
             ranges.clear();
@@ -2299,8 +2299,8 @@ impl State {
         }
         let views = ranges.len() as u32;
         // Per host copy, the span its picked views cover.
-        let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
-            std::collections::HashMap::new();
+        let mut spans: crate::fasthash::FastMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
+            crate::fasthash::FastMap::default();
         for (shadow, from, to) in ranges.values() {
             let key = std::sync::Arc::as_ptr(shadow) as usize;
             let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));

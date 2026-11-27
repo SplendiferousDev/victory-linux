@@ -193,10 +193,9 @@ struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>);
 // reference-counted wrappers holding them, dropped once.
 unsafe impl Send for Retired {}
 
-/// Milliseconds since the first call.
+/// Milliseconds since the first call (`crate::coarseclock`).
 pub(crate) fn now_ms() -> u64 {
-    static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
-    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+    crate::coarseclock::now_ms()
 }
 
 /// This moment, for telling later how long ago it was ([`long_ago`]): the
@@ -3107,20 +3106,20 @@ struct Deferred {
     kept: Vec<windows::core::IUnknown>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
-    refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    refreshed: crate::fasthash::FastSet<(usize, usize, usize)>,
     /// Buffer ranges already marked as written by shaders since the last
     /// refresh of the same copy or title copy (host copy, address, bytes).
-    gpu_written: std::collections::HashSet<(usize, usize, usize)>,
+    gpu_written: crate::fasthash::FastSet<(usize, usize, usize)>,
     /// With [`list_reuse`]: the host pipelines the list has kept, by
     /// address ([`HostList::first_bind`]).
-    bound: std::collections::HashSet<usize>,
+    bound: crate::fasthash::FastSet<usize>,
     /// With [`list_reuse`]: upload memory filled from title memory since
     /// the last title copy (source, bytes): its host GPU address, which a
     /// second fill would find holding the same bytes
     /// ([`HostList::fill_scratch`]).
     filled: std::collections::HashMap<(usize, usize), u64>,
     /// Textures whose contents the list brings up to date.
-    textures: std::collections::HashSet<usize>,
+    textures: crate::fasthash::FastSet<usize>,
     /// Last GPU source copied into each aliased host texture in this list.
     texture_aliases: std::collections::HashMap<usize, usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,

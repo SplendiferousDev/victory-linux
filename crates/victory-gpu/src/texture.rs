@@ -814,7 +814,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         return;
     };
     use std::sync::atomic::Ordering::Relaxed;
-    staging.used.store(crate::host::moment(), Relaxed);
+    crate::coarseclock::stamp(&staging.used, crate::host::moment());
     // Levels on demand: a view of the texture now starts at another
     // level, or another texture now starts inside its span, with no byte
     // of its memory changed. The levels are judged anew: detiled again at

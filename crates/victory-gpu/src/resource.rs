@@ -407,10 +407,10 @@ pub(crate) fn twin_resource<'a>(
     if this.is_null() {
         return None;
     }
-    let (_, twin) = hosted(this, true)?;
+    let texture = hosted_with(this, true, |(_, twin)| twin.as_ref().map(|t| std::ptr::from_ref(&t.colour.texture)))??;
     // SAFETY: as in `host_resource`: the twin lives as long as the host
     // copy, which a depth texture keeps until the title releases it.
-    twin.map(|t| unsafe { &*std::ptr::from_ref(&t.colour.texture) })
+    Some(unsafe { &*texture })
 }
 
 /// The texture of the twin of the depth plane of `this`, a depth texture
@@ -1342,6 +1342,15 @@ pub(crate) fn host_waits(this: This) -> bool {
 /// `make` says so. `None` for buffers and for textures the host refuses.
 #[cfg(windows)]
 fn hosted(this: This, make: bool) -> Option<Made> {
+    hosted_with(this, make, Clone::clone)
+}
+
+/// As [`hosted`], handing `f` the host side under the lock instead of a
+/// clone of it: no reference counts taken and let go on the way for an
+/// answer that needs none (each a write to a line the recording threads
+/// share).
+#[cfg(windows)]
+fn hosted_with<R>(this: This, make: bool, f: impl FnOnce(&Made) -> R) -> Option<R> {
     use std::sync::atomic::Ordering::Relaxed;
     let r = resource(this);
     if r.desc.dimension == BUFFER {
@@ -1457,8 +1466,8 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         // are made before the next submission runs.
         crate::descriptor::texture_made(this as usize);
     }
-    r.host.used.store(crate::host::moment(), Relaxed);
-    made.clone()
+    crate::coarseclock::stamp(&r.host.used, crate::host::moment());
+    made.as_ref().map(f)
 }
 
 /// The host copy of title texture `this` if it is made, without making it
@@ -2078,11 +2087,10 @@ pub(crate) fn placed_textures() -> u64 {
 #[cfg(windows)]
 pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
     use windows::core::Interface;
-    let (host, _) = hosted(this, true)?;
-    let before = host
-        .state
-        .swap(wanted, std::sync::atomic::Ordering::Relaxed);
-    (before != wanted).then(|| (host.texture.as_raw(), before))
+    let (texture, before) = hosted_with(this, true, |(host, _)| {
+        (host.texture.as_raw(), host.state.swap(wanted, std::sync::atomic::Ordering::Relaxed))
+    })?;
+    (before != wanted).then_some((texture, before))
 }
 
 /// The host GPU's copy of a title resource, if it has one: made now if
@@ -2095,13 +2103,13 @@ pub(crate) fn host_resource<'a>(
     if this.is_null() {
         return None;
     }
-    let (host, _) = hosted(this, true)?;
+    let texture = hosted_with(this, true, |(host, _)| std::ptr::from_ref(&host.texture))?;
     // SAFETY: the resource holds the host copy until the title releases it
     // (lists and slots that name the texture hold it past that), or until
     // `let_go_idle` takes it: only from a texture the title fills, that no
     // list and no slot holds and that nothing asked for in seconds (the
     // asking just made is noted under the same lock).
-    Some(unsafe { &*std::ptr::from_ref(&host.texture) })
+    Some(unsafe { &*texture })
 }
 
 /// A title texture's host copy, shared, for a list to hold.
@@ -2657,14 +2665,14 @@ static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 
 
 /// The placed textures asked for with filler words set, as asked
 /// (address and description): for [`PLACED_TWINS`].
-#[cfg(windows)]
+#[cfg(all(windows, feature = "diagnostics"))]
 static PLACED_RAW: std::sync::Mutex<std::collections::BTreeSet<(u64, [u32; 14])>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
 /// Placed textures asked for a second time with other filler words in
 /// their description: each was a second resource and host copy before the
 /// filler was left out of the key ([`texture_at`]).
-#[cfg(windows)]
+#[cfg(all(windows, feature = "diagnostics"))]
 static PLACED_TWINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// See [`PLACED_TWINS`] (read by the diagnostics build's memory line).
@@ -2742,6 +2750,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     // that fills at world entry. They are not part of what a texture is.
     // `VICTORY_PLACED_FILLER=1`: kept in the key, as before.
     static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    #[cfg(feature = "diagnostics")]
     let raw = *desc;
     let mut key = *desc;
     if !*KEPT.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1")) {
@@ -2751,7 +2760,10 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     let desc = &key;
     let mut map = crate::lockmeter::lock("rs:PLACED_TEXTURES", &PLACED_TEXTURES);
     // How many resources the filler alone would have added (a count for
-    // the log: `placed_filler_twins`).
+    // the diagnostics build's memory line: `placed_filler_twins`; the
+    // release build kept a tree of every description asked for, searched
+    // on each ask, for a count nothing read).
+    #[cfg(feature = "diagnostics")]
     if raw != key {
         let mut seen = crate::lockmeter::lock("rs:PLACED_RAW", &PLACED_RAW);
         if seen.insert((address, raw)) {

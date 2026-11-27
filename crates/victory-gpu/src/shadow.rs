@@ -6435,12 +6435,12 @@ fn lookup_cache() -> bool {
 /// The most asks a thread remembers before it starts again.
 const FOUND_MOST: usize = 8192;
 
-type Found = std::collections::HashMap<(u64, u64, bool), std::sync::Weak<Shadow>>;
+type Found = crate::fasthash::FastMap<(u64, u64, bool), std::sync::Weak<Shadow>>;
 
 thread_local! {
     /// What this thread's asks found, and the count of table changes they
     /// are from.
-    static FOUND: std::cell::RefCell<(u64, Found)> = std::cell::RefCell::new((u64::MAX, Found::new()));
+    static FOUND: std::cell::RefCell<(u64, Found)> = std::cell::RefCell::new((u64::MAX, Found::default()));
 }
 
 #[track_caller]
@@ -6464,7 +6464,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         LOOKUPS[0].fetch_add(1, Ordering::Relaxed);
         if shadow.window {
             // As `loose` notes an ask of a window it hands out.
-            shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+            crate::coarseclock::stamp(&shadow.used, crate::host::moment());
             shadow.asked[0].fetch_min(address, Ordering::Relaxed);
             shadow.asked[1].fetch_max(address.saturating_add(len.max(1)), Ordering::Relaxed);
             if len <= 1 {
@@ -6800,7 +6800,7 @@ fn loose_choice(map: &BTreeMap<(u64, u64), Arc<Shadow>>, address: u64, end: u64,
 
 /// What [`loose`] notes on a window it hands out.
 fn loose_note(shadow: &Shadow, address: u64, end: u64, unsized_ask: bool) {
-    shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+    crate::coarseclock::stamp(&shadow.used, crate::host::moment());
     shadow.asked[0].fetch_min(address, Ordering::Relaxed);
     shadow.asked[1].fetch_max(end, Ordering::Relaxed);
     if unsized_ask {
@@ -6827,7 +6827,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     };
     // Under the lock, with the handing out: see `let_go_idle`.
     let note = |shadow: &Shadow| {
-        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+        crate::coarseclock::stamp(&shadow.used, crate::host::moment());
         shadow.asked[0].fetch_min(address, Ordering::Relaxed);
         shadow.asked[1].fetch_max(end, Ordering::Relaxed);
         if unsized_ask {
@@ -6966,7 +6966,7 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let now = *tick;
     if let Some((shadow, used)) = map.get_mut(&(address, len)) {
         *used = now;
-        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+        crate::coarseclock::stamp(&shadow.used, crate::host::moment());
         return Some(shadow.clone());
     }
     if map.len() >= MANY {
