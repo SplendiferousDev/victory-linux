@@ -369,15 +369,45 @@ pub(crate) fn views_between(start: usize, end: usize) -> Vec<(usize, usize)> {
 /// The address of the 64 KiB page shown at `page` in every title view that
 /// shows it, `page`'s own address included; empty if `page` is not a view.
 pub(crate) fn pages_of(page: usize) -> Vec<usize> {
-    let v = views();
-    let Some((&base, &(bytes, section, offset))) = v.views.range(..=page).next_back() else {
-        return Vec::new();
-    };
+    shown_at(&views(), page).cloned().unwrap_or_default()
+}
+
+/// [`pages_of`] in `v`, without a copy of the list.
+fn shown_at(v: &Views, page: usize) -> Option<&Vec<usize>> {
+    let (&base, &(bytes, section, offset)) = v.views.range(..=page).next_back()?;
     let within = page.wrapping_sub(base);
     if within >= bytes || !within.is_multiple_of(K64) {
+        return None;
+    }
+    v.pages.get(&(section, offset + within as u64))
+}
+
+/// For each 64 KiB page `b * K64` of blocks `[from, to)` that lies in a
+/// title view (each block once a view it lies in, as [`views_between`]
+/// gives them): the block and [`pages_of`] it, where that has 2 to `most`
+/// views. One look at the views for the whole run, and no list made for a
+/// page with one view (most of them): `crate::watch::protect` asks this
+/// under the guards' lock (`VICTORY_GUARD_ONE_LOOK`; after Belobug
+/// f2cc1009, where asking page by page was 6 % of the submitting thread's
+/// time).
+pub(crate) fn shared_pages_of_blocks(from: usize, to: usize, most: usize) -> Vec<(usize, Vec<usize>)> {
+    let (start, end) = (from.saturating_mul(K64), to.saturating_mul(K64));
+    if start >= end {
         return Vec::new();
     }
-    v.pages.get(&(section, offset + within as u64)).cloned().unwrap_or_default()
+    let v = views();
+    let first = v.views.range(..=start).next_back().filter(|(base, view)| **base + view.0 > start);
+    let mut out = Vec::new();
+    for (&base, &(bytes, _, _)) in first.into_iter().chain(v.views.range(start.saturating_add(1)..end)) {
+        for block in (base / K64).max(from)..base.saturating_add(bytes).div_ceil(K64).min(to) {
+            if let Some(shown) = shown_at(&v, block * K64)
+                && (2..=most).contains(&shown.len())
+            {
+                out.push((block, shown.clone()));
+            }
+        }
+    }
+    out
 }
 
 /// The title views that show any of the physical bytes `[offset, offset +
@@ -1308,6 +1338,36 @@ mod tests {
         assert_eq!(cover(at + 4 * K64, K64), Cover::Run(77, 4 * K64 as u64));
         views_gone(at + 4 * K64, K64);
         assert_eq!(cover(at + 4 * K64, K64), Cover::None);
+    }
+
+    /// One look at the views for a run of blocks finds what a look block by
+    /// block finds, without the pages shown once or too often.
+    #[test]
+    fn shared_pages_of_a_run_are_those_found_block_by_block() {
+        let at = 0x7_8000_0000usize;
+        // Section 91: pages 0-3 at `at`; pages 1-2 again further on; page 3
+        // in very many views.
+        title_memory_view(at, 4 * K64, 91, 0);
+        title_memory_view(at + 16 * K64, 2 * K64, 91, K64 as u64);
+        for k in 0..5 {
+            title_memory_view(at + (32 + k) * K64, K64, 91, 3 * K64 as u64);
+        }
+        let (from, to) = (at / K64, at / K64 + 40);
+        let one_look = shared_pages_of_blocks(from, to, 4);
+        let mut by_block = Vec::new();
+        for (base, bytes) in views_between(from * K64, to * K64) {
+            for block in (base / K64).max(from)..(base + bytes).div_ceil(K64).min(to) {
+                let shown = pages_of(block * K64);
+                if (2..=4).contains(&shown.len()) {
+                    by_block.push((block, shown));
+                }
+            }
+        }
+        assert_eq!(one_look, by_block);
+        let blocks: Vec<usize> = one_look.iter().map(|(b, _)| b - at / K64).collect();
+        assert_eq!(blocks, vec![1, 2, 16, 17]);
+        assert!(shared_pages_of_blocks(to, from, 4).is_empty());
+        views_gone(at, 40 * K64);
     }
 
     /// Only private memory committed whole, read-write, is taken for a part.

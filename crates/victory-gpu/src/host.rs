@@ -19,6 +19,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
 mod card_merge;
+mod card_ports;
 mod slot_wait;
 mod stall_report;
 mod twin_ring;
@@ -2363,6 +2364,8 @@ struct CardWork {
     /// With `VICTORY_CARD_HASH_WIDE=alt` ([`card_hash_wide_now`]): the compare of [`CARD_COMPARE_WIDE`], `pso`
     /// being [`CARD_COMPARE`]'s. Both shaders declare the same root signature.
     pso_wide: Option<ID3D12PipelineState>,
+    /// The wide compare loading eight places at once (`card_ports`, `VICTORY_CARD_COMPARE_EIGHT`).
+    pso_eight: Option<ID3D12PipelineState>,
     /// One dword per piece compared, set where the piece differs: PC
     /// memory, mapped (buffer, mapping, bytes).
     differs: (ID3D12Resource, usize, u64),
@@ -2594,10 +2597,11 @@ fn card_hash_wide_now() -> bool {
 impl CardWork {
     /// The compare's pipeline for a submission ([`card_hash_wide_now`]) and whether it is the wide form.
     fn compare_for(&self, wide_now: bool) -> (&ID3D12PipelineState, bool) {
-        match (&self.pso_wide, wide_now) {
+        let chosen = match (&self.pso_wide, wide_now) {
             (Some(wide), true) => (wide, true),
             _ => (&self.pso, card_hash_wide()),
-        }
+        };
+        card_ports::compare_or_eight(chosen, &self.pso_eight)
     }
 }
 
@@ -5167,6 +5171,7 @@ impl Host {
             // With `alt`: the wide form's pipeline beside it (`pso` is then the thread-a-piece form, as
             // `card_compare_source` gives it without `=1`). None if it does not build: every submission keeps `pso`.
             let pso_wide = (card_hash_mode() == 2).then(|| self.make_card_compare_wide(&root)).flatten();
+            let pso_eight = self.make_card_compare_eight(&root);
             Ok(CardWork {
                 sync: vec![list()?],
                 check: vec![list()?],
@@ -5174,6 +5179,7 @@ impl Host {
                 root,
                 pso,
                 pso_wide,
+                pso_eight,
                 differs: (differs, data as usize, RESULTS),
                 fetched: None,
                 taken: 0,
@@ -5592,10 +5598,12 @@ impl Host {
                     // the declared pieces and flags those whose hash is another.
                     let hashes = |list: &ID3D12GraphicsCommandList, group: &[Synced]| {
                         // (a copy promoted the buffer to a copy destination;
-                        // the merge left it an unordered-access one)
+                        // the merge left it an unordered-access one; once a buffer, `card_ports::first_of_buffer`)
+                        let mut seen = Vec::new();
                         let moves: Vec<_> = group
                             .iter()
                             .filter(|w| w.before.is_some() && (w.merged.is_some() || !w.ranges.is_empty()))
+                            .filter(|w| card_ports::first_of_buffer(&mut seen, &w.shadow.buffer))
                             .map(|w| {
                                 let from = if w.merged.is_some() {
                                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS
