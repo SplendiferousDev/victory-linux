@@ -73,6 +73,13 @@ pub fn title_memory_placeholder(at: usize, len: usize) {
     note(&mut p, at, len);
 }
 
+/// Whether `[at, at + len)` lies in a placeholder reservation the runtime
+/// made ([`title_memory_placeholder`]): the stand-in for the kernel's
+/// answer where that is not given (Wine).
+pub(crate) fn recorded_placeholder(at: usize, len: usize) -> bool {
+    within(&placeholders(), at, at.saturating_add(len)).is_some()
+}
+
 fn note(p: &mut BTreeMap<usize, usize>, at: usize, len: usize) {
     let end = at.saturating_add(len);
     let first = p
