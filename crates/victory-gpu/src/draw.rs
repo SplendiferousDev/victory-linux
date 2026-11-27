@@ -575,6 +575,8 @@ pub(crate) struct State {
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
+    /// Its recording held dynamic slots when they were given back.
+    had_tables: bool,
     /// Diagnostics: the number of this recording of the list, by which the
     /// tables it makes twice are told ([`table_asked`]); 0 until its first.
     #[cfg(feature = "diagnostics")]
@@ -598,6 +600,11 @@ impl State {
     /// shortcut: a list the title runs a second time without a reset then
     /// reads slots others may have taken (logged once).
     pub(crate) fn tables_done(&mut self) {
+        // Ran again without a reset: what it recorded reads per-draw slots
+        // given back after its first run (`crate::readercheck`).
+        if self.tables_gone && self.had_tables {
+            crate::readercheck::rerun();
+        }
         if self.tables_gone && self.dynamic.is_empty() {
             return;
         }
@@ -605,6 +612,7 @@ impl State {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("a list ran again after its descriptor tables were given back"));
         }
+        self.had_tables |= !self.dynamic.is_empty();
         for (heap, id, first, n) in self.dynamic.drain(..) {
             crate::descriptor::release_dynamic(heap, id, first, n);
         }
@@ -1097,6 +1105,9 @@ struct Fresh {
     n: u32,
     /// Which slots the shader reads in the title's formats, in order.
     halves: Vec<u32>,
+    /// Which entries the shader reads as constant buffers while they hold
+    /// another view, made constant buffer views (`crate::tablekey`).
+    forced: Vec<u32>,
     at: usize,
     first: u32,
 }
@@ -1783,6 +1794,9 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
+            if crate::readercheck::on() {
+                crate::readercheck::shader(&stage.shader.hash);
+            }
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, &t.host.half_views, compute, &spans, &mut staged);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
@@ -4002,7 +4016,7 @@ impl State {
             }
         }
         let mut made = Vec::new();
-        for slot in fresh {
+        for &slot in &fresh {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
@@ -4085,13 +4099,19 @@ impl State {
                 .collect();
             halves.sort_unstable();
             halves.dedup();
-            let key = halves.iter().fold(table_hash(table, n), |h, &k| {
-                (h.rotate_left(5) ^ u64::from(k + 1)).wrapping_mul(0x517c_c1b7_2722_0a95)
-            });
+            // And which entries it reads as constant buffers over another
+            // view (`VICTORY_TABLE_KEY_CBV`; off, none).
+            let forced = if crate::tablekey::key_cbv() {
+                crate::tablekey::forced(&entries, n, |k| crate::descriptor::view(table + u64::from(k) * 32))
+            } else {
+                Vec::new()
+            };
+            let key = crate::tablekey::key(table_hash(table, n), &halves, &forced);
             let same = self.fresh_tables.get(&key).filter(|f| {
                 f.table == table
                     && f.n == n
                     && f.halves == halves
+                    && f.forced == forced
                     && self.fresh_records[f.at..f.at + n as usize]
                         .iter()
                         .enumerate()
@@ -4138,6 +4158,9 @@ impl State {
                         tally(18, 1);
                     }
                 }
+                if crate::readercheck::on() {
+                    self.check_readers(&entries, host, first, crate::readercheck::Path::Found);
+                }
                 made.push((slot, first * 32));
                 continue;
             }
@@ -4155,7 +4178,7 @@ impl State {
             clock.lap(21);
             let at = self.fresh_records.len();
             self.fresh_records.extend((0..n).map(|k| record(table, k)));
-            self.fresh_tables.insert(key, Fresh { table, n, halves, at, first });
+            self.fresh_tables.insert(key, Fresh { table, n, halves, forced, at, first });
             if !spans.is_empty() {
                 staged.push((table, n));
             }
@@ -4267,11 +4290,55 @@ impl State {
                     }
                 }
             }
+            if crate::readercheck::on() {
+                self.check_readers(&entries, host, first, crate::readercheck::Path::Fresh);
+            }
             made.push((slot, first * 32));
+        }
+        // Tables with constants that were not made afresh after all are
+        // read in the title's own slots.
+        if crate::readercheck::on() {
+            for &slot in fresh.iter().filter(|&&slot| !made.iter().any(|m| m.0 == slot)) {
+                for u in used.iter().filter(tables).filter(|u| u.slot == slot && u.kind == ResourceType::Cbv) {
+                    let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+                        continue;
+                    };
+                    let handle = table + u64::from(u.table_offset_dwords) * 4;
+                    let Some(heap) = self.heap_of(handle) else {
+                        continue;
+                    };
+                    let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
+                        continue;
+                    };
+                    crate::readercheck::check(
+                        host.kind_of(index),
+                        crate::readercheck::Path::InPlace,
+                        index,
+                        u.table_offset_dwords / 8,
+                        self.pipeline,
+                    );
+                }
+            }
         }
         #[cfg(feature = "diagnostics")]
         tally_done();
         made
+    }
+
+    /// `VICTORY_READER_CHECK`: the slots of a table made in per-draw slots
+    /// from `first` that `entries` read as constant buffers hold constant
+    /// buffer views (`crate::readercheck`).
+    fn check_readers(
+        &self,
+        entries: &[&UsedResource],
+        host: &crate::descriptor::host::HostHeap,
+        first: u32,
+        path: crate::readercheck::Path,
+    ) {
+        for u in entries.iter().filter(|u| u.kind == ResourceType::Cbv) {
+            let k = u.table_offset_dwords / 8;
+            crate::readercheck::check(host.kind_of(first + k), path, first + k, k, self.pipeline);
+        }
     }
 
     /// The first draws, at debug level: what they bind and read

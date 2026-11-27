@@ -11,16 +11,25 @@ use std::sync::atomic::{AtomicU8, Ordering};
 pub(crate) struct Switch {
     var: &'static str,
     what: &'static str,
+    /// The mode while unset or set to something else than `0`, `1`, `alt`.
+    default: u8,
     mode: OnceLock<u8>,
     last: AtomicU8,
 }
 
 /// `0` off, `1` on, `2` in turn, from a switch's value.
+#[cfg(test)]
 pub(crate) fn mode_of(value: Option<&str>) -> u8 {
+    mode_or(value, 0)
+}
+
+/// As [`mode_of`] for a switch that is `default` while unset: `0` is off.
+pub(crate) fn mode_or(value: Option<&str>, default: u8) -> u8 {
     match value.map(str::trim) {
+        Some("0") => 0,
         Some("1") => 1,
         Some("alt") => 2,
-        _ => 0,
+        _ => default,
     }
 }
 
@@ -38,6 +47,18 @@ impl Switch {
         Switch {
             var,
             what,
+            default: 0,
+            mode: OnceLock::new(),
+            last: AtomicU8::new(2),
+        }
+    }
+
+    /// A switch that is on unless set to `0` (or `alt`).
+    pub(crate) const fn new_on(var: &'static str, what: &'static str) -> Switch {
+        Switch {
+            var,
+            what,
+            default: 1,
             mode: OnceLock::new(),
             last: AtomicU8::new(2),
         }
@@ -46,9 +67,11 @@ impl Switch {
     /// `0` off, `1` on, `2` in turn (read once).
     pub(crate) fn mode(&self) -> u8 {
         *self.mode.get_or_init(|| {
-            let mode = mode_of(std::env::var(self.var).ok().as_deref());
-            if mode == 1 {
+            let mode = mode_or(std::env::var(self.var).ok().as_deref(), self.default);
+            if mode == 1 && self.default == 0 {
                 tracing::info!("{} ({}=1)", self.what, self.var);
+            } else if mode == 0 && self.default == 1 {
+                tracing::info!("off: {} ({}=0)", self.what, self.var);
             }
             mode
         })
@@ -87,6 +110,14 @@ mod tests {
         assert_eq!(mode_of(Some("2")), 0);
         assert_eq!(mode_of(Some("1")), 1);
         assert_eq!(mode_of(Some(" alt ")), 2);
+    }
+
+    #[test]
+    fn a_switch_on_by_default_is_off_only_at_zero() {
+        assert_eq!(mode_or(None, 1), 1);
+        assert_eq!(mode_or(Some("0"), 1), 0);
+        assert_eq!(mode_or(Some("2"), 1), 1);
+        assert_eq!(mode_or(Some("alt"), 1), 2);
     }
 
     #[test]

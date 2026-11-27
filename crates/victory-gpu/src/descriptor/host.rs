@@ -2353,7 +2353,6 @@ impl HostHeap {
     }
 
     /// What slot `index` holds ([`HostHeap::kinds`]).
-    #[cfg(test)]
     pub(crate) fn kind_of(&self, index: u32) -> u8 {
         self.kinds.get(index as usize).map_or(0, |k| k.load(std::sync::atomic::Ordering::Relaxed))
     }
