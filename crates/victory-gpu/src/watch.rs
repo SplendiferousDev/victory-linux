@@ -1130,6 +1130,13 @@ fn placeholder(block: usize) -> bool {
     // in that word, not the flags.)
     const MEMORY_REGION_INFORMATION_EX: u32 = 7;
     const PLACEHOLDER_RESERVATION: u32 = 1 << 8;
+    // Wine answers this class with an error status (invalid class, or not
+    // implemented), and always will for a build that has none of it: found
+    // once, then the runtime's own record of its reservations stands in.
+    static UNSUPPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if UNSUPPORTED.load(std::sync::atomic::Ordering::Relaxed) {
+        return placeholder_by_record(block);
+    }
     let mut region = Region::default();
     // SAFETY: the answer's room and its size; the kernel checks the address.
     let status = unsafe {
@@ -1142,7 +1149,32 @@ fn placeholder(block: usize) -> bool {
             std::ptr::null_mut(),
         )
     };
+    const STATUS_NOT_IMPLEMENTED: i32 = 0xC000_0002_u32 as i32;
+    const STATUS_INVALID_INFO_CLASS: i32 = 0xC000_0003_u32 as i32;
+    if matches!(status, STATUS_NOT_IMPLEMENTED | STATUS_INVALID_INFO_CLASS) {
+        UNSUPPORTED.store(true, std::sync::atomic::Ordering::Relaxed);
+        return placeholder_by_record(block);
+    }
     status >= 0 && region.region_type & PLACEHOLDER_RESERVATION != 0
+}
+
+/// [`placeholder`] where the kernel's question is not answered (Wine): the
+/// block is in a placeholder reservation the runtime made
+/// ([`crate::noquery::title_memory_placeholder`]) and is still reserved,
+/// not mapped or committed (`VirtualQuery` tells that much there). A
+/// reservation the title released by itself may be recorded still; the
+/// holes noted in it are asked of the guards again by their notes' age, as
+/// for any hole in an ordinary reservation.
+fn placeholder_by_record(block: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    if !crate::noquery::recorded_placeholder(block * BLOCK, BLOCK) {
+        return false;
+    }
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+    n != 0 && info.State == MEM_RESERVE
 }
 
 /// The note that `block` is uncommitted is gone, or is true no longer: the
@@ -2871,6 +2903,9 @@ mod tests {
         };
         let pages = |block: usize| (p + block * BLOCK) / PAGE;
         let (from, to) = (p, p + 4 * BLOCK);
+        // The runtime tells of its placeholders as it makes them (the record
+        // stands in for the kernel's answer where that is not given).
+        crate::noquery::title_memory_placeholder(p, 4 * BLOCK);
         let first = map(0);
         assert!(placeholder(p / BLOCK + 1) && placeholder(p / BLOCK + 3), "what is left of the placeholder");
         assert!(!placeholder(p / BLOCK), "a view is none");
