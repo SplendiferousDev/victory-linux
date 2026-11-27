@@ -50,6 +50,11 @@ mod halves;
 #[path = "dispatch_threads.rs"]
 mod dispatch_threads;
 
+/// The interpolation and export lowering, split out so this file stays under
+/// the size limit.
+#[path = "io_ops.rs"]
+mod io_ops;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -1340,6 +1345,7 @@ impl<'a> Lower<'a> {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
+                    || n.starts_with("v_permlane")
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
@@ -2378,6 +2384,9 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        if self.s.pixel {
+            settle_position_mode(&mut self.s.inputs);
+        }
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -5647,12 +5656,21 @@ impl<'a> Lower<'a> {
                 (self.s.m.bin(c, op, a, b), None)
             }
             "s_lshl1_add_u32" | "s_lshl2_add_u32" | "s_lshl3_add_u32" | "s_lshl4_add_u32" => {
+                // SCC: the sum overflows 32 bits, through bits shifted out
+                // of src0 or the add's carry.
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
-                let k = self.s.m.i32(u32::from(name.as_bytes()[6] - b'0'));
+                let n = u32::from(name.as_bytes()[6] - b'0');
+                let k = self.s.m.i32(n);
                 let t = self.s.m.bin(c, Bin::Shl, a, k);
-                (self.s.m.bin(c, Bin::Add, t, b), None)
+                let r = self.s.m.bin(c, Bin::Add, t, b);
+                let (rest, z) = (self.s.m.i32(32 - n), self.s.m.i32(0));
+                let out = self.s.m.bin(c, Bin::LShr, a, rest);
+                let shifted_out = self.s.m.cmp(c, pred::NE, out, z);
+                let carry = self.s.m.cmp(c, pred::IULT, r, t);
+                (r, Some(self.s.m.bin(c, Bin::Or, shifted_out, carry)))
             }
             "s_min_u32" | "s_max_u32" | "s_min_i32" | "s_max_i32" => {
+                // SCC: src0 is the one chosen.
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
                 let p = match name {
                     "s_min_u32" => pred::IULT,
@@ -5661,7 +5679,7 @@ impl<'a> Lower<'a> {
                     _ => pred::SGT,
                 };
                 let t = self.s.m.cmp(c, p, a, b);
-                (self.s.m.select(c, t, a, b), None)
+                (self.s.m.select(c, t, a, b), Some(t))
             }
             "s_abs_i32" => {
                 let a = src32(self, 0)?;
@@ -6572,6 +6590,39 @@ impl<'a> Lower<'a> {
         Ok(out)
     }
 
+    /// Channels of buffer format `format`, as [`Self::format_load`] gives
+    /// them, as d16 data: 16 bits each, two per dword, low half first (an
+    /// odd last high half 0). Integer formats keep their low 16 bits; the
+    /// others become f16.
+    fn d16_channels(&mut self, format: u8, channels: Vec<V>) -> Result<Vec<V>, Why> {
+        let (_, numeric) = buffer_format(format).ok_or("a buffer format")?;
+        let c = self.cur;
+        let mut halves = Vec::new();
+        for x in channels {
+            halves.push(if matches!(numeric, Numeric::Uint | Numeric::Sint) {
+                let m = self.s.m.i32(0xFFFF);
+                self.s.m.bin(c, Bin::And, x, m)
+            } else {
+                let (f, i32t) = (self.as_float(x), self.s.t.i32);
+                self.s
+                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+            });
+        }
+        let mut out = Vec::new();
+        for pair in halves.chunks(2) {
+            out.push(match *pair {
+                [lo, hi] => {
+                    let k16 = self.s.m.i32(16);
+                    let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
+                    self.s.m.bin(c, Bin::Or, lo, hi)
+                }
+                [lo] => lo,
+                _ => unreachable!("chunks of one or two"),
+            });
+        }
+        Ok(out)
+    }
+
     /// The byte offset a buffer descriptor built around a root descriptor adds
     /// (constant and computed parts); none for other descriptors.
     fn built_offset(&mut self, src: &Source) -> Result<(u32, Option<V>), Why> {
@@ -6868,6 +6919,123 @@ impl<'a> Lower<'a> {
                 _ => return Err(WHY),
             };
             incoming.push((index, at));
+        }
+        let join = self.block[block].ok_or(WHY)?;
+        let phi = self.s.m.phi(join, self.s.t.i32);
+        self.s.m.set_phi(phi, incoming);
+        Ok(phi)
+    }
+
+    /// Registers an immediate sampler constant and returns its slot index.
+    fn register_sampler(&mut self, words: &[u32], cmp: bool) -> Result<u32, Why> {
+        let words: [u32; 4] = words
+            .get(..4)
+            .and_then(|w| w.try_into().ok())
+            .ok_or("a sampler constant")?;
+        let n = match self.samplers.iter().position(|w| *w == words) {
+            Some(n) => n,
+            None => {
+                self.samplers.push(words);
+                self.samplers.len() - 1
+            }
+        };
+        if cmp && n < 64 {
+            self.s.cmp_samplers |= 1 << n;
+        }
+        Ok(n as u32)
+    }
+
+    /// Resolves a control-flow phi of immediate sampler constants into either a
+    /// single static sampler register (`One`) or a uniform `i32` phi index over
+    /// `regs` (`Many`) for branch dispatch at the sample site.
+    fn sampler_phi_choice(
+        &mut self,
+        block: usize,
+        args: &[Source],
+        cmp: bool,
+        depth: u32,
+    ) -> Result<(Option<V>, Vec<u32>), Why> {
+        const WHY: Why = "a descriptor chosen by control flow";
+        let mut distinct: Vec<[u32; 4]> = Vec::new();
+        self.collect_constant_samplers(block, args, depth, &mut distinct)?;
+        if distinct.is_empty() {
+            return Err(WHY);
+        }
+        let mut regs = Vec::with_capacity(distinct.len());
+        for w in &distinct {
+            regs.push(self.register_sampler(w, cmp)?);
+        }
+        if regs.len() == 1 {
+            return Ok((None, regs));
+        }
+        let idx = self.sampler_index_phi(block, args, 0, &distinct, depth)?;
+        Ok((Some(idx), regs))
+    }
+
+    fn collect_constant_samplers(
+        &self,
+        block: usize,
+        args: &[Source],
+        depth: u32,
+        distinct: &mut Vec<[u32; 4]>,
+    ) -> Result<(), Why> {
+        const WHY: Why = "a descriptor chosen by control flow";
+        let p = self.x.p;
+        for (&q, arg) in p.blocks[block].preds.iter().zip(args) {
+            if self.block[q].is_none() {
+                continue;
+            }
+            match arg {
+                Source::Constant(w) if w.len() >= 4 => {
+                    let k: [u32; 4] = w[..4].try_into().unwrap();
+                    if !distinct.contains(&k) {
+                        distinct.push(k);
+                    }
+                }
+                Source::Phi {
+                    block: inner,
+                    args: inner_args,
+                } if depth > 0 => {
+                    self.collect_constant_samplers(*inner, inner_args, depth - 1, distinct)?;
+                }
+                _ => return Err(WHY),
+            }
+        }
+        Ok(())
+    }
+
+    fn sampler_index_phi(
+        &mut self,
+        block: usize,
+        args: &[Source],
+        lower: u32,
+        distinct: &[[u32; 4]],
+        depth: u32,
+    ) -> Result<V, Why> {
+        const WHY: Why = "a descriptor chosen by control flow";
+        let p = self.x.p;
+        let mut incoming = Vec::new();
+        for (&q, arg) in p.blocks[block].preds.iter().zip(args) {
+            if self.block[q].is_none() {
+                continue;
+            }
+            let tail = self.tail[q].ok_or(WHY)?;
+            let at = self.edges.get(&(q, block)).copied().unwrap_or(tail);
+            let idx = match arg {
+                Source::Constant(w) if w.len() >= 4 => {
+                    let k: [u32; 4] = w[..4].try_into().unwrap();
+                    let pos = distinct.iter().position(|d| *d == k).ok_or(WHY)? as u32;
+                    self.s.m.i32(lower + pos)
+                }
+                Source::Phi {
+                    block: inner,
+                    args: inner_args,
+                } if depth > 0 => {
+                    self.sampler_index_phi(*inner, inner_args, lower, distinct, depth - 1)?
+                }
+                _ => return Err(WHY),
+            };
+            incoming.push((idx, at));
         }
         let join = self.block[block].ok_or(WHY)?;
         let phi = self.s.m.phi(join, self.s.t.i32);
@@ -7886,6 +8054,57 @@ impl<'a> Lower<'a> {
                     .op(c, "legacyF16ToF32", Attr::ReadNone, self.s.t.f32, 131, &[a]);
                 float(self, r)
             }
+            "v_cvt_f32_f64" if v.opsel == 0 => {
+                // IEEE-754 f64 (sign:1, exp:11 bias 1023, frac:52) -> f32
+                // in integer ops so no DXIL f64/doubles feature flag is needed.
+                let x = self.src64(inst, 0)?;
+                let (lo, mut hi) = self.split64(x);
+                if v.abs & 1 != 0 {
+                    let m = self.s.m.i32(0x7FFF_FFFF);
+                    hi = self.s.m.bin(c, Bin::And, hi, m);
+                }
+                if v.neg & 1 != 0 {
+                    let s = self.s.m.i32(0x8000_0000);
+                    hi = self.s.m.bin(c, Bin::Xor, hi, s);
+                }
+                let sign_mask = self.s.m.i32(0x8000_0000);
+                let sign = self.s.m.bin(c, Bin::And, hi, sign_mask);
+                let k20 = self.s.m.i32(20);
+                let exp_mask = self.s.m.i32(0x7FF);
+                let exp_raw = self.s.m.bin(c, Bin::LShr, hi, k20);
+                let exp64 = self.s.m.bin(c, Bin::And, exp_raw, exp_mask);
+                let frac_hi_mask = self.s.m.i32(0x000F_FFFF);
+                let frac_hi = self.s.m.bin(c, Bin::And, hi, frac_hi_mask);
+                let k3 = self.s.m.i32(3);
+                let k29 = self.s.m.i32(29);
+                let mant_hi = self.s.m.bin(c, Bin::Shl, frac_hi, k3);
+                let mant_lo = self.s.m.bin(c, Bin::LShr, lo, k29);
+                let mant = self.s.m.bin(c, Bin::Or, mant_hi, mant_lo);
+                let bias_diff = self.s.m.i32(896);
+                let exp32 = self.s.m.bin(c, Bin::Sub, exp64, bias_diff);
+                let k23 = self.s.m.i32(23);
+                let exp32_sh = self.s.m.bin(c, Bin::Shl, exp32, k23);
+                let normal = self.s.m.bin(c, Bin::Or, sign, exp32_sh);
+                let normal = self.s.m.bin(c, Bin::Or, normal, mant);
+                let k897 = self.s.m.i32(897);
+                let under = self.s.m.cmp(c, pred::IULT, exp64, k897);
+                let k1151 = self.s.m.i32(1151);
+                let over = self.s.m.cmp(c, pred::IUGE, exp64, k1151);
+                let inf_bits = self.s.m.i32(0x7F80_0000);
+                let inf = self.s.m.bin(c, Bin::Or, sign, inf_bits);
+                let k2047 = self.s.m.i32(2047);
+                let is_max = self.s.m.cmp(c, pred::EQ, exp64, k2047);
+                let frac_or = self.s.m.bin(c, Bin::Or, frac_hi, lo);
+                let z = self.s.m.i32(0);
+                let has_frac = self.s.m.cmp(c, pred::NE, frac_or, z);
+                let is_nan = self.s.m.bin(c, Bin::And, is_max, has_frac);
+                let qnan = self.s.m.i32(0x7FC0_0000);
+                let over_val = self.s.m.select(c, is_nan, qnan, inf);
+                let r = self.s.m.select(c, under, sign, normal);
+                let r = self.s.m.select(c, over, over_val, r);
+                let f = self.as_float(r);
+                float(self, f)
+            }
             "v_cndmask_b32" => {
                 let mask = match v.src.get(2) {
                     Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
@@ -7963,6 +8182,81 @@ impl<'a> Lower<'a> {
                         .or_insert(Val::Missing("a lane mask read as data"));
                 }
                 Ok(())
+            }
+            "v_permlane16_b32" | "v_permlanex16_b32" => {
+                // RDNA2 ISA 12.12: each nibble of {src2, src1} selects a lane
+                // in this row of 16, or the other row of the same 32-lane half.
+                // OP_SEL[0:1] are fetch-inactive and bound-control, not half selects.
+                if v.abs != 0 || v.neg != 0 || v.opsel & !3 != 0 {
+                    return Err("permlane input modifiers");
+                }
+                self.cross_lane(false)?;
+                let fetch_inactive = v.opsel & 1 != 0;
+                if fetch_inactive
+                    && !all_lane_blocks(self.x.st).is_some_and(|all| all[self.cur_ir])
+                {
+                    // DXIL cannot read the last VGPR value of a host invocation
+                    // that has left through a lane branch. A guard keeps it here.
+                    return Err("a permlane fetch from lanes outside the host branch");
+                }
+                let (x, lo, hi) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let lane = self.lane_index();
+                let (k7, k8, k15, k16, k31, k32, k4, one, zero) = (
+                    self.s.m.i32(7),
+                    self.s.m.i32(8),
+                    self.s.m.i32(15),
+                    self.s.m.i32(16),
+                    self.s.m.i32(31),
+                    self.s.m.i32(32),
+                    self.s.m.i32(4),
+                    self.s.m.i32(1),
+                    self.s.m.i32(0),
+                );
+                let pos = self.s.m.bin(c, Bin::And, lane, k15);
+                let lower = self.s.m.cmp(c, pred::IULT, pos, k8);
+                let packed = self.s.m.select(c, lower, lo, hi);
+                let shift = self.s.m.bin(c, Bin::And, pos, k7);
+                let shift = self.s.m.bin(c, Bin::Mul, shift, k4);
+                let pick = self.s.m.bin(c, Bin::LShr, packed, shift);
+                let pick = self.s.m.bin(c, Bin::And, pick, k15);
+                let not15 = self.s.m.i32(!15);
+                let mut row = self.s.m.bin(c, Bin::And, lane, not15);
+                if name == "v_permlanex16_b32" {
+                    row = self.s.m.bin(c, Bin::Xor, row, k16);
+                }
+                let src = self.s.m.bin(c, Bin::Or, row, pick);
+                let r = if fetch_inactive {
+                    self.read_lane(x, src)
+                } else {
+                    // Ballot the console EXEC guard as well as the host's active
+                    // invocations. Never shuffle from an inactive host lane.
+                    let enabled = guard.unwrap_or_else(|| self.s.m.bool(true));
+                    let i32t = self.s.t.i32;
+                    let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+                    let mask = self.s.op(
+                        c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[enabled],
+                    );
+                    let lo = self.s.m.extract(c, mask, 0);
+                    let hi = self.s.m.extract(c, mask, 1);
+                    let lower = self.s.m.cmp(c, pred::IULT, src, k32);
+                    let word = self.s.m.select(c, lower, lo, hi);
+                    let bit = self.s.m.bin(c, Bin::And, src, k31);
+                    let bit = self.s.m.bin(c, Bin::LShr, word, bit);
+                    let bit = self.s.m.bin(c, Bin::And, bit, one);
+                    let active = self.s.m.cmp(c, pred::NE, bit, zero);
+                    let safe = self.s.m.select(c, active, src, lane);
+                    let read = self.read_lane(x, safe);
+                    let fallback = if v.opsel & 2 != 0 {
+                        zero
+                    } else {
+                        let Some(Operand::Vector { reg, .. }) = v.dst else {
+                            return Err("a permlane result outside a VGPR");
+                        };
+                        self.i32_of(inst.read(Reg::V(reg)).ok_or("a permlane old value")?)?
+                    };
+                    self.s.m.select(c, active, read, fallback)
+                };
+                int(self, r)
             }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
@@ -9561,211 +9855,6 @@ impl<'a> Lower<'a> {
         }
     }
 
-    fn interp(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
-        let Some(&interp) = self.interps.get(&site) else {
-            // The first half of a pair: its second half interpolates the
-            // attribute itself, so nothing needs this half's partial sum.
-            // But an f16 second half that writes the high half of the
-            // register this one wrote keeps the low half as it was (the
-            // console compiler reuses the register; the low half is not
-            // read), so the register needs a value: 0.
-            let name = inst.name();
-            if name == "v_interp_p1_f32" || name == "v_interp_p1ll_f16" {
-                let dst = match &inst.fields {
-                    Fields::Vintrp { dst, .. } => Some(*dst),
-                    Fields::Valu(v) => v.dst,
-                    _ => None,
-                };
-                if let Some(Operand::Vector { reg, .. }) = dst {
-                    let zero = self.s.m.i32(0);
-                    self.write(inst, Reg::V(reg), zero, None);
-                    return Ok(());
-                }
-            }
-            return Err(FIRST_HALF);
-        };
-        let name = inst.name();
-        let (dst, src) = match &inst.fields {
-            Fields::Vintrp { dst, src, .. } => (*dst, Some(*src)),
-            Fields::Valu(v) => {
-                if v.abs != 0 || v.neg != 0 {
-                    return Err("interpolation operand modifiers");
-                }
-                (v.dst.ok_or("an interpolation")?, v.src.get(1).copied())
-            }
-            _ => unreachable!(),
-        };
-        let Operand::Vector { reg, .. } = dst else {
-            return Err("an interpolation");
-        };
-        // A float operand of the instruction.
-        let float = |l: &mut Self, op: Option<Operand>| -> Result<V, Why> {
-            let x = l.operand(inst, &op.ok_or("an interpolation operand")?)?;
-            Ok(l.as_float(x))
-        };
-        // What the result adds to the evaluated channel (a second half's
-        // first half, when the halves evaluate on their own).
-        let mut add = None;
-        let (attribute, eval) = match *interp {
-            Interp::Interpolated {
-                attribute,
-                barycentric,
-                ..
-            } => {
-                let mode = interp_mode(barycentric).ok_or("pull-model interpolation")?;
-                let eval = if self.per_vertex(attribute.row) {
-                    // The element is read per vertex elsewhere, so it is
-                    // constant: weigh its vertices with SV_Barycentrics.
-                    let mut ij = [None; 2];
-                    for (index, w) in ij.iter_mut().enumerate() {
-                        let x = match self.barycentric(barycentric, index as u8) {
-                            Val::I32(x) => x,
-                            Val::Missing(w) => return Err(w),
-                            Val::Bit(_) => unreachable!(),
-                        };
-                        *w = Some(self.as_float(x));
-                    }
-                    Eval::Weights {
-                        p0: true,
-                        i: ij[0],
-                        j: ij[1],
-                    }
-                } else {
-                    Eval::Mode(mode)
-                };
-                (attribute, eval)
-            }
-            // P0, the provoking vertex: a flat (nointerpolation) input.
-            Interp::Vertex {
-                attribute,
-                vertex: 2,
-            } => (attribute, Eval::Mode(1)),
-            // P10 and P20: what the first and second halves weigh, P1 - P0
-            // and P2 - P0, which is what the hardware holds for an
-            // attribute the program also interpolates.
-            Interp::Vertex { attribute, vertex } if self.interpolated(attribute.row) => {
-                let one = Some(self.s.m.f32(1f32.to_bits()));
-                let (i, j) = if vertex == 0 {
-                    (one, None)
-                } else {
-                    (None, one)
-                };
-                (attribute, Eval::Weights { p0: false, i, j })
-            }
-            Interp::Vertex { .. } => return Err("a non-provoking vertex value"),
-            // A half of an interpolation with computed i or j: P0 + i P10,
-            // or the old dst (f16: the third operand) + j P20.
-            Interp::Weighted { attribute } if name.starts_with("v_interp_p1") => {
-                let i = Some(float(self, src)?);
-                (
-                    attribute,
-                    Eval::Weights {
-                        p0: true,
-                        i,
-                        j: None,
-                    },
-                )
-            }
-            Interp::Weighted { attribute } => {
-                let old = match &inst.fields {
-                    Fields::Valu(v) => v.src.get(2).copied(),
-                    _ => Some(dst),
-                };
-                add = Some(float(self, old)?);
-                let j = Some(float(self, src)?);
-                (
-                    attribute,
-                    Eval::Weights {
-                        p0: false,
-                        i: None,
-                        j,
-                    },
-                )
-            }
-        };
-        let packing = match &self.x.native.io {
-            StageIo::Ps { inputs, .. } => inputs
-                .iter()
-                .find(|i| i.row == attribute.row && i.fp16)
-                .map(|i| {
-                    let packs = if i.pack2 {
-                        input_packs(&self.x.native.io, &self.s.inputs)
-                    } else {
-                        Vec::new()
-                    };
-                    (i.pack2, packs)
-                }),
-            _ => None,
-        };
-        let f16 = name.ends_with("_f16");
-        // The evaluated channel plus `add`, as a float.
-        let total = |l: &mut Self, row: u8, ch: u8| -> Result<V, Why> {
-            let x = l.eval_channel(row, ch, eval)?;
-            let x = l.as_float(x);
-            Ok(match add {
-                Some(a) => l.s.m.bin(l.cur, Bin::Add, a, x),
-                None => x,
-            })
-        };
-        let x = match packing {
-            None if f16 || attribute.high => return Err("a 16-bit read of a 32-bit input"),
-            None => {
-                let x = total(self, attribute.row, attribute.channel)?;
-                self.as_int(x)
-            }
-            Some((pack2, packs)) => {
-                // 16-bit values: one in the low half of each dword, or two
-                // per dword (`packed_half`); the host's are 32-bit floats.
-                let half = |l: &mut Self, h: u8| -> Result<Option<V>, Why> {
-                    let src = if pack2 {
-                        packed_half(&l.s.inputs, &packs, attribute.row, h)
-                    } else {
-                        h.is_multiple_of(2).then_some((attribute.row, h / 2))
-                    };
-                    match src {
-                        Some((row, ch)) => total(l, row, ch).map(Some),
-                        None => Ok(None),
-                    }
-                };
-                let to_f16 = |l: &mut Self, f: V| {
-                    let i32t = l.s.t.i32;
-                    l.s.op(l.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
-                };
-                let h = 2 * attribute.channel + u8::from(attribute.high);
-                let c = self.cur;
-                if name == "v_interp_p1ll_f16" {
-                    // An f32 result from 16-bit vertex values.
-                    let f = half(self, h)?.ok_or("a packed input half no element holds")?;
-                    self.as_int(f)
-                } else if f16 {
-                    let f = half(self, h)?.ok_or("a packed input half no element holds")?;
-                    let lo = to_f16(self, f);
-                    self.low_half(inst, reg, lo)
-                } else if matches!(eval, Eval::Mode(1)) {
-                    // The whole dword of a flat input: both halves.
-                    let h = 2 * attribute.channel;
-                    let z = self.s.m.i32(0);
-                    let lo = match half(self, h)? {
-                        Some(f) => to_f16(self, f),
-                        None => z,
-                    };
-                    let hi = match half(self, h + 1)? {
-                        Some(f) => to_f16(self, f),
-                        None => z,
-                    };
-                    let k16 = self.s.m.i32(16);
-                    let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
-                    self.s.m.bin(c, Bin::Or, lo, hi)
-                } else {
-                    return Err("32-bit interpolation of a 16-bit input");
-                }
-            }
-        };
-        // A pixel interpolates in every lane; guards only hide inactive ones.
-        self.write(inst, Reg::V(reg), x, None);
-        Ok(())
-    }
-
     /// Whether the program reads attribute row `row` per vertex (an
     /// interpolation with computed barycentrics, or P10 or P20): then its
     /// element is declared constant and read with `attributeAtVertex`.
@@ -10218,7 +10307,23 @@ impl<'a> Lower<'a> {
             if cmp && (*a16 || dmask.count_ones() != 1) {
                 return Err("a comparison sample of 16-bit coordinates or several channels");
             }
-            let sh = self.handle(site, ss, true, (14 | if cmp { 0x8000 } else { 0 }, 0))?;
+            let mut sampler_choice: Option<(V, Vec<u32>)> = None;
+            let sh = match ss {
+                Source::Phi { block, args } => {
+                    match self.sampler_phi_choice(*block, args, cmp, 8) {
+                        Ok((None, regs)) => self.s.sampler_handle(self.cur, regs[0]),
+                        Ok((Some(idx), regs)) => {
+                            let first = self.s.sampler_handle(self.cur, regs[0]);
+                            sampler_choice = Some((idx, regs));
+                            first
+                        }
+                        Err(_) => {
+                            self.handle(site, ss, true, (14 | if cmp { 0x8000 } else { 0 }, 0))?
+                        }
+                    }
+                }
+                _ => self.handle(site, ss, true, (14 | if cmp { 0x8000 } else { 0 }, 0))?,
+            };
             // Texel offsets (`_o`) come first: x in bits 0-5, y in 8-13,
             // signed (programmable offsets: gathers only).
             let offset_word = name.ends_with("_o");
@@ -10335,6 +10440,60 @@ impl<'a> Lower<'a> {
             } else {
                 fu
             };
+            let call_sample = |l: &mut Self,
+                                   intrinsic: &str,
+                                   opcode: u32,
+                                   args: &[V],
+                                   gathered: &mut Option<[V; 4]>|
+             -> V {
+                let Some((idx, ref regs)) = sampler_choice else {
+                    return l
+                        .s
+                        .op(c, intrinsic, Attr::ReadOnly, l.s.t.res_ret, opcode, args);
+                };
+                let merge = l.s.m.new_block();
+                let mut cur_test = c;
+                let mut per_ch: [Vec<(V, usize)>; 4] = Default::default();
+                let mut last_r = args[0];
+                for (i, &reg) in regs.iter().enumerate() {
+                    let arm = if i + 1 == regs.len() {
+                        cur_test
+                    } else {
+                        let arm = l.s.m.new_block();
+                        let next = l.s.m.new_block();
+                        let k = l.s.m.i32(i as u32);
+                        let cond = l.s.m.cmp(cur_test, pred::EQ, idx, k);
+                        l.s.m.terminate(cur_test, Term::CondBr(cond, arm, next));
+                        cur_test = next;
+                        arm
+                    };
+                    let mut arm_args = args.to_vec();
+                    arm_args[1] = l.s.sampler_handle(arm, reg);
+                    let r_i = l.s.op(
+                        arm,
+                        intrinsic,
+                        Attr::ReadOnly,
+                        l.s.t.res_ret,
+                        opcode,
+                        &arm_args,
+                    );
+                    for (ch, slot) in per_ch.iter_mut().enumerate() {
+                        let v = l.s.m.extract(arm, r_i, ch as u32);
+                        slot.push((v, arm));
+                    }
+                    l.s.m.terminate(arm, Term::Br(merge));
+                    last_r = r_i;
+                }
+                let mut phis = [fu; 4];
+                for (ch, incoming) in per_ch.into_iter().enumerate() {
+                    let phi = l.s.m.phi(merge, l.s.t.f32);
+                    l.s.m.set_phi(phi, incoming);
+                    phis[ch] = phi;
+                }
+                *gathered = Some(phis);
+                l.cur = merge;
+                last_r
+            };
             match op {
                 // Outside a pixel shader there are no screen derivatives:
                 // the validator refuses `sample` there ("features
@@ -10348,14 +10507,7 @@ impl<'a> Lower<'a> {
                 60 if !self.s.pixel => {
                     args.extend(&os);
                     args.push(self.s.m.f32(0));
-                    self.s.op(
-                        c,
-                        "sampleLevel.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        62,
-                        &args,
-                    )
+                    call_sample(self, "sampleLevel.f32", 62, &args, &mut gathered)
                 }
                 60 => {
                     if offset_word {
@@ -10381,8 +10533,7 @@ impl<'a> Lower<'a> {
                     }
                     args.extend(&os);
                     args.push(clamp);
-                    self.s
-                        .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
+                    call_sample(self, "sample.f32", 60, &args, &mut gathered)
                 }
                 61 => {
                     // With a16 the bias is an f16 in the low half of its
@@ -10398,25 +10549,11 @@ impl<'a> Lower<'a> {
                     args.extend(&os);
                     if self.s.pixel {
                         args.extend([bias, clamp]);
-                        self.s.op(
-                            c,
-                            "sampleBias.f32",
-                            Attr::ReadOnly,
-                            self.s.t.res_ret,
-                            61,
-                            &args,
-                        )
+                        call_sample(self, "sampleBias.f32", 61, &args, &mut gathered)
                     } else {
                         // As above: the bias is the level.
                         args.push(bias);
-                        self.s.op(
-                            c,
-                            "sampleLevel.f32",
-                            Attr::ReadOnly,
-                            self.s.t.res_ret,
-                            62,
-                            &args,
-                        )
+                        call_sample(self, "sampleLevel.f32", 62, &args, &mut gathered)
                     }
                 }
                 63 if kind == 5 => {
@@ -10457,14 +10594,7 @@ impl<'a> Lower<'a> {
                     let lod = if has_cl { self.binary(35, lod, clamp) } else { lod };
                     args.extend(&os);
                     args.push(lod);
-                    self.s.op(
-                        c,
-                        "sampleLevel.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        62,
-                        &args,
-                    )
+                    call_sample(self, "sampleLevel.f32", 62, &args, &mut gathered)
                 }
                 63 => {
                     let mut g = vec![fu; 6];
@@ -10477,14 +10607,7 @@ impl<'a> Lower<'a> {
                     args.extend(&os);
                     args.extend(g);
                     args.push(clamp);
-                    self.s.op(
-                        c,
-                        "sampleGrad.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        63,
-                        &args,
-                    )
+                    call_sample(self, "sampleGrad.f32", 63, &args, &mut gathered)
                 }
                 64 | 65 => {
                     let reference = addr_u32(self, first - 1)?;
@@ -10497,8 +10620,7 @@ impl<'a> Lower<'a> {
                     } else {
                         "sampleCmpLevelZero.f32"
                     };
-                    self.s
-                        .op(c, name, Attr::ReadOnly, self.s.t.res_ret, op, &args)
+                    call_sample(self, name, op, &args, &mut gathered)
                 }
                 62 => {
                     let lod = if name == "image_sample_l" {
@@ -10509,14 +10631,7 @@ impl<'a> Lower<'a> {
                     };
                     args.extend(&os);
                     args.push(lod);
-                    self.s.op(
-                        c,
-                        "sampleLevel.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        62,
-                        &args,
-                    )
+                    call_sample(self, "sampleLevel.f32", 62, &args, &mut gathered)
                 }
                 _ => {
                     if name == "image_gather4" {
@@ -10598,14 +10713,7 @@ impl<'a> Lower<'a> {
                     } else {
                         args.extend(&os[..2]);
                         args.push(self.s.m.i32(dmask.trailing_zeros()));
-                        self.s.op(
-                            c,
-                            "textureGather.f32",
-                            Attr::ReadOnly,
-                            self.s.t.res_ret,
-                            73,
-                            &args,
-                        )
+                        call_sample(self, "textureGather.f32", 73, &args, &mut gathered)
                     }
                 }
             }
@@ -10772,8 +10880,9 @@ impl<'a> Lower<'a> {
             "buffer_load_sshort" => Some((16, true)),
             _ => None,
         };
-        // d16: two 16-bit channels per VGPR, low half first.
-        let d16 = name.starts_with("buffer_") && name.contains("_format_d16_");
+        // d16: two 16-bit channels per VGPR, low half first (buffer and
+        // tbuffer formats alike).
+        let d16 = name.contains("_format_d16_");
         let plain = name.replace("_format_d16_", "_format_");
         let (typed, count) = match plain
             .strip_prefix("buffer_load_")
@@ -11137,7 +11246,11 @@ impl<'a> Lower<'a> {
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
-            for (k, x) in self.format_load(h, off, f, count)?.into_iter().enumerate() {
+            let mut xs = self.format_load(h, off, f, count)?;
+            if d16 {
+                xs = self.d16_channels(f, xs)?;
+            }
+            for (k, x) in xs.into_iter().enumerate() {
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
@@ -11258,244 +11371,11 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    fn export(&mut self, b: usize, i: usize) -> Result<(), Why> {
-        let e = *self
-            .exports
-            .get(&(b, i))
-            .ok_or("an export I/O raising did not see")?;
-        if e.compressed {
-            return Err("a compressed export");
-        }
-        let guard = self.guard(b, i)?;
-        let mesh = self.s.mesh.is_some();
-        let c = self.cur;
-        if let Some(g) = guard
-            && !mesh
-        {
-            if !(e.done && self.s.pixel) {
-                return Err("a conditional export");
-            }
-            let t = self.s.m.bool(true);
-            let kill = self.s.m.bin(c, Bin::Xor, g, t);
-            self.s
-                .op(c, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
-        }
-        if mesh && e.target == Target::Primitive {
-            return self.emit_indices(e, guard);
-        }
-        let param_row = |usage: Usage, row: u8| match usage {
-            // The 2020 compiler leaves a mesh program's first entry zeroed
-            // (usage "position"): its row is the one no other entry names.
-            Usage::Other(0) if mesh => self.unnamed_row(),
-            _ => Some(row),
-        };
-        // (output element, channel) per exported channel; per-primitive
-        // outputs are elements of `prims`.
-        let mut stores = Vec::new();
-        let primitive = matches!(e.target, Target::PrimitiveParam { .. });
-        let outputs = if primitive {
-            &self.s.prims
-        } else {
-            &self.s.outputs
-        };
-        let by_kind = |kind: u8| outputs.iter().position(|o| o.kind == kind);
-        // 16-bit vertex outputs: the halves each dword carries, as (output
-        // element, channel, high half) per channel.
-        let halves = match e.target {
-            Target::Param { usage, row } => {
-                param_row(usage, row).and_then(|r| self.half_outputs.get(&r).map(|&h| (r, h)))
-            }
-            _ => None,
-        };
-        if let Some((row, (pack2, _))) = halves {
-            let packs: Vec<(u8, Option<u8>)> = self
-                .half_outputs
-                .iter()
-                .filter(|(_, h)| h.0)
-                .map(|(&r, h)| (r, h.1))
-                .collect();
-            for ch in 0..4u8 {
-                let Some(value) = e.values[usize::from(ch)] else {
-                    continue;
-                };
-                for high in [false, true] {
-                    let h = 2 * ch + u8::from(high);
-                    let src = if pack2 {
-                        packed_half(outputs, &packs, row, h)
-                    } else {
-                        (!high).then_some((row, ch))
-                    };
-                    let found = src.and_then(|(r, c)| {
-                        outputs.iter().position(|o| {
-                            o.row == Some(u32::from(r)) && c >= o.col && c < o.col + o.cols
-                        })
-                    });
-                    if let Some(id) = found {
-                        let col = src.expect("found").1 - outputs[id].col;
-                        stores.push((id, col, value, Some(high)));
-                    }
-                }
-            }
-        }
-        for ch in 0..4u8 {
-            let Some(value) = e.values[usize::from(ch)] else {
-                continue;
-            };
-            if halves.is_some() {
-                break;
-            }
-            let found = match e.target {
-                Target::Color(n) => outputs
-                    .iter()
-                    .position(|o| o.kind == 16 && o.row == Some(u32::from(n)))
-                    .map(|id| (id, ch)),
-                Target::Position(0) => by_kind(3).map(|id| (id, ch)),
-                Target::Depth => match ch {
-                    0 => by_kind(17)
-                        .or(by_kind(18))
-                        .or(by_kind(19))
-                        .map(|id| (id, 0)),
-                    1 => by_kind(20).map(|id| (id, 0)),
-                    2 => by_kind(14).map(|id| (id, 0)),
-                    _ => None,
-                },
-                Target::Param { usage, row } | Target::PrimitiveParam { usage, row } => {
-                    let row = param_row(usage, row);
-                    outputs
-                        .iter()
-                        .position(|o| {
-                            row.is_some_and(|r| o.row == Some(u32::from(r)))
-                                && ch >= o.col
-                                && ch < o.col + o.cols
-                        })
-                        .map(|id| (id, ch - outputs[id].col))
-                }
-                Target::Null | Target::Unread => None,
-                Target::Position(n @ 1..=2) => {
-                    // shortcut: without the misc vector (point size, render
-                    // target or viewport index) pos1 and pos2 carry the clip
-                    // then cull distances, in semantic order.
-                    if outputs.iter().any(|o| matches!(o.kind, 4 | 5)) {
-                        return Err("render-target or viewport index exports");
-                    }
-                    let mut dists: Vec<usize> = (0..outputs.len())
-                        .filter(|&i| matches!(outputs[i].kind, 6 | 7))
-                        .collect();
-                    dists.sort_by_key(|&i| (outputs[i].kind, outputs[i].index));
-                    let flat: Vec<(usize, u8)> = dists
-                        .iter()
-                        .flat_map(|&i| (0..outputs[i].cols).map(move |c| (i, c)))
-                        .collect();
-                    // Channels past the distances the signature declares are
-                    // ones the clipper does not enable (`PA_CL_VS_OUT_CNTL`).
-                    let k = usize::from(n - 1) * 4 + usize::from(ch);
-                    flat.get(k).copied()
-                }
-                Target::Position(_) => return Err("clip, cull or point-size exports"),
-                Target::Primitive => return Err("a primitive export"),
-            };
-            if let Some((id, col)) = found {
-                stores.push((id, col, value, None));
-            }
-        }
-        fn elements<'l>(l: &'l mut Lower, primitive: bool) -> &'l mut Vec<SigElement> {
-            if primitive {
-                &mut l.s.prims
-            } else {
-                &mut l.s.outputs
-            }
-        }
-        if stores
-            .iter()
-            .any(|s| s.3.is_none() && elements(self, primitive)[s.0].half)
-        {
-            return Err("a 16-bit output the stage data does not mark");
-        }
-        // A mesh lane writes its own vertex or primitive, where it exports.
-        let at = if mesh {
-            let flat = self.mesh_thread();
-            let limit = if let Some(m) = self.s.mesh {
-                if primitive {
-                    m.max_primitives
-                } else {
-                    m.max_vertices
-                }
-            } else {
-                0
-            };
-            let threads = self.s.threads.map(|t| t[0]).unwrap_or(u32::MAX);
-            let mesh_guard = if limit > 0 && threads > limit {
-                let lim = self.s.m.i32(limit);
-                let in_bounds = self.s.m.cmp(self.cur, pred::IULT, flat, lim);
-                match guard {
-                    Some(g) => Some(self.s.m.bin(self.cur, Bin::And, g, in_bounds)),
-                    None => Some(in_bounds),
-                }
-            } else {
-                guard
-            };
-            self.begin_guarded(mesh_guard)
-        } else {
-            None
-        };
-        let (name, opcode) = match (mesh, primitive) {
-            (false, _) => ("storeOutput", 5),
-            (true, false) => ("storeVertexOutput", 171),
-            (true, true) => ("storePrimitiveOutput", 172),
-        };
-        for (id, col, value, half) in stores {
-            let mut x = self.i32_of(value)?;
-            if let Some(high) = half {
-                // An f16 half, declared a 32-bit float on the host.
-                let c = self.cur;
-                if high {
-                    let k16 = self.s.m.i32(16);
-                    x = self.s.m.bin(c, Bin::LShr, x, k16);
-                }
-                let f32t = self.s.t.f32;
-                let f = self
-                    .s
-                    .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
-                x = self.as_int(f);
-            }
-            let el = &mut elements(self, primitive)[id];
-            el.usage |= 1 << col;
-            let (suffix, x) = match el.comp {
-                9 if half.is_some() => (".f32", self.as_float(x)),
-                9 => {
-                    let f = match self.floats.get(&value) {
-                        Some(&f) => f,
-                        None => self.as_float(x),
-                    };
-                    (".f32", f)
-                }
-                _ => (".i32", x),
-            };
-            let mut args = vec![
-                self.s.m.i32(id as u32),
-                self.s.m.i32(0),
-                self.s.m.i8(col),
-                x,
-            ];
-            if mesh {
-                args.push(self.mesh_thread());
-            }
-            let void = self.s.t.void;
-            self.s.op(
-                self.cur,
-                &format!("{name}{suffix}"),
-                Attr::NoUnwind,
-                void,
-                opcode,
-                &args,
-            );
-        }
-        self.end_guarded(at, &[]);
-        Ok(())
-    }
-
-    /// Mesh: `exp prim` as the lane's primitive. Bit 31 culls it (all
-    /// indices 0: no area).
+    /// Mesh: `exp prim` as the lane's primitive. Each corner takes ten
+    /// bits: a 9-bit vertex index and, above it, its edge flag (bits 9, 19
+    /// and 29), which only the console's edge-flag rasterisation reads and
+    /// which is no part of the index. Bit 31 culls it (all indices 0: no
+    /// area).
     fn emit_indices(&mut self, e: &Export, guard: Option<V>) -> Result<(), Why> {
         let v = e.values[0].ok_or("a primitive export without its indices")?;
         let x = self.i32_of(v)?;
@@ -11893,6 +11773,20 @@ impl<'a> Lower<'a> {
 
 /// The DXIL interpolation mode of a kind of barycentrics (none for the
 /// pull model).
+/// A pixel program under conservative depth declares its position centroid
+/// (`emit`); one that runs per sample (an `SV_SampleIndex` input or a
+/// per-sample interpolation) declares it per sample instead.
+pub(super) fn settle_position_mode(inputs: &mut [SigElement]) {
+    let per_sample = inputs
+        .iter()
+        .any(|e| e.kind == 12 || matches!(e.interp, 6 | 7));
+    for e in inputs.iter_mut().filter(|e| e.kind == 3 && e.interp == 5) {
+        if per_sample {
+            e.interp = 7;
+        }
+    }
+}
+
 fn interp_mode(kind: Barycentric) -> Option<u8> {
     Some(match kind {
         Barycentric::PerspectiveCenter => 2,

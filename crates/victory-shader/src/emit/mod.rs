@@ -90,6 +90,8 @@ mod intersect_tests;
 pub mod host;
 mod lower;
 mod own_bits;
+#[cfg(all(test, windows))]
+mod permlane_tests;
 mod rect;
 mod sampler;
 mod shader;
@@ -745,10 +747,15 @@ fn emit_program(
     let mut inputs = sig(FourCC::ISG1)?;
     let mut outputs = sig(FourCC::OSG1)?;
     // Interpolation as DXC declares it by default; pixel inputs that are
-    // read get the mode their barycentrics say.
+    // read get the mode their barycentrics say. Under conservative depth
+    // (`SV_DepthGreaterEqual`/`SV_DepthLessEqual`) the validator wants the
+    // position centroid (or per sample, which `lower` sets when the program
+    // runs per sample), as in PR #136.
+    let conservative_depth = pixel && outputs.iter().any(|o| matches!(o.kind, 18 | 19));
     let interpolated = if pixel { &mut inputs } else { &mut outputs };
     for e in interpolated {
         e.interp = match (e.kind, e.comp) {
+            (3, _) if conservative_depth => 5,
             (3, _) => 4,
             // Constant, as DXC declares it (the AMD compiler crashed on a
             // front face without a mode).
@@ -1291,9 +1298,12 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn stub_pipeline_is_created() {
-        let Ok(host) = super::host::Host::new(false) else {
-            eprintln!("no SM 6.6 device; skipped");
-            return;
+        let host = match super::host::Host::new(false) {
+            Ok(host) => host,
+            Err(e) => {
+                eprintln!("no SM 6.6 device ({e}); skipped");
+                return;
+            }
         };
         let ps = super::HostShader {
             stage: crate::HwStage::Ps,
@@ -1357,6 +1367,184 @@ mod tests {
         let ours = c[4..20].to_vec();
         v.validate(&mut c).unwrap();
         assert_eq!(c[4..20], ours[..], "our hash differs from the validator's");
+    }
+
+    /// Triangle (0, 1, 2), each corner's 9-bit index in its 10-bit field.
+    const TRIANGLE: u32 = 1 << 10 | 2 << 20;
+    /// The edge flags of the three corners (bits 9, 19 and 29).
+    const EDGE_FLAGS: u32 = 1 << 9 | 1 << 19 | 1 << 29;
+    /// The culling bit.
+    const CULL: u32 = 1 << 31;
+
+    /// A one-wave (32-lane) triangle mesh program whose lanes all export
+    /// primitive `prim` and, as vertex `lane`, the position
+    /// (lane & 1 ? 3 : -1, lane & 2 ? 3 : -1, 0.5, 1): triangle (0, 1, 2)
+    /// covers the whole target.
+    fn triangle_mesh(prim: u32) -> Result<HostShader, ShaderError> {
+        let words = [
+            0xD765_0001u32, // v_mbcnt_lo_u32_b32 v1, -1, 0
+            0x0001_00C1,
+            0x3604_0281, // v_and_b32 v2, 1, v1
+            0x3606_0282, // v_and_b32 v3, 2, v1
+            0x7E04_0D02, // v_cvt_f32_u32 v2, v2
+            0x7E06_0D03, // v_cvt_f32_u32 v3, v3
+            0x1008_04F6, // v_mul_f32 v4, 4.0, v2
+            0x0608_08F3, // v_add_f32 v4, -1.0, v4
+            0x100A_06F4, // v_mul_f32 v5, 2.0, v3
+            0x060A_0AF3, // v_add_f32 v5, -1.0, v5
+            0x7E0C_02F0, // v_mov_b32 v6, 0.5
+            0x7E0E_02F2, // v_mov_b32 v7, 1.0
+            0x7E12_02FF, // v_mov_b32 v9, prim
+            prim,
+            0xF800_0941, // exp prim v9, off, off, off done
+            0x0000_0009,
+            0xF800_08CF, // exp pos0 v4, v5, v6, v7 done
+            0x0706_0504,
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: false,
+            vgprs: 10,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(crate::native::MeshIo {
+                outputs: vec![],
+                clip_cntl: 0,
+                threads: 32,
+                max_vertices: 32,
+                max_primitives: 32,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let position = SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            kind: 3,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+        };
+        let osg1 = container::signature(&[position], false);
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes)?;
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+        let st = structure::structure(&p)?;
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, &native)?;
+        emit(&c, &native, &p, &st, &io, &res)
+    }
+
+    /// A primitive export's corners are 9-bit indices: the edge flag above
+    /// each (bits 9, 19, 29) is no part of it. Masking ten bits made a
+    /// flagged corner index 512 or more, past any mesh program's vertices
+    /// (the draw test below shows the triangle). Flagged, unflagged and
+    /// culled exports translate, and dxil.dll, where there is one, takes
+    /// each module.
+    #[test]
+    fn primitive_export_indices_drop_the_edge_flags() {
+        #[cfg(windows)]
+        let mut validator = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        )
+        .ok();
+        for prim in [
+            TRIANGLE,
+            TRIANGLE | EDGE_FLAGS,
+            TRIANGLE | EDGE_FLAGS | CULL,
+        ] {
+            let ms = triangle_mesh(prim).unwrap_or_else(|e| panic!("{prim:#x}: {e}"));
+            #[cfg(windows)]
+            if let Some(v) = validator.as_mut() {
+                v.validate(&mut ms.dxil.clone())
+                    .unwrap_or_else(|e| panic!("{prim:#x}: {e}"));
+            }
+        }
+    }
+
+    /// A triangle mesh program on the host GPU and on WARP (where they have
+    /// mesh shaders): triangle (0, 1, 2) covers the target with its corners'
+    /// edge flags set as without them; with the culling bit, nothing is lit.
+    #[test]
+    #[cfg(windows)]
+    fn edge_flagged_triangles_draw_as_unflagged_ones() {
+        use super::host::{Draw, Host, Root};
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_FEATURE_D3D12_OPTIONS7, D3D12_FEATURE_DATA_D3D12_OPTIONS7,
+            D3D12_MESH_SHADER_TIER_NOT_SUPPORTED, D3D12_SHADER_VISIBILITY_MESH,
+        };
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let ps = constant_color();
+        let mut ran = 0;
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                continue;
+            };
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+            // SAFETY: the query writes the structure of the given size.
+            let queried = unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS7,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+            };
+            if queried.is_err() || options.MeshShaderTier == D3D12_MESH_SHADER_TIER_NOT_SUPPORTED {
+                eprintln!("no mesh shaders on the {label} device; skipped");
+                continue;
+            }
+            for (prim, culled) in [
+                (TRIANGLE, false),
+                (TRIANGLE | EDGE_FLAGS, false),
+                (TRIANGLE | EDGE_FLAGS | CULL, true),
+            ] {
+                let ms = triangle_mesh(prim).unwrap();
+                let root = host
+                    .root_signature_for(&[(&ms, D3D12_SHADER_VISIBILITY_MESH)])
+                    .unwrap();
+                let pso = host
+                    .mesh_pipeline_with(&root, &ms.dxil, &ps)
+                    .unwrap_or_else(|e| panic!("{label}: mesh pipeline: {e}"));
+                let texels = host
+                    .draw(
+                        &root,
+                        &pso,
+                        &Draw {
+                            roots: vec![(0, Root::Constants(vec![0]))],
+                            textures: &[],
+                            samplers: &[],
+                            vertices: &[],
+                            stride: 0,
+                            size: (16, 16),
+                            mesh_groups: 1,
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{label}: draw: {e}"));
+                let lit = texels.iter().filter(|t| t[3] != 0.0).count();
+                if culled {
+                    assert_eq!(lit, 0, "{label}, {prim:#x}: a culled triangle lit texels");
+                    continue;
+                }
+                assert!(
+                    texels.iter().all(|t| *t == [1.0, 0.5, 0.25, 1.0]),
+                    "{label}, {prim:#x}: {lit} of 256 texels lit"
+                );
+            }
+            eprintln!("{label}: edge-flagged triangles drew");
+            ran += 1;
+        }
+        if ran == 0 {
+            eprintln!("no device with mesh shaders; skipped");
+        }
     }
 
     /// A pixel shader interpolating at sample positions (PERSP_SAMPLE
@@ -2002,6 +2190,18 @@ mod barycentric_tests {
     /// Translates a pixel program with the input VGPRs `input_addr`
     /// enables and one float4 TEXCOORD0 attribute (attr 0, row 0).
     fn pixel(words: &[u32], input_addr: u32) -> Result<HostShader, ShaderError> {
+        let mut target = element("SV_Target", 16, 0);
+        target.usage = 15;
+        pixel_sig(words, input_addr, &[element("TEXCOORD", 0, 0)], &[target])
+    }
+
+    /// The same with the console signatures `inputs` and `outputs`.
+    fn pixel_sig(
+        words: &[u32],
+        input_addr: u32,
+        inputs: &[SigElement],
+        outputs: &[SigElement],
+    ) -> Result<HostShader, ShaderError> {
         let native = NativeProgram {
             stage: HwStage::Ps,
             wave64: false,
@@ -2025,10 +2225,8 @@ mod barycentric_tests {
             },
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
-        let mut target = element("SV_Target", 16, 0);
-        target.usage = 15;
-        let isg1 = container::signature(&[element("TEXCOORD", 0, 0)], true);
-        let osg1 = container::signature(&[target], false);
+        let isg1 = container::signature(inputs, true);
+        let osg1 = container::signature(outputs, false);
         let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
         let c = Container::parse(&bytes).unwrap();
         let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
@@ -2146,6 +2344,87 @@ mod barycentric_tests {
     }
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    /// The `PSV0` input elements: (kind, start row if allocated, mode).
+    fn psv_inputs(shader: &HostShader) -> Vec<(u8, Option<u8>, u8)> {
+        let c = Container::parse(&shader.dxil).unwrap();
+        let psv = c.part(FourCC::PSV0).unwrap().data;
+        let u = |at: usize| u32::from_le_bytes(psv[at..at + 4].try_into().unwrap()) as usize;
+        let info = u(0);
+        let n_in = psv[4 + 28] as usize;
+        let mut at = 4 + info;
+        let n_bind = u(at);
+        at += 4;
+        if n_bind > 0 {
+            at += 4 + n_bind * u(at);
+        }
+        at += 4 + u(at);
+        at += 4 + 4 * u(at);
+        let size = u(at);
+        at += 4;
+        (0..n_in)
+            .map(|k| {
+                let e = &psv[at + k * size..];
+                let row = (e[10] & 0x40 != 0).then_some(e[9]);
+                (e[11], row, e[13])
+            })
+            .collect()
+    }
+
+    /// A conservative depth output makes the position centroid, which the
+    /// validator wants (14 programs were rejected with the center mode).
+    #[test]
+    fn conservative_depth_declares_a_centroid_position() {
+        let [e0, e1] = exp_mrt0(2);
+        let words = [
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            e0,
+            e1,
+            S_ENDPGM,
+        ];
+        let mut position = element("SV_Position", 3, 1);
+        position.usage = 0;
+        let inputs = [element("TEXCOORD", 0, 0), position];
+        let mut target = element("SV_Target", 16, 0);
+        target.usage = 15;
+        for (kind, name) in [(18, "SV_DepthLessEqual"), (19, "SV_DepthGreaterEqual")] {
+            let mut depth = element(name, kind, 0);
+            (depth.row, depth.cols) = (None, 1);
+            let shader =
+                pixel_sig(&words, PERSP_CENTER, &inputs, &[target.clone(), depth]).unwrap();
+            let pos: Vec<_> = psv_inputs(&shader)
+                .into_iter()
+                .filter(|e| e.0 == 3)
+                .collect();
+            assert_eq!(pos, [(3, Some(1), 5)], "{name}");
+        }
+        // Plain depth or none: noperspective center, as DXC declares it.
+        let shader = pixel_sig(&words, PERSP_CENTER, &inputs, &[target]).unwrap();
+        assert!(psv_inputs(&shader).contains(&(3, Some(1), 4)));
+    }
+
+    /// Per sample, the conservative-depth position is per sample too.
+    #[test]
+    fn conservative_depth_per_sample_declares_a_sample_position() {
+        let mut position = element("SV_Position", 3, 0);
+        position.interp = 5;
+        let mut sample = element("SV_SampleIndex", 12, 0);
+        (sample.comp, sample.row, sample.cols) = (5, None, 1);
+        let mut inputs = vec![position.clone(), sample];
+        super::lower::settle_position_mode(&mut inputs);
+        assert_eq!(inputs[0].interp, 7);
+        // A per-sample interpolation alone does the same.
+        let mut texcoord = element("TEXCOORD", 0, 1);
+        texcoord.interp = 6;
+        let mut inputs = vec![position.clone(), texcoord];
+        super::lower::settle_position_mode(&mut inputs);
+        assert_eq!(inputs[0].interp, 7);
+        // Without either, centroid stays.
+        let mut alone = vec![position];
+        super::lower::settle_position_mode(&mut alone);
+        assert_eq!(alone[0].interp, 5);
+    }
 
     /// An interpolation whose i is computed (`v_mul_f32 v3, 0.5, v0`) reads
     /// the attribute's vertices: TEXCOORD0 becomes constant, read with
