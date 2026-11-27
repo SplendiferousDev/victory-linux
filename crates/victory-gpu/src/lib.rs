@@ -39,6 +39,8 @@ mod drvwatch;
 #[cfg(windows)]
 mod hostfault;
 #[cfg(windows)]
+mod faultaddr;
+#[cfg(windows)]
 mod fpsbox;
 #[cfg(windows)]
 mod stats;

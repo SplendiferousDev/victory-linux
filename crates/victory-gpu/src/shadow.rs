@@ -3916,6 +3916,27 @@ pub(crate) fn gone_holding(gpu: u64, since: u64) -> Option<String> {
         })
 }
 
+/// The live copy (a window, or a card copy) that holds the host GPU
+/// address `gpu`, described, if one does. Only tries the locks.
+pub(crate) fn live_holding(gpu: u64) -> Option<String> {
+    let holds = |s: &Shadow| {
+        // SAFETY: a plain query of our own buffer.
+        let bytes = unsafe { s.buffer.GetDesc() }.Width;
+        (s.gpu..s.gpu + bytes).contains(&gpu).then(|| format!("{:#x}+{bytes:#x} of title {:#x}+{:#x}", s.gpu, s.start, s.len))
+    };
+    if let Ok(loose) = LOOSE.try_lock()
+        && let Some(found) = loose.values().find_map(|s| holds(s))
+    {
+        return Some(format!("window {found}"));
+    }
+    let carded = CARDED.try_lock().ok()?;
+    carded
+        .iter()
+        .filter_map(std::sync::Weak::upgrade)
+        .find_map(|s| holds(&s))
+        .map(|found| format!("card copy {found}"))
+}
+
 /// Writes `va+bytes` ranges, joined where they touch, at most `most`.
 fn write_ranges(mut ranges: Vec<(u64, u64)>, most: usize, out: &mut String) {
     use std::fmt::Write;
