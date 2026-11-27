@@ -207,12 +207,21 @@ impl Shader {
                         samplers = t.host.samplers.len(),
                         "shader translated"
                     ),
-                    Err(e) => tracing::warn!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        error = %e,
-                        "shader does not translate; its pipelines' draws are dropped"
-                    ),
+                    Err(e) => {
+                        tracing::warn!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            error = %e,
+                            "shader does not translate; its pipelines' draws are dropped"
+                        );
+                        // `VICTORY_DUMP_REFUSED=<dir>`: the container as the title gave it,
+                        // `<hash>.cdxil`, for offline work (`victory translate <dir>`).
+                        if let Some(dir) = std::env::var_os("VICTORY_DUMP_REFUSED") {
+                            let dir = std::path::PathBuf::from(dir);
+                            let _ = std::fs::create_dir_all(&dir);
+                            let _ = std::fs::write(dir.join(format!("{}.cdxil", self.hash)), &self.container[..]);
+                        }
+                    }
                 }
                 done.ok()
             })
@@ -414,6 +423,9 @@ pub(crate) fn builder_off(why: &'static str) {
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
     static ALLOWED: OnceLock<bool> = OnceLock::new();
+    // Off unless `VICTORY_BVH_BUILDER=1` (the base fork turned it on by
+    // default; this fork keeps it off: the base's own notes say the title
+    // crashes 30-40 s after it starts).
     if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
         return false;
     }

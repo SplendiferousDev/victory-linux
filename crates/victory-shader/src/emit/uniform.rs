@@ -94,13 +94,17 @@ pub(super) fn lane_uniform(
                     }
                 }
                 // an LDS read at an alike address reads one value in every lane
+                // (`_d16` forms keep the other half of the destination register and are left
+                // out; base fork 1320dfd7.)
                 if let Fields::Ds {
                     addr: Some(Operand::Vector { reg, .. }),
                     dst: Some(_),
                     data,
+                    gds: false,
                     ..
                 } = &inst.fields
                     && name.starts_with("ds_read")
+                    && !name.contains("_d16")
                     && data.is_empty()
                 {
                     if inst.read(Reg::V(*reg)).is_some_and(|a| known(&next, &a)) {
@@ -139,20 +143,25 @@ pub(super) fn lane_uniform(
                     continue;
                 }
                 let alike = ops.iter().all(|op| match *op {
-                    Operand::Vector { reg, .. } => {
-                        // every dword of the operand the instruction reads from that register on
+                    Operand::Vector { reg, dwords } => {
+                        // every dword of the operand the instruction reads (not the old value of a
+                        // higher-numbered destination register that IR keeps for guards). A
+                        // relative move reads the register `M0` past this one, and a swap keeps
+                        // or moves old values: for those every register read from this one on
+                        // counts. (Base fork 1320dfd7.)
+                        let whole = name.starts_with("v_movrel") || name.starts_with("v_swap");
+                        let end = reg.saturating_add(dwords);
                         let read: Vec<Value> = inst
                             .reads
                             .iter()
-                            .filter(|r| matches!(r.0, Reg::V(x) if x >= reg))
+                            .filter(|r| matches!(r.0, Reg::V(x) if x >= reg && (whole || x < end)))
                             .map(|r| r.1)
                             .collect();
                         !read.is_empty() && read.iter().all(|x| known(&next, x))
                     }
                     // a scalar is one value; a lane mask is not, unless a compare of such values made it
-                    Operand::Scalar { code, .. } if code != NULL => inst
-                        .read(Reg::S(code))
-                        .is_none_or(|x| !is_mask(x) || known(&next, &x)),
+                    Operand::Scalar { code, dwords } if code != NULL => (code..code.saturating_add(dwords))
+                        .all(|c| inst.read(Reg::S(c)).is_none_or(|x| !is_mask(x) || known(&next, &x))),
                     _ => true,
                 });
                 if alike {
