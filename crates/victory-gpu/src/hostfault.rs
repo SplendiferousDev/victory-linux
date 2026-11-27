@@ -71,6 +71,24 @@ pub(crate) fn parse(line: &str) -> Option<Fault> {
             text: text.to_owned(),
         });
     }
+    // The driver failing inside itself, with no Xid: a mapping it could not
+    // set up ("intermapRegisterDmaMapping: Failed to insert ...") and the
+    // assertions that follow ("nvAssertFailedNoLog: ... gpu_vaspace.c").
+    // These came before a hung kernel driver once, so they count as faults.
+    for (needle, kind) in [
+        ("NVRM: intermapRegisterDmaMapping: Failed", "mapping failed"),
+        ("nvAssertFailed", "driver assertion"),
+    ] {
+        if let Some(at) = rest.find(needle) {
+            let at = rest[..at].rfind("NVRM").unwrap_or(at);
+            return Some(Fault {
+                vendor: Vendor::Nvidia,
+                kind: kind.to_owned(),
+                time,
+                text: rest[at..].to_owned(),
+            });
+        }
+    }
     let at = rest.find("amdgpu")?;
     let text = &rest[at..];
     let kind = if text.contains("GPU reset begin") {
@@ -244,6 +262,11 @@ mod tests {
         .unwrap();
         assert_eq!(f.vendor, Vendor::Nvidia);
         assert_eq!(f.kind, "Xid 31");
+        let m = parse("1764100000.5 NVRM: intermapRegisterDmaMapping: Failed to insert new mapping node for range 0x10000-0x1FFFF!").unwrap();
+        assert_eq!(m.kind, "mapping failed");
+        let a = parse("box kernel: NVRM: GPU0 nvAssertFailedNoLog: Assertion failed: NV_OK == status @ gpu_vaspace.c:4155").unwrap();
+        assert_eq!(a.kind, "driver assertion");
+        assert!(a.text.starts_with("NVRM: GPU0"));
         assert_eq!(f.time, Some(1764100000.25));
         assert!(f.text.starts_with("NVRM: Xid"));
         // Raw journal line with a host name, no stamp of ours.

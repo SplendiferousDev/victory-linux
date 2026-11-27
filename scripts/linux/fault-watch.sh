@@ -23,7 +23,7 @@ fi
 
 : >>"$out"
 # Driver lines only; the layer tells faults from follow-ups.
-pattern='NVRM: Xid|amdgpu.*(timeout|GPU reset begin|page fault)'
+pattern='NVRM: (Xid|intermapRegisterDmaMapping: Failed|.*nvAssertFailed)|amdgpu.*(timeout|GPU reset begin|page fault)'
 journalctl -k -f -n 0 -q -o short-unix |
   grep --line-buffered -E "$pattern" |
   while IFS= read -r line; do
