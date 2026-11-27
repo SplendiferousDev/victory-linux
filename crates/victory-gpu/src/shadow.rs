@@ -6189,6 +6189,7 @@ struct Entry {
 /// of [`crate::shared_lookups`].
 static BUFFERS: std::sync::RwLock<BTreeMap<(u64, usize), Entry>> = std::sync::RwLock::new(BTreeMap::new());
 
+#[track_caller]
 fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
     crate::lockmeter::write("sh:BUFFERS", &BUFFERS)
 }
@@ -6286,6 +6287,7 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use. A `len` of 0 or 1 is an ask without a length
 /// (a root view: the caller reads on to the copy's end).
+#[track_caller]
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     lookup(address, len, false)
 }
@@ -6306,6 +6308,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// (and copied) anew. Run 71, on a 256 KiB grid: 350 MB copied per frame
 /// against 120 MB, 7,087 write-watch askings against 2,600, and 5,263
 /// windows (4.5 GB) let go in two minutes against 393 in a whole run.
+#[track_caller]
 pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
     // With whole windows (the default) there is one window to a cell and
     // nothing to choose: exactly `find`.
@@ -6339,6 +6342,7 @@ static TABLES_CHANGED: AtomicU64 = AtomicU64::new(0);
 
 fn tables_changed() {
     TABLES_CHANGED.fetch_add(1, Ordering::SeqCst);
+    LOOKUPS[2].fetch_add(1, Ordering::Relaxed);
 }
 
 #[cfg(test)]
@@ -6383,8 +6387,10 @@ mod registration_tests {
 }
 
 /// Since the last frame line: asks answered from a thread's own memory of
-/// them, and asks that went to the tables.
-pub(crate) static LOOKUPS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// them, asks that went to the tables, changes of the tables (each one
+/// empties every thread's memory of its asks), and the times a thread found
+/// its memory emptied so.
+pub(crate) static LOOKUPS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// Whether a thread remembers what its asks found (fork pull request
 /// #1237; `VICTORY_LOOKUP_CACHE=1`).
@@ -6437,6 +6443,7 @@ thread_local! {
     static FOUND: std::cell::RefCell<(u64, Found)> = std::cell::RefCell::new((u64::MAX, Found::new()));
 }
 
+#[track_caller]
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     if !lookup_cache() {
         return lookup_tables(address, len, any);
@@ -6447,6 +6454,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         if f.0 != changes {
             f.1.clear();
             f.0 = changes;
+            LOOKUPS[3].fetch_add(1, Ordering::Relaxed);
         }
         f.1.get(&(address, len, any)).and_then(std::sync::Weak::upgrade)
     });
@@ -6481,6 +6489,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     Some(shadow)
 }
 
+#[track_caller]
 fn lookup_tables(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     if crate::shared_lookups::on() {
@@ -6765,6 +6774,7 @@ static LOOSE: std::sync::RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = std::sync::
 /// [`loose`]'s ask of a window that is there already, under the read lock
 /// ([`crate::shared_lookups`]): the same choice of window and the same notes on it (atomics;
 /// the idle sweep, which reads them, takes the lock for writing). `None`: none is there yet.
+#[track_caller]
 fn loose_shared(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
     let map = crate::lockmeter::read("sh:LOOSE read", &LOOSE);
     let (start, len) = loose_choice(&map, address, end, unsized_ask, any);
@@ -6798,6 +6808,7 @@ fn loose_note(shadow: &Shadow, address: u64, end: u64, unsized_ask: bool) {
     }
 }
 
+#[track_caller]
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
     let mut map = crate::lockmeter::write("sh:LOOSE", &LOOSE);
     let (cell, _) = window_of(address, end, WINDOW);

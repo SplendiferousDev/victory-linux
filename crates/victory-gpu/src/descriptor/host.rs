@@ -206,6 +206,7 @@ pub(crate) static DYNAMIC_LOW: std::sync::atomic::AtomicU32 = std::sync::atomic:
 /// Takes `lock`. Diagnostics builds count a take that finds it held in
 /// [`LOCKS`]`[at]` and add the nanoseconds it then waits to `[at + 1]`.
 #[cfg(feature = "diagnostics")]
+#[track_caller]
 fn locked<T>(lock: &Mutex<T>, at: usize) -> std::sync::MutexGuard<'_, T> {
     use std::sync::atomic::Ordering::Relaxed;
     match lock.try_lock() {
@@ -213,7 +214,7 @@ fn locked<T>(lock: &Mutex<T>, at: usize) -> std::sync::MutexGuard<'_, T> {
         Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
         Err(std::sync::TryLockError::WouldBlock) => {
             let started = std::time::Instant::now();
-            let guard = crate::lockmeter::lock("dh:lock", &lock);
+            let guard = crate::lockmeter::lock(heap_lock_name(at), &lock);
             LOCKS[at].fetch_add(1, Relaxed);
             LOCKS[at + 1].fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
             guard
@@ -222,8 +223,19 @@ fn locked<T>(lock: &Mutex<T>, at: usize) -> std::sync::MutexGuard<'_, T> {
 }
 
 #[cfg(not(feature = "diagnostics"))]
-fn locked<T>(lock: &Mutex<T>, _: usize) -> std::sync::MutexGuard<'_, T> {
-    crate::lockmeter::lock("dh:lock", &lock)
+#[track_caller]
+fn locked<T>(lock: &Mutex<T>, at: usize) -> std::sync::MutexGuard<'_, T> {
+    crate::lockmeter::lock(heap_lock_name(at), &lock)
+}
+
+/// The lock meter's name of a host heap's lock by its index in the diagnostics counts.
+fn heap_lock_name(at: usize) -> &'static str {
+    match at {
+        4 => "dh:made (slot mirroring)",
+        11 => "dh:kept",
+        13 => "dh:next (dynamic tables)",
+        _ => "dh:lock",
+    }
 }
 
 #[cfg(feature = "diagnostics")]

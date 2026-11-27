@@ -137,11 +137,14 @@ pub(super) fn late_line(frames: f64) {
         }
     }
     {
-        let found = [0, 1].map(|i| crate::shadow::LOOKUPS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        let found = [0, 1, 2, 3].map(|i| crate::shadow::LOOKUPS[i].swap(0, Ordering::Relaxed) as f64 / frames);
         tracing::info!(
-            "asks for a buffer's host copy per frame: {:.0} answered from the asking thread's memory of them, {:.0} from the tables (VICTORY_LOOKUP_CACHE)",
+            "asks for a buffer's host copy per frame: {:.0} answered from the asking thread's memory of them, {:.0} from the tables (VICTORY_LOOKUP_CACHE); \
+             {:.1} changes of the tables, each emptying every thread's memory of its asks, found {:.1} times",
             found[0],
-            found[1]
+            found[1],
+            found[2],
+            found[3]
         );
     }
     {

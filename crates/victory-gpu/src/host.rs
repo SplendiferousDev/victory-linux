@@ -7735,7 +7735,7 @@ impl HostList {
         crate::shot::close(self);
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
-            let count = crate::lockmeter::lock("ho:notes", &(self.notes).len() as u32).min(STAMPS - 1);
+            let count = (crate::lockmeter::lock("ho:notes", &self.notes).len() as u32).min(STAMPS - 1);
             // SAFETY: an open list, our heap and read-back buffer.
             unsafe {
                 self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, count);

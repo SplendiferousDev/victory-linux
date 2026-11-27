@@ -62,6 +62,43 @@ static TABLE: [Slot; SLOTS] = [const {
         counts: [const { [const { AtomicU64::new(0) }; CLASSES] }; 3],
     }
 }; SLOTS];
+/// The places locks are taken from (`#[track_caller]` through [`lock`], [`read`], [`write`]
+/// and the helpers that call them): the place, the lock's name, and its acquisitions, those
+/// that found the lock held and the nanoseconds they waited, all threads.
+struct Site {
+    at: AtomicUsize,
+    name: AtomicUsize,
+    len: AtomicUsize,
+    counts: [AtomicU64; 3],
+}
+
+static SITES: [Site; SLOTS] = [const {
+    Site {
+        at: AtomicUsize::new(0),
+        name: AtomicUsize::new(0),
+        len: AtomicUsize::new(0),
+        counts: [const { AtomicU64::new(0) }; 3],
+    }
+}; SLOTS];
+
+fn site(at: &'static std::panic::Location<'static>, name: &'static str) -> Option<&'static Site> {
+    let key = std::ptr::from_ref(at) as usize;
+    let start = (key >> 3).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 56;
+    for i in 0..SLOTS {
+        let s = &SITES[(start + i) % SLOTS];
+        match s.at.compare_exchange(0, key, Relaxed, Relaxed) {
+            Ok(_) => {
+                s.name.store(name.as_ptr() as usize, Relaxed);
+                s.len.store(name.len(), Relaxed);
+                return Some(s);
+            }
+            Err(was) if was == key => return Some(s),
+            Err(_) => {}
+        }
+    }
+    None
+}
+
 /// Frames since the last line.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
@@ -84,17 +121,27 @@ fn slot(name: &'static str) -> Option<&'static Slot> {
     None
 }
 
+#[track_caller]
 fn note(name: &'static str, waited: Option<Instant>) {
+    let waited_ns = waited.map(|since| since.elapsed().as_nanos() as u64);
+    if let Some(s) = site(std::panic::Location::caller(), name) {
+        s.counts[0].fetch_add(1, Relaxed);
+        if let Some(ns) = waited_ns {
+            s.counts[1].fetch_add(1, Relaxed);
+            s.counts[2].fetch_add(ns, Relaxed);
+        }
+    }
     let Some(s) = slot(name) else { return };
     let class = CLASS.with(Cell::get) as usize;
     s.counts[0][class].fetch_add(1, Relaxed);
-    if let Some(since) = waited {
+    if let Some(ns) = waited_ns {
         s.counts[1][class].fetch_add(1, Relaxed);
-        s.counts[2][class].fetch_add(since.elapsed().as_nanos() as u64, Relaxed);
+        s.counts[2][class].fetch_add(ns, Relaxed);
     }
 }
 
 /// `m.lock()`, poison ignored; metered with the switch on.
+#[track_caller]
 pub(crate) fn lock<'a, T>(name: &'static str, m: &'a Mutex<T>) -> MutexGuard<'a, T> {
     if !on() {
         return m.lock().unwrap_or_else(|e| e.into_inner());
@@ -118,6 +165,7 @@ pub(crate) fn lock<'a, T>(name: &'static str, m: &'a Mutex<T>) -> MutexGuard<'a,
 }
 
 /// `m.read()`, poison ignored; metered with the switch on.
+#[track_caller]
 pub(crate) fn read<'a, T>(name: &'static str, m: &'a RwLock<T>) -> RwLockReadGuard<'a, T> {
     if !on() {
         return m.read().unwrap_or_else(|e| e.into_inner());
@@ -141,6 +189,7 @@ pub(crate) fn read<'a, T>(name: &'static str, m: &'a RwLock<T>) -> RwLockReadGua
 }
 
 /// `m.write()`, poison ignored; metered with the switch on.
+#[track_caller]
 pub(crate) fn write<'a, T>(name: &'static str, m: &'a RwLock<T>) -> RwLockWriteGuard<'a, T> {
     if !on() {
         return m.write().unwrap_or_else(|e| e.into_inner());
@@ -233,7 +282,58 @@ pub(crate) fn line() -> Option<String> {
     if frames == 0 {
         return None;
     }
-    Some(text(take(frames as f64), frames))
+    let sites = take_sites(frames as f64);
+    Some(format!("{} | {}", text(take(frames as f64), frames), sites_text(sites)))
+}
+
+/// One place's figures since the last line, per frame: where, which lock, taken, found held,
+/// ms waited.
+#[derive(Debug, Clone, PartialEq)]
+struct SiteRow {
+    at: String,
+    name: String,
+    taken: f64,
+    contended: f64,
+    waited_ms: f64,
+}
+
+fn take_sites(frames: f64) -> Vec<SiteRow> {
+    let mut rows = Vec::new();
+    for s in &SITES {
+        let key = s.at.load(Relaxed);
+        let (name, len) = (s.name.load(Relaxed), s.len.load(Relaxed));
+        if key == 0 || name == 0 {
+            continue;
+        }
+        // SAFETY: `key` is a `&'static Location`'s address and `name`/`len` a `&'static str`'s
+        // ([`site`]).
+        let (at, name) = unsafe {
+            (&*(key as *const std::panic::Location<'static>), std::str::from_utf8_unchecked(std::slice::from_raw_parts(name as *const u8, len)))
+        };
+        let [taken, contended, waited] = std::array::from_fn(|i| s.counts[i].swap(0, Relaxed) as f64 / frames);
+        if taken > 0.0 {
+            let file = at.file().rsplit(['/', '\\']).next().unwrap_or(at.file());
+            rows.push(SiteRow { at: format!("{file}:{}", at.line()), name: name.to_string(), taken, contended, waited_ms: waited / 1e6 });
+        }
+    }
+    rows
+}
+
+fn sites_text(mut rows: Vec<SiteRow>) -> String {
+    rows.sort_by(|a, b| b.taken.total_cmp(&a.taken));
+    let most: Vec<String> = rows
+        .iter()
+        .take(8)
+        .map(|r| format!("{} ({}) {:.0} taken {:.0} held {:.1} ms", r.at, r.name, r.taken, r.contended, r.waited_ms))
+        .collect();
+    rows.sort_by(|a, b| b.waited_ms.total_cmp(&a.waited_ms));
+    let waited: Vec<String> = rows
+        .iter()
+        .take(8)
+        .filter(|r| r.waited_ms > 0.0)
+        .map(|r| format!("{} ({}) {:.1} ms", r.at, r.name, r.waited_ms))
+        .collect();
+    format!("places taken most per frame: {}; waited longest: {}", most.join("; "), waited.join("; "))
 }
 
 #[cfg(test)]
@@ -255,6 +355,22 @@ mod tests {
         assert!(big < line.find("small 1.5 ms").expect("small shown"), "{line}");
         assert!(line.contains("recorders 10 taken 3 held 9.0 ms, submit 2 taken 1 held 0.5 ms)"), "{line}");
         assert!(!line.contains("relay 0"), "{line}");
+    }
+
+    #[test]
+    fn places_are_sorted_by_takes_and_by_waits() {
+        let row = |at: &str, taken: f64, waited_ms: f64| SiteRow {
+            at: at.into(),
+            name: "sh:BUFFERS".into(),
+            taken,
+            contended: 1.0,
+            waited_ms,
+        };
+        let text = sites_text(vec![row("a.rs:1", 5.0, 9.0), row("b.rs:2", 50.0, 1.0), row("c.rs:3", 1.0, 0.0)]);
+        let (most, waited) = text.split_once("; waited longest: ").expect("two parts");
+        assert!(most.find("b.rs:2").unwrap() < most.find("a.rs:1").unwrap(), "{text}");
+        assert!(waited.find("a.rs:1").unwrap() < waited.find("b.rs:2").unwrap(), "{text}");
+        assert!(!waited.contains("c.rs:3"), "{text}");
     }
 
     #[test]
