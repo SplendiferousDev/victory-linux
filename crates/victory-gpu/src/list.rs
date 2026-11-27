@@ -146,9 +146,13 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     let Some(list) = host_list(this) else { return };
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
+    let timed = victory_core::timeline::on().then(std::time::Instant::now);
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
+    if let Some(timed) = timed {
+        victory_core::timeline::recorded(timed.elapsed().as_nanos() as u64);
+    }
     #[cfg(feature = "diagnostics")]
     crate::copystat::recorded(started);
     #[cfg(feature = "diagnostics")]

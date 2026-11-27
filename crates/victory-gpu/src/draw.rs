@@ -2348,6 +2348,7 @@ impl State {
         HEAP_PASS_PARTS[0].fetch_add(textures_began.elapsed().as_micros() as u64, Ordering::Relaxed);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        victory_core::timeline::span(victory_core::timeline::Span::HeapPass, started.elapsed().as_micros() as u64);
         static LOGGED: AtomicU64 = AtomicU64::new(0);
         // The first pass and every growth of the set by half.
         let seen = LOGGED.load(Ordering::Relaxed);
@@ -2491,6 +2492,7 @@ impl State {
         HEAP_PASS_PARTS[0].fetch_add(textures_began.elapsed().as_micros() as u64, Ordering::Relaxed);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        victory_core::timeline::span(victory_core::timeline::Span::HeapPass, started.elapsed().as_micros() as u64);
         // Every 256 passes: how many of the slots looked at held the record
         // of their last look (what a further cut could leave alone).
         static SEEN: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];

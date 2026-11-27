@@ -48,8 +48,13 @@ pub enum Mark {
     TitleWaitEnd,
     /// The title called present.
     PresentCall,
+    /// A list call of the title (recording into our host lists) returned.
+    Recorded,
+    /// The pass over the view heap for shaders that pick buffers by index ended (it runs in
+    /// a list call, on the title's thread, once a frame).
+    HeapPass,
 }
-const MARKS: usize = 7;
+const MARKS: usize = 9;
 
 /// Times of a frame, summed (microseconds).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,8 +72,65 @@ pub enum Span {
     CardIdle,
     /// The title's waits for values in memory.
     TitleWait,
+    /// The title's threads inside our list calls (recording), all threads.
+    Record,
+    /// The pass over the view heap (inside a list call).
+    HeapPass,
 }
-const SPANS: usize = 6;
+const SPANS: usize = 8;
+
+/// Threads that made list calls: their id and their nanoseconds inside them this frame, and
+/// calls this frame. A thread takes a slot at its first call; past the last slot it is counted
+/// in the sums only.
+const RECORDERS: usize = 32;
+static RECORDER_ID: [AtomicU64; RECORDERS] = [const { AtomicU64::new(0) }; RECORDERS];
+static RECORDER_NS: [AtomicU64; RECORDERS] = [const { AtomicU64::new(0) }; RECORDERS];
+static RECORD_CALLS: AtomicU64 = AtomicU64::new(0);
+static NEXT_RECORDER: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// This thread's slot in [`RECORDER_NS`] (`usize::MAX`: none yet; `RECORDERS`: none left).
+    static MY_SLOT: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+}
+
+/// A list call of the title took `ns` nanoseconds and returned now.
+pub fn recorded(ns: u64) {
+    if !on() {
+        return;
+    }
+    let slot = MY_SLOT.with(|s| {
+        if s.get() == usize::MAX {
+            let n = NEXT_RECORDER.fetch_add(1, Relaxed) as usize;
+            if n < RECORDERS {
+                static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+                RECORDER_ID[n].store(NEXT_ID.fetch_add(1, Relaxed), Relaxed);
+            }
+            s.set(n.min(RECORDERS));
+        }
+        s.get()
+    });
+    if slot < RECORDERS {
+        RECORDER_NS[slot].fetch_add(ns, Relaxed);
+    }
+    RECORD_CALLS.fetch_add(1, Relaxed);
+    span(Span::Record, ns / 1_000);
+}
+
+/// This frame's list calls: calls, threads that made any, the busiest thread's milliseconds.
+fn take_recorders() -> [f64; 3] {
+    let mut threads = 0;
+    let mut most = 0;
+    for ns in &RECORDER_NS {
+        let v = ns.swap(0, Relaxed);
+        threads += u64::from(v > 0);
+        most = most.max(v);
+    }
+    [
+        RECORD_CALLS.swap(0, Relaxed) as f64,
+        threads as f64,
+        most as f64 / 1e6,
+    ]
+}
 
 static FIRST: [AtomicU64; MARKS] = [const { AtomicU64::new(u64::MAX) }; MARKS];
 static LAST: [AtomicU64; MARKS] = [const { AtomicU64::new(0) }; MARKS];
@@ -146,6 +208,8 @@ pub fn span(s: Span, us: u64) {
     }
     match s {
         Span::Prepare => stamp(Mark::Prepared, now),
+        Span::Record => stamp(Mark::Recorded, now),
+        Span::HeapPass => stamp(Mark::HeapPass, now),
         Span::Landing => {
             stamp(Mark::Landed, now);
             keep(&mut recent().landed, now);
@@ -200,6 +264,8 @@ pub struct Frame {
     /// The title's waits that ended in it: all, those met right after a landing, right after
     /// the card ran dry.
     pub waits: [u64; 3],
+    /// Its list calls: calls, threads that made any, the busiest thread's milliseconds in them.
+    pub recorders: [f64; 3],
 }
 
 impl Frame {
@@ -318,12 +384,15 @@ pub fn present_return() -> Option<String> {
     let last = std::array::from_fn(|i| LAST[i].swap(0, Relaxed));
     let sum = std::array::from_fn(|i| SUM[i].swap(0, Relaxed));
     let in_present = std::array::from_fn(|i| IN_PRESENT[i].swap(0, Relaxed));
+    let recorders = take_recorders();
     if start == 0 {
         return None;
     }
     let mut r = recent();
-    r.frames
-        .push(Frame::of(start, now, first, last, sum, in_present));
+    r.frames.push(Frame {
+        recorders,
+        ..Frame::of(start, now, first, last, sum, in_present)
+    });
     if r.line_at == 0 {
         r.line_at = now;
     }
@@ -404,7 +473,9 @@ pub fn line(frames: &[Frame]) -> String {
          last {}; title's waits begin first {} end last {} | sums per frame: preparing {}, waits for the card {}, submit thread \
          idle {}, landing {}, card idle {}, title's waits {} | the present stood for: nothing (the title came later) {}, our \
          preparing {}, our waits for the card {}, neither {} | ended last in the frame: {} | title's waits {}, met within 2 ms \
-         after a landing {}, after the card ran dry {}",
+         after a landing {}, after the card ran dry {} | the title's list calls (recording into ours): first returned {} last {}, \
+         {} ms in all ({} in the present call) in {} calls on {} threads, the busiest thread {} ms in them; the view-heap pass \
+         {} ms, ended {}",
         med(&|f: &Frame| Some(f.ms)),
         first(Mark::TitleSubmit),
         last(Mark::TitleSubmit),
@@ -435,6 +506,15 @@ pub fn line(frames: &[Frame]) -> String {
         waits[0],
         waits[1],
         waits[2],
+        first(Mark::Recorded),
+        last(Mark::Recorded),
+        sum(Span::Record),
+        inp(Span::Record),
+        med(&|f: &Frame| Some(f.recorders[0])),
+        med(&|f: &Frame| Some(f.recorders[1])),
+        med(&|f: &Frame| Some(f.recorders[2])),
+        sum(Span::HeapPass),
+        last(Mark::HeapPass),
     )
 }
 
@@ -567,5 +647,28 @@ mod tests {
         assert!(line.contains("nothing (the title came later) 3"), "{line}");
         assert!(line.contains("title submit 3"), "{line}");
         assert!(line.contains("landings end first - last -"), "{line}");
+        assert!(
+            line.contains("list calls (recording into ours): first returned - last -"),
+            "{line}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod recorder_tests {
+    use super::*;
+
+    #[test]
+    fn recorders_are_taken_per_frame() {
+        // Without the switch nothing is kept.
+        recorded(1_000_000);
+        assert_eq!(RECORD_CALLS.load(Relaxed), u64::from(on()));
+        // The table itself: two threads' nanoseconds, then taken and reset.
+        RECORDER_NS[RECORDERS - 1].store(3_000_000, Relaxed);
+        RECORDER_NS[RECORDERS - 2].store(1_000_000, Relaxed);
+        RECORD_CALLS.store(7, Relaxed);
+        let [calls, threads, most] = take_recorders();
+        assert_eq!((calls, threads, most), (7.0, 2.0, 3.0));
+        assert_eq!(take_recorders(), [0.0, 0.0, 0.0]);
     }
 }
