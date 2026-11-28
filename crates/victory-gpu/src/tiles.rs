@@ -204,6 +204,9 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
                 tracing::warn!(error = %e, "no heap for texture levels given on demand: those levels stay empty");
                 return None;
             }
+            if let Some(heap) = &made {
+                crate::memsites::note(heap, crate::memsites::Kind::Heap, desc.SizeInBytes);
+            }
             let fresh = Heap {
                 heap: made?,
                 free: vec![(0, HEAP_TILES)],

@@ -136,6 +136,9 @@ fn host_heap(this: This) -> Option<(&'static Heap, windows::Win32::Graphics::Dir
                     )
                     .ok()?;
             }
+            if let Some(h) = &made {
+                crate::memsites::note(h, crate::memsites::Kind::QueryHeap, u64::from(heap.desc.count) * 8);
+            }
             made
         })
         .clone()?;
@@ -250,6 +253,7 @@ pub(crate) fn resolve(list: &crate::host::HostList, this: This, kind: u32, first
         return false;
     }
     let Some(back) = back else { return false };
+    crate::memsites::note(&back, crate::memsites::Kind::ReadBack, desc.Width);
     // SAFETY: an open list, our query heap (every query of the range ended), a read-back buffer of their size.
     unsafe { list.list.ResolveQueryData(&host, host_type(kind), first, count, &back, 0) };
     let visible = if kind == 1 { 1 } else { 1 << 20 };

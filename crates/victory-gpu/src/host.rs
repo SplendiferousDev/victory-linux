@@ -27,6 +27,10 @@ mod pooled_staging;
 mod slot_wait;
 mod stall_report;
 mod twin_ring;
+mod prelude_pool;
+mod allocator_trim;
+pub(crate) use allocator_trim::text as allocator_trim_text;
+pub(crate) use prelude_pool::text as prelude_pool_text;
 mod late_line;
 use late_line::late_line;
 mod at_budget;
@@ -1561,7 +1565,8 @@ mod tests;
 
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
-    allocator: ID3D12CommandAllocator,
+    /// And when it was made: renewed at a reset when old (`allocator_trim`).
+    allocator: Mutex<(ID3D12CommandAllocator, u64)>,
     pub(crate) list: ID3D12GraphicsCommandList,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
@@ -1818,6 +1823,7 @@ fn plane_pass() -> Option<&'static PlanePass> {
                     NodeMask: 0,
                 })
                 .ok()?;
+            crate::memsites::note_view_heap(&host.device, &views);
             Some(PlanePass {
                 cpu: views.GetCPUDescriptorHandleForHeapStart().ptr,
                 gpu: views.GetGPUDescriptorHandleForHeapStart().ptr,
@@ -4849,6 +4855,9 @@ impl Host {
                 Ok((allocator, list))
             })()
         };
+        if let Ok((a, l)) = &made {
+            crate::memsites::note_pair(a, l);
+        }
         LISTS[1].fetch_add(1, Ordering::Relaxed);
         match made {
             Ok(prelude) => Some(prelude),
@@ -4871,12 +4880,13 @@ impl Host {
                 &allocator,
                 None,
             )?;
+            crate::memsites::note_pair(&allocator, &list);
             let prelude = OnceLock::new();
-            if !lazy_prelude() {
+            if !lazy_prelude() && !prelude_pool::on() {
                 let _ = prelude.set(self.make_prelude());
             }
             Ok(HostList {
-                allocator,
+                allocator: Mutex::new((allocator, now_ms())),
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
@@ -7794,12 +7804,12 @@ impl HostList {
         if let Some(fills) = crate::lockmeter::lock("ho:card_fills", &self.card_fills).as_mut() {
             (fills.1, fills.2) = (0, false);
         }
+        let mut allocator = crate::lockmeter::lock("ho:allocator", &self.allocator);
+        // Nothing of the list runs: an old allocator may be renewed.
+        allocator_trim::refresh(&mut allocator, allocator_trim::LIST);
         // SAFETY: the list is not executing.
-        let reset = unsafe {
-            self.allocator
-                .Reset()
-                .and_then(|()| self.list.Reset(&self.allocator, None))
-        };
+        let reset = unsafe { allocator.0.Reset().and_then(|()| self.list.Reset(&allocator.0, None)) };
+        drop(allocator);
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
@@ -8208,11 +8218,14 @@ impl HostList {
         if barriers.is_empty() && syncs.is_empty() && !gathered && detiles.is_empty() {
             return None;
         }
-        let Some((allocator, list)) = self
-            .prelude
-            .get_or_init(|| host().and_then(|h| h.make_prelude()))
-            .as_ref()
-        else {
+        // With `VICTORY_PRELUDE_POOL=1` one of the shared pool, handed back
+        // through `retire` once recorded (`prelude_pool`).
+        let pooled = if prelude_pool::on() { prelude_pool::take(host()) } else { None };
+        let Some((allocator, list)) = (match &pooled {
+            Some(p) => Some((&p.0.0, &p.1)),
+            None if prelude_pool::on() => None,
+            None => self.prelude.get_or_init(|| host().and_then(|h| h.make_prelude())).as_ref().map(|(a, l)| (a, l)),
+        }) else {
             fail(format_args!("no host list for a state prelude"));
         };
         // SAFETY: the prelude is not executing (every submission is waited
@@ -8267,7 +8280,11 @@ impl HostList {
         if let Err(e) = recorded {
             fail(format_args!("a host state prelude did not record ({e})"));
         }
-        list.cast().ok()
+        let out = list.cast().ok();
+        if let Some(p) = pooled {
+            prelude_pool::give(p);
+        }
+        out
     }
 
     /// From here on the list gathers no records (`crate::indirect::gather`):
@@ -10210,6 +10227,7 @@ impl Host {
     /// A buffer in the upload heap, mapped for writing.
     /// A buffer of `size` bytes the card writes and we read (a read back),
     /// in the state copies into it need.
+    #[track_caller]
     pub(crate) fn read_back_buffer(&self, size: u64) -> Option<ID3D12Resource> {
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_READBACK,
@@ -10241,7 +10259,10 @@ impl Host {
             )
         };
         match made {
-            Ok(()) => buffer,
+            Ok(()) => {
+                crate::memsites::note(buffer.as_ref()?, crate::memsites::Kind::ReadBack, size);
+                buffer
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no read-back buffer");
                 None
@@ -10249,6 +10270,7 @@ impl Host {
         }
     }
 
+    #[track_caller]
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
@@ -10288,7 +10310,10 @@ impl Host {
                 })
         };
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(()) => {
+                crate::memsites::note(buffer.as_ref()?, crate::memsites::Kind::Upload, size);
+                Some((buffer?, data.cast()))
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no upload buffer");
                 None
@@ -10727,6 +10752,7 @@ impl Host {
     /// nothing of ours does) and shaders read: for host copies the CPU
     /// fills and no shader writes. `None` where the device has no such
     /// heaps or turns the buffer down (then the caller's usual buffer).
+    #[track_caller]
     pub(crate) fn gpu_upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         if !self.gpu_upload() {
             return None;
@@ -10788,6 +10814,9 @@ impl Host {
                     }
                     same
                 });
+                if works {
+                    crate::memsites::note(&buffer, crate::memsites::Kind::GpuUpload, size);
+                }
                 works.then_some((buffer, data.cast()))
             }
             (made, _) => {
@@ -10805,6 +10834,7 @@ impl Host {
     /// it is fast too) and shaders read and write: for host copies of title
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
+    #[track_caller]
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[2].fetch_add(1, Ordering::Relaxed);
         MADE[3].fetch_add(size, Ordering::Relaxed);
@@ -10847,7 +10877,10 @@ impl Host {
                 })
         };
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(()) => {
+                crate::memsites::note(buffer.as_ref()?, crate::memsites::Kind::Shared, size);
+                Some((buffer?, data.cast()))
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no shared buffer");
                 None
@@ -10857,6 +10890,7 @@ impl Host {
 
     /// A device-local buffer shaders may write (unordered access) and indirect
     /// execution may read, starting in the common state.
+    #[track_caller]
     pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
         MADE[4].fetch_add(1, Ordering::Relaxed);
         MADE[5].fetch_add(size, Ordering::Relaxed);
@@ -10891,7 +10925,10 @@ impl Host {
             )
         };
         match made {
-            Ok(()) => buffer,
+            Ok(()) => {
+                crate::memsites::note(buffer.as_ref()?, crate::memsites::Kind::Card, size);
+                buffer
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no unordered-access buffer");
                 None
