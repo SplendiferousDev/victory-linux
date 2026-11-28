@@ -67,6 +67,15 @@ pub(crate) struct Shadow {
     /// Asks for the copy that gave no length (root views: they read from
     /// their address to the copy's end, whatever lies there).
     unsized_asks: AtomicU64,
+    /// Whether anything but a pass over the heap ever asked for the copy
+    /// (`crate::winshare::drawn`; noted only with the memory-by-site line
+    /// on): a window without it is held for shaders that pick views by
+    /// index, and no draw named it.
+    drawn: std::sync::atomic::AtomicBool,
+    /// With `VICTORY_WINDOW_SHARE`, for a copy of a view's own bytes
+    /// ([`exact`]): the windows whose place decided that the view gets one
+    /// ([`Shadow::lean_on`]), kept for as long as this copy lives.
+    leans: Mutex<Vec<Arc<Shadow>>>,
     /// A number no other copy has had. Its address is no name for a copy:
     /// one let go and another made may share it.
     id: u64,
@@ -4281,6 +4290,10 @@ pub(crate) fn let_go_idle() {
         for key in keys {
             if map.get(&key).is_some_and(&idle) {
                 gone.extend(map.remove(&key));
+                // (With the table's lock held: no ask finds it from here.)
+                if crate::winshare::on() {
+                    crate::winshare::index().remove(key.0, key.1);
+                }
             }
         }
         gone
@@ -4324,6 +4337,8 @@ pub(crate) struct WindowUse {
     pub copied: [u64; 2],
     pub outside: [u64; 2],
     pub cover: u64,
+    /// What sharing (`crate::winshare`) holds and would save, beside them.
+    pub share: crate::winshare::Alive,
 }
 
 impl WindowUse {
@@ -4383,6 +4398,9 @@ pub(crate) fn window_use_text() -> String {
     let mut out = WindowUse::default();
     let mut seen = std::collections::HashSet::new();
     let mut spans = Vec::new();
+    // What was asked for with a length (lowest to highest of each window),
+    // and the root views' windows.
+    let (mut sized, mut roots) = (Vec::new(), Vec::new());
     {
         let loose = crate::lockmeter::read("sh:LOOSE read", &LOOSE);
         for s in loose.values() {
@@ -4398,20 +4416,40 @@ pub(crate) fn window_use_text() -> String {
             // space, the copied ones by their number in the copy.)
             let base = s.start as usize / PAGE;
             pages.extend(crate::lockmeter::lock("sh:parts", &s.parts).keys().map(|&page| page.saturating_sub(base)));
-            out.add(
-                s.unsized_asks.load(Ordering::Relaxed) > 0,
-                s.start,
-                s.len,
-                s.asked[0].load(Ordering::Relaxed),
-                s.asked[1].load(Ordering::Relaxed),
-                pages.len() as u64,
-            );
+            let unsized_ask = s.unsized_asks.load(Ordering::Relaxed) > 0;
+            let (low, high) = (s.asked[0].load(Ordering::Relaxed), s.asked[1].load(Ordering::Relaxed));
+            out.add(unsized_ask, s.start, s.len, low, high, pages.len() as u64);
+            // About what the grid would hold for the same asks: its cells
+            // from the lowest to the highest (asks apart in the window
+            // would be windows apart on the grid, and asks across a grid
+            // line two cells each: so "about").
+            let (low, high) = (low.max(s.start), high.min(s.start + s.len));
+            if unsized_ask {
+                roots.push((s.start, s.len));
+            } else if low < high {
+                out.share.grid += window_of(low, high, window()).1;
+                sized.push((low, high));
+            }
+            if !s.drawn.load(Ordering::Relaxed) {
+                out.share.undrawn[0] += 1;
+                out.share.undrawn[1] += s.len;
+            }
             spans.push((s.start, s.len));
+        }
+        if crate::winshare::on() {
+            let index = crate::winshare::index();
+            for &(start, len) in &spans {
+                if index.took(start, len) > 0 {
+                    out.share.shared[0] += 1;
+                    out.share.shared[1] += len;
+                }
+            }
         }
     }
     spans.sort_unstable();
     out.cover = cover(spans.into_iter());
-    out.text()
+    out.share.root_under = crate::winshare::bytes_under(sized, &roots);
+    out.text() + &crate::winshare::text(&out.share, out.bytes[0], crate::winshare::on(), crate::winshare::unit())
 }
 
 /// For the memory line of every build (`crate::tight::line`): what the
@@ -4595,6 +4633,8 @@ impl Shadow {
             used: AtomicU64::new(crate::host::moment()),
             asked: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
             unsized_asks: AtomicU64::new(0),
+            drawn: std::sync::atomic::AtomicBool::new(false),
+            leans: Mutex::default(),
             id: {
                 static NEXT: AtomicU64 = AtomicU64::new(1);
                 NEXT.fetch_add(1, Ordering::Relaxed)
@@ -5876,6 +5916,30 @@ impl Shadow {
         self.card.is_some()
     }
 
+    /// Whether this is a window of title memory outside buffers.
+    pub(crate) fn is_window(&self) -> bool {
+        self.window
+    }
+
+    /// This copy of a view's own bytes ([`exact`]) was chosen because the
+    /// view does not begin on an element of `window`, the copy its ask
+    /// found. With `VICTORY_WINDOW_SHARE` the window is kept for as long as
+    /// this copy lives: whether a view begins on an element depends on
+    /// where its window begins, and a window let go while the view's slot
+    /// still shows this copy could be followed by one that begins elsewhere
+    /// (on the grid a window made again begins where the last one did).
+    /// The pass would then bring that window up to date for the slot, and
+    /// not this copy. Nothing without the switch.
+    pub(crate) fn lean_on(&self, window: &Arc<Shadow>) {
+        if !window.window || !crate::winshare::on() {
+            return;
+        }
+        let mut leans = crate::lockmeter::lock("sh:leans", &self.leans);
+        if !leans.iter().any(|held| Arc::ptr_eq(held, window)) {
+            leans.push(window.clone());
+        }
+    }
+
     /// Whether this is title memory in place (`crate::inplace`), not a copy.
     pub(crate) fn in_place(&self) -> bool {
         self.place.is_some()
@@ -6362,6 +6426,12 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         if !keys.is_empty() {
             tables_changed();
         }
+        if crate::winshare::on() {
+            let mut index = crate::winshare::index();
+            for key in &keys {
+                index.remove(key.0, key.1);
+            }
+        }
         gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
     }
     {
@@ -6421,8 +6491,9 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 #[track_caller]
 pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
     // With whole windows (the default) there is one window to a cell and
-    // nothing to choose: exactly `find`.
-    if !fine() {
+    // nothing to choose: exactly `find`. (Not with `VICTORY_WINDOW_SHARE`:
+    // such an ask may take a window of any length, `crate::winshare`.)
+    if !fine() && !crate::winshare::on() {
         return find(address, len);
     }
     lookup(address, len, true)
@@ -6579,6 +6650,9 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             shadow.asked[1].fetch_max(address.saturating_add(len.max(1)), Ordering::Relaxed);
             if len <= 1 {
                 shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
+            }
+            if crate::winshare::drawn() {
+                shadow.drawn.store(true, Ordering::Relaxed);
             }
         }
         return Some(shadow);
@@ -6908,6 +6982,11 @@ fn loose_shared(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<
 
 /// Which window [`loose`] names for an ask.
 fn loose_choice(map: &BTreeMap<(u64, u64), Arc<Shadow>>, address: u64, end: u64, unsized_ask: bool, any: bool) -> (u64, u64) {
+    if !unsized_ask && crate::winshare::on() {
+        // (A window to make is not in the table: the caller finds none.)
+        let most = crate::winshare::most_now(address, end, window(), any);
+        return crate::winshare::index().choose(address, end, crate::winshare::unit(), most).key();
+    }
     let (cell, _) = window_of(address, end, WINDOW);
     let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
     if unsized_ask && tails() {
@@ -6929,6 +7008,9 @@ fn loose_note(shadow: &Shadow, address: u64, end: u64, unsized_ask: bool) {
     if unsized_ask {
         shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
     }
+    if crate::winshare::drawn() {
+        shadow.drawn.store(true, Ordering::Relaxed);
+    }
 }
 
 #[track_caller]
@@ -6936,7 +7018,23 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     let mut map = crate::lockmeter::write("sh:LOOSE", &LOOSE);
     let (cell, _) = window_of(address, end, WINDOW);
     let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
-    let (start, len) = if unsized_ask && tails() {
+    // With `VICTORY_WINDOW_SHARE`, for an ask with a length: the oldest
+    // window that holds it, or one fitted to it (`crate::winshare`).
+    let share = !unsized_ask && crate::winshare::on();
+    let (start, len) = if share {
+        let most = crate::winshare::most_now(address, end, window(), any);
+        let mut index = crate::winshare::index();
+        loop {
+            let choice = index.choose(address, end, crate::winshare::unit(), most);
+            let (start, len) = choice.key();
+            if matches!(choice, crate::winshare::Choice::Make(..)) || map.contains_key(&(start, len)) {
+                break (start, len);
+            }
+            // (Never seen: a window the index names is in the table. Were
+            // one not, it is forgotten and the ask goes on to the next.)
+            index.remove(start, len);
+        }
+    } else if unsized_ask && tails() {
         let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
         longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
     } else if any && fine() && !unsized_ask {
@@ -6949,12 +7047,14 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         named
     };
     // Under the lock, with the handing out: see `let_go_idle`.
-    let note = |shadow: &Shadow| {
-        crate::coarseclock::stamp(&shadow.used, crate::host::moment());
-        shadow.asked[0].fetch_min(address, Ordering::Relaxed);
-        shadow.asked[1].fetch_max(end, Ordering::Relaxed);
-        if unsized_ask {
-            shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
+    let note = |shadow: &Shadow| loose_note(shadow, address, end, unsized_ask);
+    // With `VICTORY_WINDOW_SHARE`: every window made is told to the index
+    // of windows, under the table's lock, as it goes into the table.
+    let told = |shadow: &Shadow| {
+        if share {
+            crate::winshare::index().made(address, end, any, start, len, shadow.id);
+        } else if crate::winshare::on() {
+            crate::winshare::index().insert(start, len, shadow.id);
         }
     };
     if let Some(shadow) = map.get(&(start, len)) {
@@ -6967,6 +7067,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());
+        told(&shadow);
         tables_changed();
         return Some(shadow);
     }
@@ -6982,6 +7083,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(shadow);
         note(&shadow);
         map.insert((start, len), shadow.clone());
+        told(&shadow);
         tables_changed();
         return Some(shadow);
     }
@@ -7046,6 +7148,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());
+    told(&shadow);
     tables_changed();
     Some(shadow)
 }

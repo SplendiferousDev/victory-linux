@@ -138,6 +138,8 @@ mod watch;
 #[cfg(windows)]
 mod windowstat;
 #[cfg(windows)]
+mod winshare;
+#[cfg(windows)]
 mod texback;
 
 #[cfg(windows)]

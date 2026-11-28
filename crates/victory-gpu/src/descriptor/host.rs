@@ -3340,6 +3340,7 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
         && let Some((start, bytes)) = own_bytes(whole.offset(base), base, first, count, element, stride, unknown)
         && let Some(own) = crate::shadow::exact(start, bytes)
     {
+        own.lean_on(&whole);
         return Some((own, start, bytes));
     }
     if view_extent()
@@ -3680,6 +3681,7 @@ fn buffer_srv(
             .and_then(|(start, bytes)| crate::shadow::exact(start, bytes))
         {
             Some(own) => {
+                own.lean_on(&shadow);
                 desc.Anonymous.Buffer.FirstElement = 0;
                 (own, 0)
             }
@@ -3733,6 +3735,7 @@ fn buffer_srv(
         );
         return None;
     }
+    crate::winshare::view_made(&shadow, offset, len, first, count, if raw { 4 } else { element });
     // The console has no component mapping; one the host does not know is the default's.
     if desc.Shader4ComponentMapping != D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING {
         desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -3775,6 +3778,7 @@ fn buffer_uav(
             .and_then(|(start, bytes)| crate::shadow::exact(start, bytes))
         {
             Some(own) => {
+                own.lean_on(&shadow);
                 desc.Anonymous.Buffer.FirstElement = 0;
                 (own, true)
             }
@@ -3837,6 +3841,7 @@ fn buffer_uav(
         );
         return None;
     }
+    crate::winshare::view_made(&shadow, offset, len, first, count, if raw { 4 } else { element });
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {

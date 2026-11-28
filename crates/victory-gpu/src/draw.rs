@@ -2263,6 +2263,8 @@ impl State {
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
+        // (The asks of this loop are the pass's, not a draw's: `crate::winshare::drawn`.)
+        let heap_pass = crate::winshare::pass();
         for (n, &index) in slots.iter().enumerate() {
             ranges.remove(&index);
             let Some(handle) = heap.handle(index) else {
@@ -2297,6 +2299,7 @@ impl State {
             }
             ranges.insert(index, (shadow, address, address + len));
         }
+        drop(heap_pass);
         let views = ranges.len() as u32;
         // Per host copy, the span its picked views cover.
         let mut spans: crate::fasthash::FastMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
@@ -2409,6 +2412,8 @@ impl State {
         // Of the slots looked at, those whose record is the one seen at
         // their last look (a view written again as it was).
         let mut same = 0u64;
+        // (The asks of this loop are the pass's, not a draw's: `crate::winshare::drawn`.)
+        let heap_pass = crate::winshare::pass();
         for (n, &index) in slots.iter().enumerate() {
             let Some(handle) = heap.handle(index) else {
                 ranges.forget(index);
@@ -2455,6 +2460,7 @@ impl State {
             let key = std::sync::Arc::as_ptr(&shadow) as usize;
             ranges.keep(index, key, &shadow, address, address + len, record, entry);
         }
+        drop(heap_pass);
         let views = ranges.views() as u32;
         // Per host copy, the span its picked views cover.
         let spans = ranges.spans();
