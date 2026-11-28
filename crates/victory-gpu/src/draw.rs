@@ -3195,7 +3195,9 @@ impl State {
             // had its colour only in the launches that entered the world
             // under the line. `VICTORY_REUPLOAD_WHEN_FULL=0`: refused, as
             // before.
-            if !room {
+            // (A slot texture eviction made null that the title touched
+            // again goes past the hold: `crate::resource::evict`.)
+            if !room && !host.texture_slot_refill(index, frame) {
                 let has_its_texture = reupload_when_full()
                     && heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle));
                 if !has_its_texture {

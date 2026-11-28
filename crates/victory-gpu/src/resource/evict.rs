@@ -35,7 +35,26 @@
 //! The next use of such a slot is that of a texture never uploaded: the
 //! queue makes the copy anew and fills it from title memory when the card
 //! has room again; until then the slot reads nothing. A draw that reads the
-//! texture through a table makes it at once, as before.
+//! texture through a table makes it at once, as before. A slot made null
+//! that the title touches again (writes a view into it, maps or writes the
+//! texture's memory) or that a bound table covers is made again at once,
+//! past the governor's hold, up to [`refills_per_frame`] a frame
+//! (`HostHeap::texture_slot_refill`); the room it takes is paid for by
+//! colder copies at the next rounds.
+//!
+//! What is seen of a texture shaders pick by index: the title's writes of
+//! its slot, the runtime's mapping, unmapping and writes of its memory (the
+//! title's streaming), tables that cover its slot, and whether all its
+//! memory is mapped. A copy whose memory is all mapped is one the title's
+//! streaming keeps whole; such copies are left alone unless
+//! `VICTORY_TEXTURE_EVICT_WHOLE=1`. Not seen: which slots a shader that
+//! picks by index reads (the index comes from the title's own data on the
+//! card); only a mark written by the translated shaders would tell.
+//!
+//! Against a loop of letting go and making again: a copy let go is not
+//! picked again for [`AGAIN_MS`], and once over the line rounds go on until
+//! the card is `VICTORY_TEXTURE_EVICT_UNDER_MB` (128) under it, then stop
+//! until it is over again.
 //!
 //! The idea of letting textures go against a byte budget, least recently
 //! used first and copies already made again last, is from VIctory-Fast.
@@ -51,6 +70,13 @@ pub(crate) const MIN_IDLE_FRAMES: u64 = 8;
 pub(crate) const PENDING_MS: u64 = 10_000;
 /// A copy let go is watched this long for being made again (a re-fill).
 pub(crate) const WATCH_MS: u64 = 60_000;
+/// A copy let go is not picked again for this long.
+pub(crate) const AGAIN_MS: u64 = 120_000;
+/// A slot the title wrote, or whose memory was mapped or written, within
+/// this many frames is not made null (`HostHeap::texture_slots_evicted`).
+pub(crate) const TOUCH_FRAMES: u64 = 1_200;
+/// Most title memory lookups (is all of a texture mapped?) a round makes.
+pub(crate) const MOST_LOOKS: usize = 4_096;
 
 /// The switch.
 #[cfg(windows)]
@@ -79,6 +105,10 @@ pub(crate) struct Facts {
     pub bytes: u64,
     /// When it was last asked for (`crate::host::moment`).
     pub used: u64,
+    /// Let go by eviction less than [`AGAIN_MS`] ago.
+    pub recent: bool,
+    /// All its title memory is mapped (or not looked at).
+    pub whole: bool,
 }
 
 /// Whether a copy may be picked at `now` (a `crate::host::moment`).
@@ -88,6 +118,7 @@ pub(crate) fn eligible(f: &Facts, now: u64) -> bool {
         && !f.listed
         && f.held
         && !f.pending
+        && !f.recent
         && f.bytes > 0
         && f.used != 0
         && idle_since(f.used, now, MIN_IDLE_MS, MIN_IDLE_FRAMES)
@@ -104,19 +135,23 @@ pub(crate) fn idle_since(moment: u64, now: u64, ms: u64, frames: u64) -> bool {
 pub(crate) struct Caps {
     pub bytes: u64,
     pub count: usize,
+    /// Copies whose memory is all mapped may be picked too.
+    pub whole: bool,
 }
 
 /// Of `all` (an id and its facts), the ids a round picks to free `want`
-/// bytes: eligible ones ([`eligible`]), never made again before the others,
-/// least recently asked for first, until `want` or a cap is reached (the
+/// bytes: eligible ones ([`eligible`]; whole ones only with `caps.whole`),
+/// never made again before the others, partly mapped before whole, least
+/// recently asked for first, until `want` or a cap is reached (the
 /// copy that crosses `want` is taken; none past the byte cap).
 pub(crate) fn choose<T: Copy>(all: &[(T, Facts)], want: u64, now: u64, caps: Caps) -> Vec<T> {
     if want == 0 || caps.count == 0 {
         return Vec::new();
     }
-    let mut order: Vec<&(T, Facts)> = all.iter().filter(|(_, f)| eligible(f, now)).collect();
+    let mut order: Vec<&(T, Facts)> =
+        all.iter().filter(|(_, f)| eligible(f, now) && (caps.whole || !f.whole)).collect();
     // By when asked for: the frame count (high half) first, then the time.
-    order.sort_by_key(|(_, f)| (f.remade, f.used >> 32, f.used & 0xffff_ffff));
+    order.sort_by_key(|(_, f)| (f.remade, f.whole, f.used >> 32, f.used & 0xffff_ffff));
     let mut out = Vec::new();
     let mut bytes = 0u64;
     for (id, f) in order {
@@ -132,12 +167,39 @@ pub(crate) fn choose<T: Copy>(all: &[(T, Facts)], want: u64, now: u64, caps: Cap
     out
 }
 
-/// The bytes to free: the card's use over the line (`budget` less
-/// `headroom`, as the governor draws it) less what was picked and has not
-/// gone yet.
-pub(crate) fn want(used: u64, budget: u64, headroom: u64, pending: u64) -> u64 {
+/// The bytes to free and whether rounds go on: over the line (`budget`
+/// less `headroom`, as the governor draws it) they start; once started
+/// (`active`) they go on down to `under` below it; then stop. Less what was
+/// picked and has not gone yet.
+pub(crate) fn want(used: u64, budget: u64, headroom: u64, under: u64, active: bool, pending: u64) -> (u64, bool) {
     let line = budget.saturating_sub(headroom);
-    used.saturating_sub(line).saturating_sub(pending)
+    let floor = line.saturating_sub(under);
+    let active = used > line || (active && used > floor);
+    if !active {
+        return (0, false);
+    }
+    (used.saturating_sub(floor).saturating_sub(pending), true)
+}
+
+/// Whether a slot made null in frame stamp `evicted` (frame + 1) is to be
+/// made again past the hold: the title touched it (`touched`, frame + 1 of
+/// its last write or memory change; 0 never) or a table covered it
+/// (`tabled`, likewise) since.
+pub(crate) fn refill_wanted(evicted: u64, touched: u64, tabled: u64) -> bool {
+    touched > evicted || tabled > evicted
+}
+
+/// A per-frame budget: whether one more may go in `frame` with `most` a
+/// frame (`state`: the frame and how many went in it).
+pub(crate) fn take_one(state: &mut (u64, u32), frame: u64, most: u32) -> bool {
+    if state.0 != frame {
+        *state = (frame, 0);
+    }
+    if state.1 >= most {
+        return false;
+    }
+    state.1 += 1;
+    true
 }
 
 /// Whether the slots that show a picked texture may all be made null: there
@@ -149,12 +211,71 @@ pub(crate) fn slots_free(slots: &[u32], count: u32, tabled_lately: impl Fn(u32) 
 
 /// The round's caps: `VICTORY_TEXTURE_EVICT_MB` (128, at most 1024) and
 /// `VICTORY_TEXTURE_EVICT_COUNT` (256, at most 4096).
-pub(crate) fn caps_from(mb: Option<&str>, count: Option<&str>) -> Caps {
+pub(crate) fn caps_from(mb: Option<&str>, count: Option<&str>, whole: Option<&str>) -> Caps {
     let n = |v: Option<&str>| v.and_then(|v| v.trim().parse::<u64>().ok());
     Caps {
         bytes: n(mb).map_or(128, |mb| mb.clamp(1, 1024)) << 20,
         count: n(count).map_or(256, |c| c.clamp(1, 4096)) as usize,
+        whole: whole.is_some_and(|v| v.trim() == "1"),
     }
+}
+
+/// A number switch in MB (`usual` while unset), in bytes.
+fn mb_var(name: &str, usual: u64) -> u64 {
+    std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(usual).min(4096) << 20
+}
+
+/// Slots made null that may be made again past the hold in one frame:
+/// `VICTORY_TEXTURE_EVICT_REFILLS` (32, at most 1024).
+pub(crate) fn refills_per_frame() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_EVICT_REFILLS").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(32).min(1024)
+    })
+}
+
+/// Title slots made null by eviction, with the frame stamp (frame + 1) in
+/// which they were, until made again past the hold.
+#[cfg(windows)]
+static EVICTED: std::sync::Mutex<std::collections::BTreeMap<u32, u64>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+#[cfg(windows)]
+static EVICTED_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The heap made `slots` null in `frame`.
+#[cfg(windows)]
+pub(crate) fn note_evicted(slots: &[u32], frame: u64) {
+    let mut e = EVICTED.lock().unwrap_or_else(|e| e.into_inner());
+    for &s in slots {
+        e.insert(s, frame + 1);
+    }
+    EVICTED_N.store(e.len(), Relaxed);
+}
+
+/// The frame stamp in which title slot `slot` was made null by eviction.
+#[cfg(windows)]
+pub(crate) fn evicted_stamp(slot: u32) -> Option<u64> {
+    if EVICTED_N.load(Relaxed) == 0 {
+        return None;
+    }
+    EVICTED.lock().unwrap_or_else(|e| e.into_inner()).get(&slot).copied()
+}
+
+/// Slot `slot`, made null by eviction, was touched since: made again now
+/// if this frame's refills allow (counted either way).
+#[cfg(windows)]
+pub(crate) fn refill_take(slot: u32, frame: u64) -> bool {
+    static BUDGET: std::sync::Mutex<(u64, u32)> = std::sync::Mutex::new((0, 0));
+    STATS[11].fetch_add(1, Relaxed);
+    if !take_one(&mut BUDGET.lock().unwrap_or_else(|e| e.into_inner()), frame, refills_per_frame()) {
+        STATS[13].fetch_add(1, Relaxed);
+        return false;
+    }
+    STATS[12].fetch_add(1, Relaxed);
+    let mut e = EVICTED.lock().unwrap_or_else(|e| e.into_inner());
+    e.remove(&slot);
+    EVICTED_N.store(e.len(), Relaxed);
+    true
 }
 
 /// Since the start: rounds that picked, copies picked and their bytes;
@@ -163,7 +284,19 @@ pub(crate) fn caps_from(mb: Option<&str>, count: Option<&str>) -> Caps {
 /// textures whose slots the heap made null, and those slots; textures it
 /// left (a slot not ours to null).
 #[cfg(windows)]
-static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+/// Then: slots made null found touched again (read while evicted), of them
+/// made again past the hold, and those the frame's refills turned away;
+/// copies left alone for all their memory being mapped, and for being let
+/// go lately.
+static STATS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+
+/// Whether rounds go on ([`want`]'s `active`).
+#[cfg(windows)]
+static ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Copies let go by eviction, by title texture, and when (ms).
+#[cfg(windows)]
+static RECENT: std::sync::Mutex<Vec<(usize, u64)>> = std::sync::Mutex::new(Vec::new());
 
 /// The most recent bytes over the plan, and the round's microseconds
 /// (most since the last line).
@@ -266,6 +399,7 @@ pub(crate) fn round() {
             if !made {
                 STATS[3].fetch_add(1, Relaxed);
                 STATS[4].fetch_add(p.bytes, Relaxed);
+                RECENT.lock().unwrap_or_else(|e| e.into_inner()).push((p.at, now_ms));
                 watched.push(Picked { when: now_ms, ..p });
             } else if r.host.used.load(Relaxed) > p.moment || now_ms.saturating_sub(p.when) > PENDING_MS {
                 STATS[7].fetch_add(1, Relaxed);
@@ -298,17 +432,44 @@ pub(crate) fn round() {
     OVER.store(over, Relaxed);
     // Only while the governor holds the texture queue back: below its top
     // level the queue would make the copies again at its next pass.
-    let want = if crate::headroom::level() >= crate::headroom::TOP { want(used, budget, headroom, pending) } else { 0 };
+    static UNDER: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let under = *UNDER.get_or_init(|| mb_var("VICTORY_TEXTURE_EVICT_UNDER_MB", 128));
+    let want = if crate::headroom::level() >= crate::headroom::TOP {
+        let (want, active) = want(used, budget, headroom, under, ACTIVE.load(Relaxed), pending);
+        ACTIVE.store(active, Relaxed);
+        want
+    } else {
+        ACTIVE.store(false, Relaxed);
+        0
+    };
+    // Slots and copies let go long ago are forgotten.
+    {
+        let mut e = EVICTED.lock().unwrap_or_else(|e| e.into_inner());
+        let frame = crate::frame::current() + 1;
+        e.retain(|_, &mut at| frame.saturating_sub(at) < 36_000);
+        EVICTED_N.store(e.len(), Relaxed);
+    }
+    let recent: std::collections::HashSet<usize> = {
+        let mut r = RECENT.lock().unwrap_or_else(|e| e.into_inner());
+        r.retain(|&(_, when)| now_ms.saturating_sub(when) < AGAIN_MS);
+        r.iter().map(|&(at, _)| at).collect()
+    };
     if want > 0 {
         static CAPS: std::sync::OnceLock<Caps> = std::sync::OnceLock::new();
         let caps = *CAPS.get_or_init(|| {
             let var = |name| std::env::var(name).ok();
-            caps_from(var("VICTORY_TEXTURE_EVICT_MB").as_deref(), var("VICTORY_TEXTURE_EVICT_COUNT").as_deref())
+            caps_from(
+                var("VICTORY_TEXTURE_EVICT_MB").as_deref(),
+                var("VICTORY_TEXTURE_EVICT_COUNT").as_deref(),
+                var("VICTORY_TEXTURE_EVICT_WHOLE").as_deref(),
+            )
         });
         let pending_at: std::collections::HashSet<usize> =
             PICKED.lock().unwrap_or_else(|e| e.into_inner()).0.iter().map(|p| p.at).collect();
         let all = super::textures();
         let mut facts: Vec<(usize, Facts)> = Vec::new();
+        // Where each copy's title memory is, to ask whether all is mapped.
+        let mut memory: Vec<(u64, u64)> = Vec::new();
         for &at in all.iter() {
             // SAFETY: as above.
             let r = unsafe { &*(at as *const super::Resource) };
@@ -334,15 +495,41 @@ pub(crate) fn round() {
                 remade: r.host.gone.load(Relaxed),
                 bytes: host.bytes,
                 used,
+                recent: recent.contains(&at),
+                whole: true,
             };
+            if f.recent && eligible(&Facts { recent: false, ..f }, now) {
+                STATS[15].fetch_add(1, Relaxed);
+            }
             facts.push((at, f));
+            memory.push((r.data() as u64, super::footprint(&r.desc).map_or(0, |f| f.size)));
+        }
+        drop(all);
+        // Whether all their memory is mapped: asked outside the table's
+        // lock (an address is only asked about, never read), oldest first,
+        // at most `MOST_LOOKS`; one not asked counts as whole.
+        if !caps.whole {
+            let mut order: Vec<usize> = (0..facts.len()).filter(|&i| eligible(&facts[i].1, now)).collect();
+            order.sort_by_key(|&i| (facts[i].1.remade, facts[i].1.used >> 32, facts[i].1.used & 0xffff_ffff));
+            for &i in order.iter().take(MOST_LOOKS) {
+                let (at, len) = memory[i];
+                let whole = len == 0 || crate::texture::mapped_bytes(at as *const u8, len as usize) >= len;
+                facts[i].1.whole = whole;
+                if whole {
+                    STATS[14].fetch_add(1, Relaxed);
+                }
+            }
         }
         let chosen = choose(&facts, want, now, caps);
+        let all = super::textures();
         if !chosen.is_empty() {
             let mut wanted = Vec::with_capacity(chosen.len());
             let mut picked = Vec::with_capacity(chosen.len());
             for &at in &chosen {
-                // SAFETY: as above (the table's lock is still held).
+                if !all.contains(&at) {
+                    continue;
+                }
+                // SAFETY: as above (in the table, under its lock).
                 let r = unsafe { &*(at as *const super::Resource) };
                 let made = crate::lockmeter::lock("rs:made", &r.host.made);
                 let Some((host, _)) = made.as_ref() else { continue };
@@ -371,7 +558,7 @@ pub(crate) fn round() {
 #[cfg(windows)]
 fn line(now: Option<(u64, u64)>) {
     static LAST: AtomicU64 = AtomicU64::new(0);
-    static BEFORE: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+    static BEFORE: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
     if !SWITCH.set() {
         return;
     }
@@ -392,7 +579,9 @@ fn line(now: Option<(u64, u64)>) {
         "texture eviction (VICTORY_TEXTURE_BUDGET_EVICT{}): since the last line {} copies picked {} MB in {} rounds, {} let go {} MB, \
          {} made again (re-fills) {} MB, {} given up; the heap made null the slots of {} of them ({} slots) and left {}; now {} MB over \
          the headroom line, {} MB picked and not gone, governor level {}; host copies of textures the title fills {} MB, other host \
-         textures (targets, written by the host) {} MB; longest round {} us",
+         textures (targets, written by the host) {} MB; {} slots made null read while evicted (touched again), {} of them made \
+         again past the hold, {} turned away by the frame's refills, {} slots made null now; left alone: {} looks found all memory \
+         mapped, {} let go lately; rounds {}; longest round {} us",
         if now.is_none() { ", off in this phase" } else { "" },
         s[1],
         mb(s[2]),
@@ -410,6 +599,13 @@ fn line(now: Option<(u64, u64)>) {
         crate::headroom::level(),
         mb(filled),
         mb(all.saturating_sub(filled)),
+        s[11],
+        s[12],
+        s[13],
+        EVICTED_N.load(Relaxed),
+        s[14],
+        s[15],
+        if ACTIVE.load(Relaxed) { "going on" } else { "stopped" },
         ROUND_US.swap(0, Relaxed),
     );
 }
@@ -430,7 +626,7 @@ mod tests {
     }
 
     const NOW: u64 = (1000 << 32) | 10_000;
-    const WIDE: Caps = Caps { bytes: 1 << 40, count: 1 << 20 };
+    const WIDE: Caps = Caps { bytes: 1 << 40, count: 1 << 20, whole: false };
 
     #[test]
     fn least_recently_used_go_first_until_the_bytes_are_reached() {
@@ -473,25 +669,65 @@ mod tests {
     #[test]
     fn the_caps_bound_a_round() {
         let all: Vec<(u32, Facts)> = (0..10).map(|i| (i, copy(40 * MB, at(u64::from(i), 1)))).collect();
-        let by_count = Caps { bytes: 1 << 40, count: 3 };
+        let by_count = Caps { bytes: 1 << 40, count: 3, whole: false };
         assert_eq!(choose(&all, 1 << 40, NOW, by_count), vec![0, 1, 2]);
-        let by_bytes = Caps { bytes: 100 * MB, count: 100 };
+        let by_bytes = Caps { bytes: 100 * MB, count: 100, whole: false };
         assert_eq!(choose(&all, 1 << 40, NOW, by_bytes), vec![0, 1]);
         // A copy too big for what is left of the cap is passed over for a
         // smaller one.
         let mixed = [(1, copy(90 * MB, at(1, 1))), (2, copy(20 * MB, at(2, 1))), (3, copy(5 * MB, at(3, 1)))];
         assert_eq!(choose(&mixed, 1 << 40, NOW, by_bytes), vec![1, 3]);
-        assert!(choose(&mixed, 1 << 40, NOW, Caps { bytes: 1 << 40, count: 0 }).is_empty());
+        assert!(choose(&mixed, 1 << 40, NOW, Caps { bytes: 1 << 40, count: 0, whole: false }).is_empty());
     }
 
     #[test]
-    fn the_bytes_wanted_are_those_over_the_line_less_the_picked() {
-        // Budget 6208, headroom 768: line 5440.
-        assert_eq!(want(5837 * MB, 6208 * MB, 768 * MB, 0), 397 * MB);
-        assert_eq!(want(5837 * MB, 6208 * MB, 768 * MB, 300 * MB), 97 * MB);
-        assert_eq!(want(5837 * MB, 6208 * MB, 768 * MB, 500 * MB), 0);
-        assert_eq!(want(5000 * MB, 6208 * MB, 768 * MB, 0), 0);
-        assert_eq!(want(5000 * MB, 0, 768 * MB, 0), 5000 * MB);
+    fn rounds_start_over_the_line_and_stop_some_way_under_it() {
+        // Budget 6208, headroom 768: line 5440; under 128: floor 5312.
+        let (b, h, u) = (6208 * MB, 768 * MB, 128 * MB);
+        assert_eq!(want(5837 * MB, b, h, u, false, 0), (525 * MB, true));
+        assert_eq!(want(5837 * MB, b, h, u, true, 300 * MB), (225 * MB, true));
+        assert_eq!(want(5837 * MB, b, h, u, false, 600 * MB), (0, true));
+        // Under the line, not started: nothing.
+        assert_eq!(want(5400 * MB, b, h, u, false, 0), (0, false));
+        // Under the line, started: on down to the floor.
+        assert_eq!(want(5400 * MB, b, h, u, true, 0), (88 * MB, true));
+        // At the floor: stopped, and not started again until over the line.
+        assert_eq!(want(5312 * MB, b, h, u, true, 0), (0, false));
+        assert_eq!(want(5430 * MB, b, h, u, false, 0), (0, false));
+    }
+
+    #[test]
+    fn copies_let_go_lately_are_not_picked_again() {
+        let recent = Facts { recent: true, ..copy(MB, at(100, 1_000)) };
+        assert!(!eligible(&recent, NOW));
+        assert!(choose(&[(1, recent)], 1 << 40, NOW, WIDE).is_empty());
+    }
+
+    #[test]
+    fn copies_with_all_memory_mapped_are_left_unless_allowed_and_go_last() {
+        let whole = Facts { whole: true, ..copy(10 * MB, at(100, 1_000)) };
+        let part = copy(10 * MB, at(900, 9_000));
+        let all = [(1, whole), (2, part)];
+        assert_eq!(choose(&all, 1 << 40, NOW, WIDE), vec![2]);
+        assert_eq!(choose(&all, 1 << 40, NOW, Caps { whole: true, ..WIDE }), vec![2, 1]);
+    }
+
+    #[test]
+    fn a_slot_made_null_comes_back_once_touched_or_tabled_since() {
+        assert!(!refill_wanted(500, 0, 0));
+        assert!(!refill_wanted(500, 499, 500));
+        assert!(refill_wanted(500, 501, 0));
+        assert!(refill_wanted(500, 0, 501));
+    }
+
+    #[test]
+    fn refills_are_bounded_per_frame() {
+        let mut state = (0, 0);
+        assert!(take_one(&mut state, 7, 2));
+        assert!(take_one(&mut state, 7, 2));
+        assert!(!take_one(&mut state, 7, 2));
+        assert!(take_one(&mut state, 8, 2));
+        assert!(!take_one(&mut state, 9, 0));
     }
 
     #[test]
@@ -507,9 +743,9 @@ mod tests {
 
     #[test]
     fn the_caps_read_megabytes_and_a_count() {
-        assert_eq!(caps_from(None, None), Caps { bytes: 128 * MB, count: 256 });
-        assert_eq!(caps_from(Some(" 64 "), Some("16")), Caps { bytes: 64 * MB, count: 16 });
-        assert_eq!(caps_from(Some("99999"), Some("0")), Caps { bytes: 1024 * MB, count: 1 });
-        assert_eq!(caps_from(Some("x"), Some("y")), Caps { bytes: 128 * MB, count: 256 });
+        assert_eq!(caps_from(None, None, None), Caps { bytes: 128 * MB, count: 256, whole: false });
+        assert_eq!(caps_from(Some(" 64 "), Some("16"), Some("1")), Caps { bytes: 64 * MB, count: 16, whole: true });
+        assert_eq!(caps_from(Some("99999"), Some("0"), Some("0")), Caps { bytes: 1024 * MB, count: 1, whole: false });
+        assert_eq!(caps_from(Some("x"), Some("y"), None), Caps { bytes: 128 * MB, count: 256, whole: false });
     }
 }
