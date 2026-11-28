@@ -570,7 +570,9 @@ impl Worker {
                 loop {
                     let p = next();
                     *mine.lock().unwrap_or_else(|e| e.into_inner()) = Some((p.clone(), Instant::now()));
+                    let started = Instant::now();
                     p.make();
+                    super::sampler_order::note_time(started.elapsed().as_millis());
                     *mine.lock().unwrap_or_else(|e| e.into_inner()) = None;
                     let with = p.made.get().is_some_and(|made| made.is_some());
                     (if with { &MADE_OK } else { &MADE_NONE }).fetch_add(1, Ordering::Relaxed);
@@ -717,6 +719,7 @@ fn drained() {
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
+            slow_this_run = super::sampler_order::SLOW_NOW.load(Ordering::Relaxed),
             "host pipelines all made"
         );
     }

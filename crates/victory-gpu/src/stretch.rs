@@ -71,6 +71,7 @@ fn make(device: &ID3D12Device) -> windows::core::Result<Pass> {
     // SAFETY: the root signature is inside the shader; the description
     // points at live data and never releases its pointer.
     unsafe {
+        crate::pipeline::sampler_order::before_serialised(device, &cs);
         let root: ID3D12RootSignature = device.CreateRootSignature(0, &cs)?;
         let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),

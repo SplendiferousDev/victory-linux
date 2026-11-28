@@ -901,6 +901,8 @@ pub(crate) fn frame_log_counts() -> (u64, u64) {
 }
 #[cfg(windows)]
 mod make;
+#[cfg(windows)]
+pub(crate) mod sampler_order;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod hold;
 

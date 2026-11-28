@@ -62,6 +62,11 @@ pub fn use_pipeline_cache(dir: PathBuf) {
     let _ = DIR.set(dir);
 }
 
+/// The pipeline cache's folder, once known.
+pub(super) fn folder() -> Option<PathBuf> {
+    DIR.get().cloned()
+}
+
 /// Host pipelines created, loaded from the library, and title pipelines
 /// started at creation, since the start.
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
@@ -727,6 +732,8 @@ pub(crate) fn save(now: bool) {
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
+            slow_this_run = super::sampler_order::SLOW_NOW.load(Ordering::Relaxed),
+            new_static_samplers = super::sampler_order::NEW.load(Ordering::Relaxed),
             "host pipeline library saved"
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
@@ -765,7 +772,7 @@ fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Res
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
 /// `path`: a reader never sees a part. Serialised so concurrent worker and
 /// shutdown saves do not race on the same staging file or target rename.
-fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(super) fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::sync::atomic::AtomicU64;
     static WRITING: Mutex<()> = Mutex::new(());
     static NEXT: AtomicU64 = AtomicU64::new(0);
