@@ -262,6 +262,7 @@ pub(crate) fn twin_ring_most() -> u64 {
 /// A copy's CPU side for a card copy of `size` bytes (`len` of title
 /// memory): plain memory with [`plain_twins`], else a buffer in the PC's
 /// memory. The side and where its bytes are.
+#[track_caller]
 fn card_side(size: u64, len: u64, window: bool) -> Option<(Side, *mut u8)> {
     if plain_twins()
         && let Some(plain) = Plain::new(size, len, window)
@@ -269,8 +270,14 @@ fn card_side(size: u64, len: u64, window: bool) -> Option<(Side, *mut u8)> {
         let at = plain.at;
         return Some((Side::Plain(plain), at));
     }
-    let (buffer, data) = host()?.shared_buffer(size)?;
+    let (buffer, data) = host()?.shared_buffer_as(size, shared_kind(window))?;
     Some((Side::Buffer(buffer), data))
+}
+
+/// How a host copy's buffer in the PC's memory is counted by site
+/// (`crate::memsites`): windows outside buffers apart.
+fn shared_kind(window: bool) -> crate::memsites::Kind {
+    if window { crate::memsites::Kind::SharedWindow } else { crate::memsites::Kind::Shared }
 }
 
 /// [`Card::masked`]: a bit for each such byte, by [`MASK_BLOCK`] of the
@@ -4304,6 +4311,109 @@ pub(crate) fn let_go_idle() {
     }
 }
 
+/// What the windows outside buffers in the PC's memory (pinned by the
+/// driver) hold and use, for asks with a length (descriptor slots, draws)
+/// and for asks without (root views, `[1]`): windows, bytes, bytes of their
+/// 64 KiB pages ever copied from title memory, bytes outside the lowest to
+/// highest address ever asked for (for root views: below the lowest); and the bytes of title memory they lie
+/// over, each byte once.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WindowUse {
+    pub windows: [u64; 2],
+    pub bytes: [u64; 2],
+    pub copied: [u64; 2],
+    pub outside: [u64; 2],
+    pub cover: u64,
+}
+
+impl WindowUse {
+    /// Adds a window of `len` bytes from `start`, asked for from `low` to
+    /// `high` (`low > high`: never), with `pages` of its pages copied.
+    fn add(&mut self, unsized_ask: bool, start: u64, len: u64, low: u64, high: u64, pages: u64) {
+        let k = usize::from(unsized_ask);
+        self.windows[k] += 1;
+        self.bytes[k] += len;
+        self.copied[k] += (pages * PAGE as u64).min(len);
+        let end = start + len;
+        let (low, high) = (low.clamp(start, end), high.clamp(start, end));
+        self.outside[k] += if unsized_ask {
+            // A root view reads from its address to the window's end, and
+            // its ask's end is its address and one: what lies below the
+            // lowest ask is what no view of it reads.
+            low - start
+        } else if low < high {
+            len - (high - low)
+        } else {
+            len
+        };
+    }
+
+    /// The figures as the memory-by-site line says them.
+    pub(crate) fn text(&self) -> String {
+        let mb = |b: u64| b >> 20;
+        let all = self.bytes[0] + self.bytes[1];
+        format!(
+            "; windows in the PC's memory: with a length {} {} MB ({} MB ever copied, {} MB outside what was asked), \
+             root views {} {} MB ({} MB ever copied, {} MB below the lowest ask: VICTORY_WINDOW_TAILS), \
+             title memory under them {} MB ({} MB in more than one)",
+            self.windows[0],
+            mb(self.bytes[0]),
+            mb(self.copied[0]),
+            mb(self.outside[0]),
+            self.windows[1],
+            mb(self.bytes[1]),
+            mb(self.copied[1]),
+            mb(self.outside[1]),
+            mb(self.cover),
+            mb(all.saturating_sub(self.cover)),
+        )
+    }
+}
+
+/// [`WindowUse`] now, for the memory-by-site line (`crate::memsites`,
+/// `VICTORY_MEM_SITES=1`, every 10 s): what a finer grid
+/// (`VICTORY_WINDOW_KB`) or tails (`VICTORY_WINDOW_TAILS`) would leave out.
+/// Empty with the line off. Reads the table of windows under its read lock
+/// and each window's copied pages under their own lock, as the memory line
+/// of diagnostics builds does.
+pub(crate) fn window_use_text() -> String {
+    if !crate::memsites::on() {
+        return String::new();
+    }
+    let mut out = WindowUse::default();
+    let mut seen = std::collections::HashSet::new();
+    let mut spans = Vec::new();
+    {
+        let loose = crate::lockmeter::read("sh:LOOSE read", &LOOSE);
+        for s in loose.values() {
+            // In the PC's memory only, each copy once.
+            if s.place.is_some() || s.uploaded != 0 || s.card.is_some() || !seen.insert(Arc::as_ptr(s) as usize) {
+                continue;
+            }
+            let mut pages: std::collections::BTreeSet<usize> = {
+                let copied = crate::lockmeter::lock("sh:copied", &s.copied);
+                copied.iter().enumerate().filter(|&(_, &at)| at != 0).map(|(i, _)| i).collect()
+            };
+            // (Pages held in part are keyed by their number in the address
+            // space, the copied ones by their number in the copy.)
+            let base = s.start as usize / PAGE;
+            pages.extend(crate::lockmeter::lock("sh:parts", &s.parts).keys().map(|&page| page.saturating_sub(base)));
+            out.add(
+                s.unsized_asks.load(Ordering::Relaxed) > 0,
+                s.start,
+                s.len,
+                s.asked[0].load(Ordering::Relaxed),
+                s.asked[1].load(Ordering::Relaxed),
+                pages.len() as u64,
+            );
+            spans.push((s.start, s.len));
+        }
+    }
+    spans.sort_unstable();
+    out.cover = cover(spans.into_iter());
+    out.text()
+}
+
 /// For the memory line of every build (`crate::tight::line`): what the
 /// windows outside buffers and the title buffers' copies hold, by where.
 pub(crate) fn held() -> crate::tight::Held {
@@ -6693,11 +6803,25 @@ fn window_of(address: u64, end: u64, grid: u64) -> (u64, u64) {
 /// together with `VICTORY_WINDOW_KB` below 4096: on the 4 MiB grid an ask
 /// with a length in the same cell makes the whole cell's window, and the
 /// tail is that.
+///
+/// `alt`: twenty seconds without, twenty with, in turn. A change of phase
+/// is the change a longer tail already is: an ask names another window
+/// than the one before (the whole cell after a tail, or a tail where no
+/// whole cell is left), lists keep and bring up to date the copy they
+/// bound, and the one no longer named goes through the idle sweep when
+/// nothing holds it. The PC memory a phase saves shows only as the old
+/// windows go, so compare memory across runs and speed within one.
+/// (`USER_VIEW_BIAS`, found again apart from the slot, is the address's
+/// offset from 16 bytes: the same in a tail and in its cell, both begin on
+/// 256 KiB.)
 fn tails() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // Off unless `VICTORY_WINDOW_TAILS=1` (with a 512 KiB grid, run 354: the
-    // preparing thread's lists' steps 44-68 ms against 31-33).
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_TAILS").is_some_and(|v| v == "1"))
+    // Off unless `VICTORY_WINDOW_TAILS=1` or `alt` (with a 512 KiB grid,
+    // run 354: the preparing thread's lists' steps 44-68 ms against 31-33).
+    static TAILS: crate::alt::Switch = crate::alt::Switch::new(
+        "VICTORY_WINDOW_TAILS",
+        "windows of root views begin at the ask's 256 KiB step, not at its 4 MiB cell",
+    );
+    TAILS.on()
 }
 
 /// Tails begin on multiples of this. A longer tail is a new host buffer,
@@ -6743,7 +6867,6 @@ pub(crate) fn window_cover() -> u64 {
 
 /// The bytes `windows` (start, bytes; in order of start) lie over, each
 /// byte once.
-#[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
 fn cover(windows: impl Iterator<Item = (u64, u64)>) -> u64 {
     let (mut covered, mut reached) = (0, 0);
     for (start, bytes) in windows {
@@ -6883,7 +7006,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         };
         (on_card, data, Some(card))
     } else {
-        let (buffer, data) = host()?.shared_buffer(len)?;
+        let (buffer, data) = host()?.shared_buffer_as(len, shared_kind(true))?;
         crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
         // With room for windows on the card (`window_card_most`): shaders get a
         // buffer there, and the one just made is the CPU's side.
@@ -7005,7 +7128,7 @@ pub(crate) fn exact_line(frames: f64) {
 
 #[cfg(test)]
 mod window_tests {
-    use super::{WINDOW, cover, grid, holder, longest_tail, tail_of, window_of};
+    use super::{WINDOW, WindowUse, cover, grid, holder, longest_tail, tail_of, window_of};
 
     /// An ask that may take any window takes the longest that holds all of
     /// it, and none that holds only a part.
@@ -7041,6 +7164,31 @@ mod window_tests {
             (0x24_0000, 0x4_0000),
         ];
         assert_eq!(cover(over.into_iter()), 0x18_0000);
+    }
+
+    /// The windows' use: copied pages cut to the window, what lies outside
+    /// the asks (below the lowest for root views), a window never asked for
+    /// all outside.
+    #[test]
+    fn window_use_counts_copied_and_unasked_bytes() {
+        const MIB: u64 = 1 << 20;
+        let mut u = WindowUse::default();
+        // With a length: 1 MiB asked for 64 KiB to 192 KiB, two pages copied.
+        u.add(false, 16 * MIB, MIB, 16 * MIB + 0x1_0000, 16 * MIB + 0x3_0000, 2);
+        // A root view's 4 MiB cell, asked at 3 MiB (its end is the address and
+        // one), all 64 of its pages copied (more counted than it has: cut).
+        u.add(true, 32 * MIB, 4 * MIB, 35 * MIB, 35 * MIB + 1, 80);
+        // Never asked for.
+        u.add(false, 48 * MIB, MIB, u64::MAX, 0, 0);
+        assert_eq!(u.windows, [2, 1]);
+        assert_eq!(u.bytes, [2 * MIB, 4 * MIB]);
+        assert_eq!(u.copied, [0x2_0000, 4 * MIB]);
+        assert_eq!(u.outside, [MIB - 0x2_0000 + MIB, 3 * MIB]);
+        u.cover = 6 * MIB;
+        let t = u.text();
+        assert!(t.contains("with a length 2 2 MB"), "{t}");
+        assert!(t.contains("root views 1 4 MB (4 MB ever copied, 3 MB below the lowest ask"), "{t}");
+        assert!(t.contains("title memory under them 6 MB (0 MB in more than one)"), "{t}");
     }
 
     /// A tail runs from the ask's page to the end of its 4 MiB cell, and an

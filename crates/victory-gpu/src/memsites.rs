@@ -62,13 +62,17 @@ pub(crate) enum Kind {
     Allocator,
     /// Command lists.
     List,
+    /// Buffers as [`Kind::Shared`] that are windows of title memory outside
+    /// buffer objects (`crate::shadow`'s windows), apart from the title
+    /// buffers' copies and the CPU sides of copies on the card.
+    SharedWindow,
 }
 
-const KINDS: usize = 12;
+const KINDS: usize = 13;
 
 const KIND_NAMES: [&str; KINDS] = [
     "upload", "shared", "gpu-upload", "read-back", "card buffers", "textures", "reserved", "resource heaps",
-    "view heaps", "query heaps", "allocators", "lists",
+    "view heaps", "query heaps", "allocators", "lists", "shared windows",
 ];
 
 /// The most sites told apart; later ones share the last.
@@ -114,6 +118,16 @@ fn site(kind: Kind, file: &'static str, line: u32) -> usize {
         names.push((kind, file, line));
     }
     names.len() - 1
+}
+
+/// A site's file as the line names it: its path below the crate's `src`
+/// (`descriptor/host.rs`, not `host.rs`: several files share a name).
+fn place_of(file: &'static str) -> &'static str {
+    let at = ["/src/", "\\src\\"].iter().filter_map(|s| file.rfind(s).map(|at| at + s.len())).max();
+    match at {
+        Some(at) => &file[at..],
+        None => file.rsplit(['/', '\\']).next().unwrap_or(file),
+    }
 }
 
 /// The destruction callback's data: the site in the low bits, the bytes in
@@ -190,8 +204,7 @@ pub(crate) fn note_pair(allocator: &ID3D12CommandAllocator, list: &ID3D12Graphic
 }
 
 fn count<T: Interface>(object: &T, kind: Kind, bytes: u64, at: &'static std::panic::Location<'static>) {
-    let file = at.file().rsplit(['/', '\\']).next().unwrap_or(at.file());
-    let n = site(kind, file, at.line());
+    let n = site(kind, place_of(at.file()), at.line());
     MADE[n].fetch_add(1, Relaxed);
     let Ok(notifier) = object.cast::<ID3DDestructionNotifier>() else {
         UNTRACKED[n].fetch_add(1, Relaxed);
@@ -307,7 +320,7 @@ pub(crate) fn line() {
         crate::list::idle_count() as u64,
         crate::host::LISTS[1].load(Relaxed),
     ];
-    let extra = crate::host::prelude_pool_text() + &crate::host::allocator_trim_text();
+    let extra = crate::host::prelude_pool_text() + &crate::host::allocator_trim_text() + &crate::shadow::window_use_text();
     tracing::info!("{}", text(&rows(), lists, &extra));
 }
 
@@ -320,6 +333,15 @@ mod tests {
         for (site, bytes, back) in [(0, 0, 0), (3, 1, 64 << 10), (1023, 64 << 10, 64 << 10), (7, 5 << 30, 5 << 30)] {
             assert_eq!(unpack(pack(site, bytes)), (site, back));
         }
+    }
+
+    #[test]
+    fn a_site_is_named_by_its_path_below_src() {
+        assert_eq!(place_of("crates/victory-gpu/src/descriptor/host.rs"), "descriptor/host.rs");
+        assert_eq!(place_of("crates\\victory-gpu\\src\\host.rs"), "host.rs");
+        assert_eq!(place_of("crates/victory-gpu/src/host.rs"), "host.rs");
+        assert_eq!(place_of("elsewhere/lib.rs"), "lib.rs");
+        assert_eq!(place_of("lib.rs"), "lib.rs");
     }
 
     #[test]

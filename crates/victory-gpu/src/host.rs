@@ -10836,6 +10836,13 @@ impl Host {
     /// the common state (buffers move out of it implicitly).
     #[track_caller]
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.shared_buffer_as(size, crate::memsites::Kind::Shared)
+    }
+
+    /// [`Host::shared_buffer`], counted by site as `kind` (windows outside
+    /// buffers apart from the other copies, `crate::memsites`).
+    #[track_caller]
+    pub(crate) fn shared_buffer_as(&self, size: u64, kind: crate::memsites::Kind) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[2].fetch_add(1, Ordering::Relaxed);
         MADE[3].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -10878,7 +10885,7 @@ impl Host {
         };
         match made {
             Ok(()) => {
-                crate::memsites::note(buffer.as_ref()?, crate::memsites::Kind::Shared, size);
+                crate::memsites::note(buffer.as_ref()?, kind, size);
                 Some((buffer?, data.cast()))
             }
             Err(e) => {
