@@ -2552,7 +2552,10 @@ impl HostHeap {
             return;
         };
         let now = if constant { SLOT_CONSTANT } else { SLOT_OTHER };
-        if let Some(count) = index.checked_sub(self.count).and_then(|at| self.writes.get(at as usize)) {
+        // (Counted for the reader check alone: off, its line is not touched.)
+        if crate::readercheck::on()
+            && let Some(count) = index.checked_sub(self.count).and_then(|at| self.writes.get(at as usize))
+        {
             count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         // Read first: nearly every write keeps the kind, and a swap would
