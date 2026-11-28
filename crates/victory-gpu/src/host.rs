@@ -27,6 +27,8 @@ mod pooled_staging;
 mod slot_wait;
 mod stall_report;
 mod twin_ring;
+mod prelude_pool;
+pub(crate) use prelude_pool::text as prelude_pool_text;
 mod late_line;
 use late_line::late_line;
 mod at_budget;
@@ -4877,7 +4879,7 @@ impl Host {
             )?;
             crate::memsites::note_pair(&allocator, &list);
             let prelude = OnceLock::new();
-            if !lazy_prelude() {
+            if !lazy_prelude() && !prelude_pool::on() {
                 let _ = prelude.set(self.make_prelude());
             }
             Ok(HostList {
@@ -8213,11 +8215,14 @@ impl HostList {
         if barriers.is_empty() && syncs.is_empty() && !gathered && detiles.is_empty() {
             return None;
         }
-        let Some((allocator, list)) = self
-            .prelude
-            .get_or_init(|| host().and_then(|h| h.make_prelude()))
-            .as_ref()
-        else {
+        // With `VICTORY_PRELUDE_POOL=1` one of the shared pool, handed back
+        // through `retire` once recorded (`prelude_pool`).
+        let pooled = if prelude_pool::on() { prelude_pool::take(host()) } else { None };
+        let Some((allocator, list)) = (match &pooled {
+            Some(p) => Some(p),
+            None if prelude_pool::on() => None,
+            None => self.prelude.get_or_init(|| host().and_then(|h| h.make_prelude())).as_ref(),
+        }) else {
             fail(format_args!("no host list for a state prelude"));
         };
         // SAFETY: the prelude is not executing (every submission is waited
@@ -8272,7 +8277,11 @@ impl HostList {
         if let Err(e) = recorded {
             fail(format_args!("a host state prelude did not record ({e})"));
         }
-        list.cast().ok()
+        let out = list.cast().ok();
+        if let Some(p) = pooled {
+            prelude_pool::give(p);
+        }
+        out
     }
 
     /// From here on the list gathers no records (`crate::indirect::gather`):
