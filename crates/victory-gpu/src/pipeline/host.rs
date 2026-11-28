@@ -924,6 +924,9 @@ impl HostPipeline {
             params.extend(crate::launch::params());
             [first, first + 1, first + 2]
         });
+        // Its static samplers have their places in the driver's table first
+        // (`sampler_order`): the same in every start.
+        super::sampler_order::before(&host.device, &samplers);
         let made = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Err(e) if let Some([first, ..]) = launch_roots => {
                 // Over the root signature's 64 words with them, say: this
