@@ -621,6 +621,9 @@ fn watch(mut workers: Vec<Worker>) {
         if last_report.elapsed() >= REPORT_EVERY {
             last_report = Instant::now();
             report(&workers);
+            // What was finished since the last save and has waited its
+            // twenty seconds, also when nothing is finished after it.
+            super::library::save(false);
         }
         workers.retain_mut(|w| {
             if !w.ended() {

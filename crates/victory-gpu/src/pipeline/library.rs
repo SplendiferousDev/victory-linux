@@ -442,8 +442,9 @@ const EARLY_FILE: &str = "early-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 32768;
 
+static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
+
 fn library() -> Option<&'static Library> {
-    static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
     LIBRARY
         .get_or_init(|| {
             // With RenderDoc loaded the device is RenderDoc's: the card's
@@ -640,6 +641,15 @@ pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let Some(dir) = DIR.get() else { return };
+    // Nothing to write: the clock is left alone. (A look with nothing added
+    // started it all the same, and pipelines finished in the next twenty
+    // seconds then waited for one finished after them: the last ones of a
+    // run never were, and runs end killed. Every run since the cache moved
+    // compiled the same three pipelines again and saved no library.)
+    let pending = USED_CHANGED.load(Ordering::Relaxed) || LIBRARY.get().and_then(Option::as_ref).is_some_and(|l| l.added.load(Ordering::Relaxed) > 0);
+    if !now && !pending {
+        return;
+    }
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
