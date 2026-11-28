@@ -170,7 +170,10 @@ unixpath() { # Windows Z: path -> Unix path (other drives are left alone)
 run_dir=$vl_state_home/run
 log_dir=$vl_state_home/logs
 vkd3d_cache=$vl_cache_home/vkd3d-cache
+driver_cache=$vl_cache_home/driver-cache
 refuse_inside_repo "state directory" "$vl_state_home"
+refuse_inside_repo "driver shader cache" "${__GL_SHADER_DISK_CACHE_PATH:-$driver_cache}"
+refuse_inside_repo "driver shader cache" "${MESA_SHADER_CACHE_DIR:-$driver_cache}"
 if [[ -n ${VKD3D_SHADER_CACHE_PATH:-} ]]; then
   if [[ $VKD3D_SHADER_CACHE_PATH == [Zz]:* || $VKD3D_SHADER_CACHE_PATH == /* ]]; then
     refuse_inside_repo "VKD3D_SHADER_CACHE_PATH" "$(unixpath "$VKD3D_SHADER_CACHE_PATH")"
@@ -202,7 +205,7 @@ if [[ -n $measure ]]; then
   mkdir -p "$(dirname -- "$measure")"
 fi
 
-mkdir -p "$run_dir" "$log_dir" "$vkd3d_cache"
+mkdir -p "$run_dir" "$log_dir" "$vkd3d_cache" "$driver_cache"
 log=$log_dir/$name.log
 
 # The page pool on a file (VICTORY_XMEM_POOL_DIR). The file holds title data:
@@ -246,14 +249,29 @@ export VKD3D_SHADER_DEBUG=${VKD3D_SHADER_DEBUG:-none}
 # is full, older entries are thrown out and every pipeline, even one loaded from
 # the pipeline library, is compiled again (1 to 7 s each instead of
 # milliseconds).
+#
+# The cache also gets a directory of its own. The size is a property of the
+# cache, not of the program: in the default directory (~/.cache/nvidia/GLCache)
+# any other program that uses the driver without the variable (a desktop
+# program, a test binary, a tool started with plain wine) sets it back to the
+# default and wipes the whole cache when it is over (the driver's README, "If
+# the default cache is used and __GL_SHADER_DISK_CACHE_SIZE is set locally").
+# The next start of the title then compiles every pipeline again, which looked
+# like a cold cache after a crash. Proton does the same (a directory per game).
+# Mesa (RADV) gets the same treatment: its cache is shared and trimmed to
+# whatever size the program using it last asked for.
+export __GL_SHADER_DISK_CACHE_PATH=${__GL_SHADER_DISK_CACHE_PATH:-$driver_cache}
 export __GL_SHADER_DISK_CACHE_SIZE=${__GL_SHADER_DISK_CACHE_SIZE:-12000000000}
 export __GL_SHADER_DISK_CACHE_SKIP_CLEANUP=${__GL_SHADER_DISK_CACHE_SKIP_CLEANUP:-1}
+export MESA_SHADER_CACHE_DIR=${MESA_SHADER_CACHE_DIR:-$driver_cache}
+export MESA_SHADER_CACHE_MAX_SIZE=${MESA_SHADER_CACHE_MAX_SIZE:-12G}
 # Any other VICTORY_* or VKD3D_* variable is already in the environment and is
 # inherited as it is.
 
 b=$(vkd3d_build_of "$prefix")
 echo "prefix:   $prefix"
 echo "vkd3d:    ${b:-unknown version} (the log's 'vkd3d-proton - build:' line confirms the build)"
+echo "drivers:  shader cache in $__GL_SHADER_DISK_CACHE_PATH (NVIDIA) / $MESA_SHADER_CACHE_DIR (Mesa)"
 echo "profile:  $console ($exe_dir build)"
 echo "log:      $log"
 [[ -z $pool_dir ]] || echo "pool:     a file in $pool_dir (VICTORY_XMEM_POOL_DIR)"

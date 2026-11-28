@@ -455,6 +455,13 @@ fn library() -> Option<&'static Library> {
                 return None;
             }
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
+            let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+            if let Some(note) = driver_cache_note(
+                var("__GL_SHADER_DISK_CACHE_PATH").as_deref(),
+                var("__GL_SHADER_DISK_CACHE_SIZE").as_deref(),
+            ) {
+                tracing::warn!("{note}");
+            }
             let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
             let library = open(&device, blob);
             if library.is_none() {
@@ -463,6 +470,25 @@ fn library() -> Option<&'static Library> {
             library
         })
         .as_ref()
+}
+
+/// A warning when NVIDIA's driver cache is told a size but kept in its
+/// shared default directory. The size is the cache's, not the program's:
+/// any other program using the driver without the variable sets it back
+/// to the default (256 MiB) and wipes the whole cache when it is over (the
+/// driver's README). The library then still loads every pipeline, but the
+/// driver compiles each again, seconds apiece: what looked like pipelines
+/// lost in a crash. `None` when the cache has a directory of its own, or
+/// when no size is set (the driver's own defaults, nothing to lose).
+fn driver_cache_note(path: Option<&str>, size: Option<&str>) -> Option<String> {
+    match (path, size) {
+        (None, Some(size)) => Some(format!(
+            "the driver's shader cache is asked for {size} bytes but kept in its shared default directory: \
+             any other program using the driver without __GL_SHADER_DISK_CACHE_SIZE wipes it, and the next \
+             start compiles every pipeline again; set __GL_SHADER_DISK_CACHE_PATH to a directory of its own"
+        )),
+        _ => None,
+    }
 }
 
 /// The library in `blob`, or an empty one if the host rejects the blob (an
@@ -834,6 +860,14 @@ pub(crate) fn note_thread_ended(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sized_driver_cache_in_the_shared_directory_is_warned_about() {
+        assert!(driver_cache_note(None, Some("12000000000")).is_some_and(|n| n.contains("12000000000")));
+        assert!(driver_cache_note(Some("/cache/driver"), Some("12000000000")).is_none());
+        assert!(driver_cache_note(Some("/cache/driver"), None).is_none());
+        assert!(driver_cache_note(None, None).is_none());
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {

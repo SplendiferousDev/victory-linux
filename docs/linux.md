@@ -159,6 +159,23 @@ clean-up off (`__GL_SHADER_DISK_CACHE_SKIP_CLEANUP=1`); set them yourself when
 starting wine another way, including for `victory warm` and
 `victory precompile-graphics`.
 
+The launcher also gives the driver's cache a directory of its own
+(`__GL_SHADER_DISK_CACHE_PATH`, default `driver-cache/` beside the vkd3d-proton
+cache; `MESA_SHADER_CACHE_DIR` and `MESA_SHADER_CACHE_MAX_SIZE` for RADV). In
+the shared default directory the size is a property of the cache: any other
+program that uses the driver without `__GL_SHADER_DISK_CACHE_SIZE` (a desktop
+program, a GPU test binary, a tool started with plain wine) sets it back to
+256 MiB and wipes the whole cache, as the driver's README says. The title's
+next start then compiles every pipeline again: the start-screen hold runs to its
+timeout and frames are slow, which looks like a cache lost in a crash. A crash
+or kill does not lose it: the runtime's library is written to a temporary file
+and renamed into place, vkd3d-proton merges its `.write` file at the next start,
+and the driver appends its entries as it goes. Use the same directory and size
+for `victory warm` and `victory precompile-graphics`, or they warm a cache the
+title never reads. Moving to the private directory costs one warm-up, unless the
+old cache's files are copied to the same place under the new directory (see
+where the driver puts them after the first start).
+
 ### Scripted pad
 
 For unattended runs, `VICTORY_PAD_FILE` names a file that is read as a list of
