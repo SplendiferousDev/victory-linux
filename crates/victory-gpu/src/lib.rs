@@ -107,6 +107,8 @@ mod gpuwatch;
 #[cfg(windows)]
 mod slotkind;
 #[cfg(windows)]
+mod slotuse;
+#[cfg(windows)]
 mod readercheck;
 #[cfg(windows)]
 mod tablekey;

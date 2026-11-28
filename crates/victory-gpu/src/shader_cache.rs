@@ -193,6 +193,23 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     }
 }
 
+/// The translation of a pixel shader container in the form that tests
+/// depth and stencil before it runs (`crate::slotuse`,
+/// `victory_shader::emit::slot_mark::with_early_depth`): kept under a key of
+/// its own beside the usual form's, which is never changed by it.
+pub(crate) fn host_shader_early(container: &[u8]) -> Result<HostShader, String> {
+    let translate = |c: &[u8]| victory_shader::emit::slot_mark::with_early_depth(true, || translate_listed(c));
+    match CACHE.get() {
+        Some(cache) => {
+            let mut h = blake3::Hasher::new();
+            h.update(b"early depth and stencil\0");
+            h.update(&build());
+            cached(cache, h.finalize().as_bytes(), container, translate)
+        }
+        None => translate(container),
+    }
+}
+
 /// The cache entry's converter: the build and the container in, the
 /// encoded translation out. `ran` tells a miss from a hit.
 struct Translate<F> {

@@ -6950,6 +6950,9 @@ impl Host {
             crate::stall::doing(crate::stall::Doing::SyncHeaps, 0, 0, 0);
             crate::descriptor::sync_heaps();
         }
+        // The slots shaders marked, if they mark any (`crate::slotuse`):
+        // its own short list, behind whatever is in the air.
+        crate::slotuse::tick();
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
         // of is named by no list, and nothing runs now (behind flights the

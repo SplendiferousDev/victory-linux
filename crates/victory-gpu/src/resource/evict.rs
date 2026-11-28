@@ -56,6 +56,17 @@
 //! the card is `VICTORY_TEXTURE_EVICT_UNDER_MB` (128) under it, then stop
 //! until it is over again.
 //!
+//! With slot marks (`crate::slotuse`, `VICTORY_SLOT_FEEDBACK=1`) the
+//! translated shaders say which slots they read: a copy with a slot a
+//! shader read within the marks' idle time is never picked, and its slots
+//! are never made null. While the marks are relied on besides
+//! (`crate::slotuse::certain`): a copy as old as that time none of whose
+//! slots was read in it may go although all its memory is mapped
+//! ([`Facts::unread`]), before the others; the slots of a copy let go leave
+//! the queue and stay null until a shader is seen reading one, the title
+//! touches it or a table covers it ([`went_unread`]), and are then made at
+//! once like the others.
+//!
 //! The idea of letting textures go against a byte budget, least recently
 //! used first and copies already made again last, is from VIctory-Fast.
 
@@ -109,6 +120,9 @@ pub(crate) struct Facts {
     pub recent: bool,
     /// All its title memory is mapped (or not looked at).
     pub whole: bool,
+    /// The slot marks say no shader read any of its slots for their whole
+    /// idle time, and nothing asked for it in that time either.
+    pub unread: bool,
 }
 
 /// Whether a copy may be picked at `now` (a `crate::host::moment`).
@@ -140,8 +154,9 @@ pub(crate) struct Caps {
 }
 
 /// Of `all` (an id and its facts), the ids a round picks to free `want`
-/// bytes: eligible ones ([`eligible`]; whole ones only with `caps.whole`),
-/// never made again before the others, partly mapped before whole, least
+/// bytes: eligible ones ([`eligible`]; whole ones only with `caps.whole`
+/// or unread by the slot marks), never made again before the others, the
+/// ones the marks say unread first, partly mapped before whole, least
 /// recently asked for first, until `want` or a cap is reached (the
 /// copy that crosses `want` is taken; none past the byte cap).
 pub(crate) fn choose<T: Copy>(all: &[(T, Facts)], want: u64, now: u64, caps: Caps) -> Vec<T> {
@@ -149,9 +164,9 @@ pub(crate) fn choose<T: Copy>(all: &[(T, Facts)], want: u64, now: u64, caps: Cap
         return Vec::new();
     }
     let mut order: Vec<&(T, Facts)> =
-        all.iter().filter(|(_, f)| eligible(f, now) && (caps.whole || !f.whole)).collect();
+        all.iter().filter(|(_, f)| eligible(f, now) && (caps.whole || !f.whole || f.unread)).collect();
     // By when asked for: the frame count (high half) first, then the time.
-    order.sort_by_key(|(_, f)| (f.remade, f.whole, f.used >> 32, f.used & 0xffff_ffff));
+    order.sort_by_key(|(_, f)| (f.remade, !f.unread, f.whole, f.used >> 32, f.used & 0xffff_ffff));
     let mut out = Vec::new();
     let mut bytes = 0u64;
     for (id, f) in order {
@@ -252,6 +267,69 @@ pub(crate) fn note_evicted(slots: &[u32], frame: u64) {
     EVICTED_N.store(e.len(), Relaxed);
 }
 
+/// Slot marks: title slot `slot` stays null for a texture that went unread
+/// at frame stamp `stamp` ([`went_unread`]), as if made null then.
+#[cfg(windows)]
+pub(crate) fn note_parked(slot: u32, stamp: u64) {
+    let mut e = EVICTED.lock().unwrap_or_else(|e| e.into_inner());
+    e.entry(slot).or_insert(stamp);
+    EVICTED_N.store(e.len(), Relaxed);
+    BY_MARKS[5].fetch_add(1, Relaxed);
+}
+
+/// Whether any title slot is null by eviction now, and how many.
+#[cfg(windows)]
+pub(crate) fn any_null() -> bool {
+    EVICTED_N.load(Relaxed) != 0
+}
+
+/// See [`any_null`].
+#[cfg(windows)]
+pub(crate) fn null_now() -> usize {
+    EVICTED_N.load(Relaxed)
+}
+
+/// Title textures (by address) whose host copy eviction let go while the
+/// slot marks said no shader read it, with the frame stamp (frame + 1) at
+/// which it was found gone; until the copy is made again.
+#[cfg(windows)]
+static UNREAD: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
+#[cfg(windows)]
+static UNREAD_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Whether any texture's copy went unread and has not been made again.
+#[cfg(windows)]
+pub(crate) fn any_unread() -> bool {
+    UNREAD_N.load(Relaxed) != 0
+}
+
+/// The frame stamp at which the copy of title texture `texture` went
+/// unread, if it did and has not been made again.
+#[cfg(windows)]
+pub(crate) fn went_unread(texture: usize) -> Option<u64> {
+    if UNREAD_N.load(Relaxed) == 0 {
+        return None;
+    }
+    UNREAD.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|u| u.get(&texture).copied())
+}
+
+/// Since the start, by the slot marks: copies not picked for a slot a
+/// shader read; copies picked as unread; of those let go, and their bytes;
+/// of those made again; slots left null and out of the queue for a texture
+/// that went unread.
+#[cfg(windows)]
+static BY_MARKS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// [`BY_MARKS`]'s first five since the last call (for `crate::slotuse`'s line).
+#[cfg(windows)]
+pub(crate) fn by_marks() -> [u64; 5] {
+    static BEFORE: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+    std::array::from_fn(|i| {
+        let n = BY_MARKS[i].load(Relaxed);
+        n - BEFORE[i].swap(n, Relaxed)
+    })
+}
+
 /// The frame stamp in which title slot `slot` was made null by eviction.
 #[cfg(windows)]
 pub(crate) fn evicted_stamp(slot: u32) -> Option<u64> {
@@ -313,6 +391,8 @@ struct Picked {
     bytes: u64,
     when: u64,
     moment: u64,
+    /// Picked as unread by the slot marks ([`Facts::unread`]).
+    unread: bool,
 }
 
 /// Picked copies not gone yet, and copies let go that are watched for
@@ -399,6 +479,14 @@ pub(crate) fn round() {
             if !made {
                 STATS[3].fetch_add(1, Relaxed);
                 STATS[4].fetch_add(p.bytes, Relaxed);
+                if p.unread {
+                    BY_MARKS[2].fetch_add(1, Relaxed);
+                    BY_MARKS[3].fetch_add(p.bytes, Relaxed);
+                    let mut went = UNREAD.lock().unwrap_or_else(|e| e.into_inner());
+                    let map = went.get_or_insert_with(Default::default);
+                    map.insert(p.at, crate::frame::current() + 1);
+                    UNREAD_N.store(map.len(), Relaxed);
+                }
                 RECENT.lock().unwrap_or_else(|e| e.into_inner()).push((p.at, now_ms));
                 watched.push(Picked { when: now_ms, ..p });
             } else if r.host.used.load(Relaxed) > p.moment || now_ms.saturating_sub(p.when) > PENDING_MS {
@@ -417,10 +505,33 @@ pub(crate) fn round() {
             if crate::lockmeter::lock("rs:made", &r.host.made).is_some() {
                 STATS[5].fetch_add(1, Relaxed);
                 STATS[6].fetch_add(p.bytes, Relaxed);
+                if p.unread {
+                    BY_MARKS[4].fetch_add(1, Relaxed);
+                }
                 return false;
             }
             true
         });
+        // The textures that went unread: until made again, or gone.
+        if UNREAD_N.load(Relaxed) != 0 {
+            let unread = |f: &mut dyn FnMut(&mut std::collections::HashMap<usize, u64>)| {
+                if let Some(map) = UNREAD.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                    f(map);
+                    UNREAD_N.store(map.len(), Relaxed);
+                }
+            };
+            let mut keys = Vec::new();
+            unread(&mut |map| keys = map.keys().copied().collect());
+            // (Asked outside the list's lock.)
+            keys.retain(|at| {
+                !all.contains(at) || {
+                    // SAFETY: as above.
+                    let r = unsafe { &*(*at as *const super::Resource) };
+                    crate::lockmeter::lock("rs:made", &r.host.made).is_some()
+                }
+            });
+            unread(&mut |map| map.retain(|at, _| !keys.contains(at)));
+        }
         waiting.iter().map(|p| p.bytes).sum::<u64>()
     };
     let memory = crate::host::host().and_then(|h| h.video_memory());
@@ -466,6 +577,13 @@ pub(crate) fn round() {
         });
         let pending_at: std::collections::HashSet<usize> =
             PICKED.lock().unwrap_or_else(|e| e.into_inner()).0.iter().map(|p| p.at).collect();
+        // Slot marks (`crate::slotuse`): the host textures shown by a slot
+        // a shader read within the marks' idle time are not picked, and,
+        // while the marks are relied on, a copy as old as that time may go
+        // as unread.
+        let marks = crate::slotuse::certain();
+        let read = crate::slotuse::textures_read();
+        let marks_idle = crate::slotuse::idle_ms();
         let all = super::textures();
         let mut facts: Vec<(usize, Facts)> = Vec::new();
         // Where each copy's title memory is, to ask whether all is mapped.
@@ -486,6 +604,10 @@ pub(crate) fn round() {
             if host.tiled.is_some() {
                 continue;
             }
+            if read.as_ref().is_some_and(|r| r.contains(&(windows::core::Interface::as_raw(&host.texture) as usize))) {
+                BY_MARKS[0].fetch_add(1, Relaxed);
+                continue;
+            }
             let f = Facts {
                 filled: host.filled,
                 made: true,
@@ -497,6 +619,7 @@ pub(crate) fn round() {
                 used,
                 recent: recent.contains(&at),
                 whole: true,
+                unread: marks.is_some() && idle_since(used, now, marks_idle, MIN_IDLE_FRAMES),
             };
             if f.recent && eligible(&Facts { recent: false, ..f }, now) {
                 STATS[15].fetch_add(1, Relaxed);
@@ -521,6 +644,8 @@ pub(crate) fn round() {
             }
         }
         let chosen = choose(&facts, want, now, caps);
+        let unread: std::collections::HashSet<usize> =
+            facts.iter().filter(|(_, f)| f.unread).map(|&(at, _)| at).collect();
         let all = super::textures();
         if !chosen.is_empty() {
             let mut wanted = Vec::with_capacity(chosen.len());
@@ -534,7 +659,9 @@ pub(crate) fn round() {
                 let made = crate::lockmeter::lock("rs:made", &r.host.made);
                 let Some((host, _)) = made.as_ref() else { continue };
                 wanted.push(Wanted(host.texture.clone()));
-                picked.push(Picked { at, bytes: host.bytes, when: now_ms, moment: now });
+                let unread = unread.contains(&at);
+                BY_MARKS[1].fetch_add(u64::from(unread), Relaxed);
+                picked.push(Picked { at, bytes: host.bytes, when: now_ms, moment: now, unread });
             }
             drop(all);
             STATS[0].fetch_add(1, Relaxed);
@@ -710,6 +837,25 @@ mod tests {
         let all = [(1, whole), (2, part)];
         assert_eq!(choose(&all, 1 << 40, NOW, WIDE), vec![2]);
         assert_eq!(choose(&all, 1 << 40, NOW, Caps { whole: true, ..WIDE }), vec![2, 1]);
+    }
+
+    #[test]
+    fn copies_the_marks_say_unread_go_first_and_although_whole() {
+        // Whole and unread by the marks: picked without the whole switch,
+        // before a partly mapped copy asked for longer ago.
+        let unread = Facts { whole: true, unread: true, ..copy(10 * MB, at(900, 9_000)) };
+        let whole = Facts { whole: true, ..copy(10 * MB, at(100, 1_000)) };
+        let part = copy(10 * MB, at(200, 2_000));
+        let all = [(1, whole), (2, part), (3, unread)];
+        assert_eq!(choose(&all, 1 << 40, NOW, WIDE), vec![3, 2]);
+        assert_eq!(choose(&all, 1, NOW, WIDE), vec![3]);
+        // One made again goes after the others all the same, and one in a
+        // list or asked for lately not at all.
+        let again = Facts { remade: true, ..unread };
+        assert_eq!(choose(&[(1, again), (2, part)], 1 << 40, NOW, WIDE), vec![2, 1]);
+        let listed = Facts { listed: true, ..unread };
+        let lately = Facts { used: at(999, 9_999), ..unread };
+        assert!(choose(&[(1, listed), (2, lately)], 1 << 40, NOW, WIDE).is_empty());
     }
 
     #[test]

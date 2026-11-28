@@ -1262,6 +1262,23 @@ impl HostHeap {
             tracing::warn!(error = %e, "host descriptor heap not made null");
         }
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
+        // Slot marks (`crate::slotuse`): the slot below the null slot shows
+        // the buffer shaders mark the slots they read in; never one of the
+        // dynamic slots handed out, if it is one of them.
+        if !sampler
+            && let Some(slot) = victory_shader::emit::slot_mark::mark_slot()
+            && slot < size
+        {
+            if let Some(d) = slot.checked_sub(h.count).filter(|&d| d < h.dynamic) {
+                let mut next = h.next.lock().unwrap_or_else(|e| e.into_inner());
+                if !std::mem::replace(&mut next.1[d as usize], true) {
+                    h.free.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            if !crate::slotuse::install(h.cpu(slot), slot, h.count) {
+                tracing::warn!(slot, "VICTORY_SLOT_FEEDBACK=1: this view heap has no buffer for the marks; its shaders' marks go nowhere");
+            }
+        }
         Some(h)
     }
 
@@ -1966,11 +1983,21 @@ impl HostHeap {
         }
         let (mut textures, mut left) = (0u64, 0u64);
         let mut unmade: Vec<u32> = Vec::new();
+        // Slot marks (`crate::slotuse`): relied on, a slot is in use if a
+        // shader read it, the title touched it or a table covered it within
+        // the marks' idle time; else a mark only adds to the usual rule.
+        let marks = crate::slotuse::certain();
+        let since = marks.or_else(crate::slotuse::cutoff);
         {
             let mut made = locked(&self.made, 4);
             for (i, slots) in found.iter().enumerate() {
                 if !crate::resource::evict::slots_free(slots, self.count, |s| {
-                    self.tabled_lately(s, frame) || self.touched_lately(s, frame)
+                    self.tabled_lately(s, frame)
+                        || crate::slotuse::protects(s, since)
+                        || match marks {
+                            Some(cutoff) => self.touched_since(s, cutoff),
+                            None => self.touched_lately(s, frame),
+                        }
                 }) {
                     left += 1;
                     continue;
@@ -1997,11 +2024,84 @@ impl HostHeap {
             crate::resource::evict::note_evicted(&unmade, frame);
             let mut queue = crate::lockmeter::lock("dh:textures", &self.textures);
             for &slot in &unmade {
-                queue.changed(slot, frame, frame + 1);
+                if marks.is_some() {
+                    // No shader read it: it waits out of the queue until
+                    // one does ([`HostHeap::texture_slots_read_again`]), the
+                    // title writes it or memory under it changes.
+                    queue.remove(slot);
+                } else {
+                    queue.changed(slot, frame, frame + 1);
+                }
             }
         }
         crate::resource::evict::slots_done(wanted, textures, unmade.len() as u64, left);
         unmade.len()
+    }
+
+    /// Slot marks (`crate::slotuse`): of the title slots `read`, the ones
+    /// texture eviction made null are due now, as written now; the pass
+    /// then makes them past the hold ([`HostHeap::texture_slot_refill`]).
+    /// Returns how many.
+    pub(crate) fn texture_slots_read_again(&self, read: &[u32], frame: u64) -> u64 {
+        if self.sampler {
+            return 0;
+        }
+        let null: Vec<u32> = read
+            .iter()
+            .copied()
+            .filter(|&slot| slot < self.count && crate::resource::evict::evicted_stamp(slot).is_some())
+            .collect();
+        if null.is_empty() {
+            return 0;
+        }
+        let mut queue = crate::lockmeter::lock("dh:textures", &self.textures);
+        for &slot in &null {
+            queue.changed(slot, frame, frame);
+        }
+        null.len() as u64
+    }
+
+    /// Slot marks (`crate::slotuse`): the host textures (by address) the
+    /// title slots `slots` show now, into `shown`.
+    pub(crate) fn shown_at(&self, slots: &[u32], shown: &mut std::collections::HashSet<usize>) {
+        use windows::core::Interface;
+        if self.sampler {
+            return;
+        }
+        for &slot in slots.iter().filter(|&&slot| slot < self.count) {
+            let kept = self.kept[(slot % KEPT_PIECES) as usize].lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(Some(resource)) = kept.get((slot / KEPT_PIECES) as usize) {
+                shown.insert(resource.as_raw() as usize);
+            }
+        }
+    }
+
+    /// Slot marks (`crate::slotuse`), for the texture pass come to title
+    /// slot `index` whose view is of title texture `texture` (address):
+    /// whether the slot is to stay null and leave the queue, because
+    /// eviction let that texture go while no shader read it
+    /// (`crate::resource::evict::went_unread`) and since then no shader read
+    /// this slot, the title did not touch it and no table covered it. The
+    /// slot is then noted as made null, so that a read brings it back.
+    pub(crate) fn texture_slot_parks(&self, index: u32, texture: usize, frame: u64) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(went) = crate::resource::evict::went_unread(texture) else {
+            return false;
+        };
+        if crate::slotuse::certain().is_none() {
+            return false;
+        }
+        let went = crate::resource::evict::evicted_stamp(index).map_or(went, |e| e.max(went));
+        let touched = u64::from(self.touched.get(index as usize).map_or(0, |t| t.load(Relaxed)));
+        let tabled = u64::from(self.tabled_stamp(index) & !TABLED_READ);
+        if crate::resource::evict::refill_wanted(went, touched, tabled)
+            || crate::slotuse::read_again(went, crate::slotuse::stamp(index))
+        {
+            return false;
+        }
+        let _ = frame;
+        crate::resource::evict::note_parked(index, went);
+        true
     }
 
     /// Title slot `index` was touched in `frame` ([`HostHeap::touched`]).
@@ -2022,9 +2122,16 @@ impl HostHeap {
         stamp != 0 && u64::from(now.wrapping_sub(stamp)) <= crate::resource::evict::TOUCH_FRAMES
     }
 
+    /// Whether title slot `index` was touched in frame `cutoff` or later.
+    fn touched_since(&self, index: u32, cutoff: u64) -> bool {
+        let stamp = self.touched.get(index as usize).map_or(0, |t| t.load(std::sync::atomic::Ordering::Relaxed));
+        u64::from(stamp) > cutoff
+    }
+
     /// For the texture pass while the card has no room: whether title slot
     /// `index`, made null by texture eviction, is to be made again all the
-    /// same, because the title touched it or a table covered it since
+    /// same, because the title touched it or a table covered it since, or a
+    /// shader was seen reading it (`crate::slotuse`)
     /// (within this frame's refills, `crate::resource::evict::refill_take`).
     pub(crate) fn texture_slot_refill(&self, index: u32, frame: u64) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
@@ -2033,7 +2140,9 @@ impl HostHeap {
         };
         let touched = u64::from(self.touched.get(index as usize).map_or(0, |t| t.load(Relaxed)));
         let tabled = u64::from(self.tabled_stamp(index) & !TABLED_READ);
-        crate::resource::evict::refill_wanted(evicted, touched, tabled) && crate::resource::evict::refill_take(index, frame)
+        (crate::resource::evict::refill_wanted(evicted, touched, tabled)
+            || crate::slotuse::read_again(evicted, crate::slotuse::stamp(index)))
+            && crate::resource::evict::refill_take(index, frame)
     }
 
     /// Makes host slot `index` null again, as it is before its view is
@@ -4288,6 +4397,21 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
         resource[12] &= !TARGET_DEPTH_UNORDERED;
         let texture = crate::resource::texture_at(address, &resource)?;
         Some(View::Shader(texture as usize, words))
+    }
+}
+
+/// The title texture (address) a shader view names, with nothing made for
+/// asking: the texture object of a view of one, or the resource already
+/// made for a texture the title placed in memory ([`placed_texture`]).
+pub(crate) fn texture_named(view: &View) -> Option<usize> {
+    match view {
+        View::Shader(texture, _) => Some(*texture),
+        &View::Placed(false, mut resource, ref desc) if resource[0] != 1 => {
+            resource[12] &= !0x7;
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            crate::resource::texture_at_made(address, &resource).map(|t| t as usize)
+        }
+        _ => None,
     }
 }
 

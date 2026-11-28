@@ -34,6 +34,10 @@ in [docs/linux.md](docs/linux.md); the scripts are in `scripts/linux/`
 - The watchdog and upscaler hooks come from
   **[ScarlettPort](https://github.com/ZigZagBoi1/ScarlettPort)**'s vendored
   runtime; the idea of a scripted pad file is theirs too.
+- Slot marks (`VICTORY_SLOT_FEEDBACK`: shaders note the heap slots they read,
+  so that texture eviction knows what is in use) follow the bindless feedback
+  of **[victory-memory-stack](https://github.com/skornuta/victory-memory-stack)**
+  by skornuta, written anew for this tree.
 
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
   contributors is the base of everything here: the loader, the runtime

@@ -58,7 +58,25 @@ use windows::core::{HSTRING, Interface, PCWSTR};
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Keeps the pipeline library and the early list in `dir` from now on.
+///
+/// A run whose shaders store slot marks (`VICTORY_SLOT_FEEDBACK=1`,
+/// `crate::slotuse`) keeps its own in the folder `slot-marks` under `dir`:
+/// its translations are others, and the usual library and lists are never
+/// read, replaced or trimmed by it. The lists start as copies of the usual
+/// ones (they name the title's pipelines, not the translations).
 pub fn use_pipeline_cache(dir: PathBuf) {
+    if crate::slotuse::on() {
+        let marks = dir.join("slot-marks");
+        if std::fs::create_dir_all(&marks).is_ok() {
+            for list in [EARLY_FILE, KILLERS_FILE] {
+                if !marks.join(list).exists() && dir.join(list).exists() {
+                    let _ = std::fs::copy(dir.join(list), marks.join(list));
+                }
+            }
+            let _ = DIR.set(marks);
+            return;
+        }
+    }
     let _ = DIR.set(dir);
 }
 
