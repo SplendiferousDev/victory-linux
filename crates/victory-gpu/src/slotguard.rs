@@ -412,7 +412,8 @@ pub(crate) fn line(frames: f64) {
          {:.1} runs taken and {:.0} slots sent back before their readers had finished, {:.1} tables refused; now {} slots kept and {} runs \
          out; tables looked at when given back (VICTORY_READER_CHECK): {:.1} slots a per-draw table was made in were \
          written again while its list held them ({:.1} of them now of another kind), {:.2} stages read a table at the \
-         title's own place past the host's title slots",
+         title's own place past the host's title slots; binds of stages that read a constant buffer at a table place \
+         their used-resource list does not name as one: {:.1} at a fixed place, {:.1} at a place worked out as they run",
         parts(),
         f(c[0]),
         f(c[1]),
@@ -429,6 +430,8 @@ pub(crate) fn line(frames: f64) {
         f(found[0]),
         f(found[1]),
         f(found[2]),
+        f(found[3]),
+        f(found[4]),
     );
 }
 
@@ -444,7 +447,8 @@ pub(crate) fn section(out: &mut String) {
          a submission in flight, {} runs cut from the ring, {} slots back to the ring with readers finished, {} runs taken and \
          {} slots sent back before their readers had finished, {} tables refused; tables looked at when given back: {} slots \
          written again while their list held them ({} of another kind now), {} stages read a table at the title's own place \
-         past the host's title slots",
+         past the host's title slots; binds of stages reading a constant buffer at a table place their used-resource list \
+         does not name as one: {} at a fixed place, {} at a place worked out as they run",
         parts(),
         if fault_test() { ", FAULT TEST early" } else { "" },
         c[0],
@@ -458,6 +462,8 @@ pub(crate) fn section(out: &mut String) {
         found[0],
         found[1],
         found[2],
+        found[3],
+        found[4],
     );
 }
 

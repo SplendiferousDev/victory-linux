@@ -1604,7 +1604,7 @@ mod tests {
             user_data: 4,
             slot: 1,
         };
-        let made = state.tables(&list, &[range], &[], &[(1, 8)], true, &[], &mut Vec::new());
+        let made = state.tables(&list, &[range], &[], &[(1, 8)], &[], true, &[], &mut Vec::new());
         let [(1, offset)] = made[..] else {
             panic!("one fresh table for root parameter 1, not {made:?}");
         };
@@ -1787,7 +1787,7 @@ mod tests {
                 slot: 1,
             })
             .collect();
-        let made = state.tables(&list, &used, &[], &[], true, &[], &mut Vec::new());
+        let made = state.tables(&list, &used, &[], &[], &[], true, &[], &mut Vec::new());
         let [(1, offset)] = made[..] else {
             panic!("one fresh table for root parameter 1, not {made:?}");
         };

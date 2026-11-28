@@ -1881,7 +1881,16 @@ impl State {
             if crate::readercheck::on() {
                 crate::readercheck::shader(&stage.shader.hash);
             }
-            let made = self.tables(list, &t.used, &t.host.root_indexed_views, &t.host.half_views, compute, &spans, &mut staged);
+            let made = self.tables(
+                list,
+                &t.used,
+                &t.host.root_indexed_views,
+                &t.host.half_views,
+                &t.host.constant_views,
+                compute,
+                &spans,
+                &mut staged,
+            );
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -4093,11 +4102,31 @@ impl State {
         used: &[UsedResource],
         indexed: &[RootIndexedView],
         half: &[(u8, u32)],
+        constant: &[(u8, u32)],
         compute: bool,
         spans: &[(u8, u32, u32)],
         staged: &mut Vec<(u64, u32)>,
     ) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
+        // `constant`: the table places the stage's code reads as constant
+        // buffers (`HostShader::constant_views`), whatever its
+        // used-resource list names there. With `VICTORY_SLOT_GUARD` on
+        // (`reach`) their tables are made afresh and long enough to hold
+        // them, and their slots are made constant buffer views; with the
+        // reader check the ones the list does not name are counted.
+        let reach = crate::slotguard::parts() != 0;
+        if crate::readercheck::on() {
+            for &(slot, dword) in constant {
+                let named = dword != u32::MAX
+                    && used
+                        .iter()
+                        .filter(tables)
+                        .any(|u| u.slot == slot && u.kind == ResourceType::Cbv && u.table_offset_dwords / 8 == dword / 8);
+                if !named {
+                    crate::readercheck::unnamed(slot, (dword != u32::MAX).then_some(dword / 8), reach, self.pipeline);
+                }
+            }
+        }
         let mut fresh_mask: u64 = 0;
         let mut fresh_extra: Vec<u8> = Vec::new();
         let mark_fresh = |mask: &mut u64, extra: &mut Vec<u8>, slot: u8| {
@@ -4116,6 +4145,11 @@ impl State {
         };
         for u in used.iter().filter(tables).filter(|u| u.kind == ResourceType::Cbv) {
             mark_fresh(&mut fresh_mask, &mut fresh_extra, u.slot);
+        }
+        if reach {
+            for &(slot, _) in constant.iter().filter(|c| c.1 != u32::MAX) {
+                mark_fresh(&mut fresh_mask, &mut fresh_extra, slot);
+            }
         }
         // The view shown in place of the title's at dword `at` of the table
         // in root parameter `slot`, if the shader moves halves there and
@@ -4231,10 +4265,19 @@ impl State {
             );
             selected.sort_unstable();
             selected.dedup();
+            // The entries the code reads as constant buffers (`reach`).
+            let mut reads: Vec<u32> = if reach {
+                constant.iter().filter(|c| c.0 == slot && c.1 != u32::MAX).map(|c| c.1 / 8).collect()
+            } else {
+                Vec::new()
+            };
+            reads.sort_unstable();
+            reads.dedup();
             let n = entries
                 .iter()
                 .map(|u| u.table_offset_dwords / 8)
                 .chain(selected.last().copied())
+                .chain(reads.last().copied())
                 .max()
                 .unwrap_or(0)
                 + 1;
@@ -4273,11 +4316,17 @@ impl State {
             halves.dedup();
             // And which entries it reads as constant buffers over another
             // view (`VICTORY_TABLE_KEY_CBV`; off, none).
-            let forced = if crate::tablekey::key_cbv() {
+            let mut forced = if crate::tablekey::key_cbv() {
                 crate::tablekey::forced(&entries, n, |k| crate::descriptor::view(table + u64::from(k) * 32))
             } else {
                 Vec::new()
             };
+            if !reads.is_empty() {
+                let other = |k: &u32| !matches!(crate::descriptor::view(table + u64::from(*k) * 32), Some(View::Constant(..)));
+                forced.extend(reads.iter().copied().filter(|k| *k < n).filter(other));
+                forced.sort_unstable();
+                forced.dedup();
+            }
             let key = crate::tablekey::key(table_hash(table, n), &halves, &forced);
             let same = self.fresh_tables.get(&key).filter(|f| {
                 f.table == table
@@ -4348,6 +4397,7 @@ impl State {
                 Some(views) => {
                     let constant = |(k, view): (usize, &Option<View>)| {
                         matches!(view, Some(View::Constant(..)))
+                            || reads.binary_search(&(k as u32)).is_ok()
                             || entries
                                 .iter()
                                 .find(|u| u.table_offset_dwords / 8 == k as u32)
@@ -4396,7 +4446,7 @@ impl State {
                 // its bytes, as the console's descriptor would.
                 let view = match view {
                     Some(View::Constant(..)) => view,
-                    _ if !used.is_some_and(|u| u.kind == ResourceType::Cbv) => view,
+                    _ if !used.is_some_and(|u| u.kind == ResourceType::Cbv) && reads.binary_search(&k).is_err() => view,
                     Some(other) => match crate::descriptor::host::buffer_range(&other) {
                         Some((address, len)) if len > 0 => {
                             crate::slotkind::table_constant(crate::slotkind::TableEntry::BufferView);
