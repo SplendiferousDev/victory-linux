@@ -78,6 +78,7 @@ impl Meter {
         }
         crate::shadow::exact_line(frames);
         crate::slotkind::line(frames);
+        crate::slotguard::line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
         card_clock_line(frames, ms);

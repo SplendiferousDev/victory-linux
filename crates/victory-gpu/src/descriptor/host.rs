@@ -116,6 +116,15 @@ pub(crate) struct HostHeap {
     /// 45), under the lock all of them need. (A free run that lies across
     /// the place the search starts from is seen by neither.)
     too_long: std::sync::atomic::AtomicU32,
+    /// With `VICTORY_SLOT_GUARD`: the dynamic runs that are out with a
+    /// shape, and the ones given back and kept for tables of their shape
+    /// (`crate::slotguard`). Taken before `next`, never under it.
+    guard: Mutex<crate::slotguard::Pools>,
+    /// Per dynamic slot: how often it was written ([`HostHeap::wrote`]). A
+    /// list that made a table there looks at it again when it gives the
+    /// slots back (`VICTORY_READER_CHECK`): a count that moved means
+    /// something wrote a slot the list still held.
+    writes: Vec<std::sync::atomic::AtomicU32>,
     /// View heaps: the bytes per element of the buffer view at each title
     /// slot, for shaders that pick a buffer by an index they compute
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
@@ -1139,6 +1148,9 @@ impl HostHeap {
             }
         };
         let extra = if sampler { 0 } else { DYNAMIC };
+        // (Read here so that a fault test without its confirmation ends
+        // the run before anything is drawn.)
+        let _ = crate::slotguard::fault_test();
         // A view heap ends at the null slot shaders clamp view indices to
         // (`probe_view_limit`), whatever the title's own count: the title's
         // slots, then the dynamic ones, then null up to and with that slot.
@@ -1223,6 +1235,8 @@ impl HostHeap {
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
+            guard: Mutex::default(),
+            writes: (0..extra).map(|_| std::sync::atomic::AtomicU32::new(0)).collect(),
             strides,
             buffers: Mutex::default(),
             changed: Mutex::default(),
@@ -2263,6 +2277,19 @@ impl HostHeap {
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
+        // A run taken with a shape (`VICTORY_SLOT_GUARD`) is kept for
+        // tables of that shape, with the submissions started so far.
+        if crate::slotguard::any() {
+            crate::slotguard::give(&self.guard, at, n, crate::slotguard::parts(), crate::host::started(), |at, n| {
+                self.release_now(at, n);
+            });
+            return;
+        }
+        self.release_now(at, n);
+    }
+
+    /// Gives the `n` dynamic slots from the `at`-th back to the ring.
+    fn release_now(&self, at: u32, n: u32) {
         let mut guard = crate::lockmeter::lock("dh:next", &self.next);
         let end = (at + n).min(self.dynamic) as usize;
         if let Some(slots) = guard.1.get_mut(at as usize..end) {
@@ -2270,7 +2297,48 @@ impl HostHeap {
             self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
             self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
             slots.fill(false);
+            // The fault test: the search starts at what was just given back.
+            if crate::slotguard::fault_test() {
+                guard.0 = at;
+            }
         }
+    }
+
+    /// As [`HostHeap::dynamic`] for a table of `shape`
+    /// (`crate::slotguard::shape`): with `VICTORY_SLOT_GUARD` a run given
+    /// back by a table of the same shape whose readers have finished, else
+    /// a run cut from the ring.
+    pub(crate) fn dynamic_shaped(&self, n: u32, shape: u64) -> Option<u32> {
+        let parts = crate::slotguard::parts();
+        if parts == 0 {
+            // Off (in turn): what was kept goes back to the ring.
+            if crate::slotguard::any() {
+                crate::slotguard::flush(&self.guard, |at, n| self.release_now(at, n));
+            }
+            return self.dynamic(n);
+        }
+        if self.sampler || n == 0 || n > self.dynamic {
+            return None;
+        }
+        crate::slotguard::take(
+            &self.guard,
+            n,
+            shape,
+            parts,
+            crate::host::finished(),
+            |n| self.dynamic(n).map(|index| index - self.count),
+            |at, n| self.release_now(at, n),
+        )
+        .map(|at| self.count + at)
+    }
+
+    /// How often dynamic slot `index` was written, with its kind in the two
+    /// low bits ([`HostHeap::writes`]); 0 for a title slot.
+    pub(crate) fn stamp_of(&self, index: u32) -> u32 {
+        let Some(count) = index.checked_sub(self.count).and_then(|at| self.writes.get(at as usize)) else {
+            return 0;
+        };
+        count.load(std::sync::atomic::Ordering::Relaxed) << 2 | u32::from(self.kind_of(index))
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -2484,6 +2552,9 @@ impl HostHeap {
             return;
         };
         let now = if constant { SLOT_CONSTANT } else { SLOT_OTHER };
+        if let Some(count) = index.checked_sub(self.count).and_then(|at| self.writes.get(at as usize)) {
+            count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         // Read first: nearly every write keeps the kind, and a swap would
         // take the line from the threads writing neighbouring slots. (The
         // same as a swap that stored what was there.)

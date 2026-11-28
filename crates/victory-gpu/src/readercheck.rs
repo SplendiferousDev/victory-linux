@@ -151,6 +151,91 @@ pub(crate) fn rerun() {
     });
 }
 
+/// Since the last line (`crate::slotguard::line`) and since the start:
+/// dynamic slots a list made a table in that were written again before
+/// the list gave them back; of them, the ones that then held another kind;
+/// stages that read a table at the title's own place past the host heap's
+/// title slots.
+static LANDING: [[AtomicU64; 3]; 2] = [const { [const { AtomicU64::new(0) }; 3] }; 2];
+
+/// Whether a line may be said now ([`LINES_A_SECOND`]).
+fn say_now() -> bool {
+    let now = EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs();
+    let mut said = SAID.load(Ordering::Relaxed);
+    loop {
+        let (say, next) = may_say(said, now);
+        if !say {
+            return false;
+        }
+        match SAID.compare_exchange_weak(said, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return true,
+            Err(seen) => said = seen,
+        }
+    }
+}
+
+/// Dynamic slot `index`, entry `entry` of a table of `n` slots that a list
+/// of title pipeline `pipeline` made, was written again before the list
+/// gave it back: its stamp (`HostHeap::stamp_of`: writes, and the kind in
+/// the two low bits) was `was` when made and is `now`. The list's draws
+/// read the slot as it is now. `when`: what looked.
+pub(crate) fn rewritten(index: u32, entry: u32, n: u32, was: u32, now: u32, when: &'static str, pipeline: usize) {
+    let (kind_was, kind_now) = ((was & 3) as u8, (now & 3) as u8);
+    for c in &LANDING {
+        c[0].fetch_add(1, Ordering::Relaxed);
+        if kind_was != kind_now {
+            c[1].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    if !say_now() {
+        return;
+    }
+    tracing::warn!(
+        index,
+        entry,
+        table_slots = n,
+        made_as = kind_name(kind_was),
+        holds = kind_name(kind_now),
+        writes_since = (now >> 2).wrapping_sub(was >> 2),
+        pipeline = format_args!("{pipeline:#x}"),
+        when,
+        "reader check: a per-draw view heap slot was written again while the list that made a table in it still read it          (VICTORY_READER_CHECK)"
+    );
+}
+
+/// A stage reads the table in root parameter `slot` at the title's own
+/// place, title slot `index`, which lies past the host heap's `count`
+/// title slots: its reads land in per-draw slots made for other tables, or
+/// in the null slot at the heap's end.
+pub(crate) fn past(index: u32, count: u32, slot: u8, pipeline: usize) {
+    for c in &LANDING {
+        c[2].fetch_add(1, Ordering::Relaxed);
+    }
+    if !say_now() {
+        return;
+    }
+    SHADER.with_borrow(|shader| {
+        tracing::warn!(
+            index,
+            count,
+            root_parameter = slot,
+            pipeline = format_args!("{pipeline:#x}"),
+            shader = shader.as_str(),
+            "reader check: a stage reads a table at the title's own place past the host heap's title slots: what it reads              there are per-draw slots made for other tables, or the null slot (VICTORY_READER_CHECK)"
+        );
+    });
+}
+
+/// For `crate::slotguard::line`: [`LANDING`] since the last call.
+pub(crate) fn take_landing() -> [u64; 3] {
+    [0, 1, 2].map(|i| LANDING[0][i].swap(0, Ordering::Relaxed))
+}
+
+/// For the reports: [`LANDING`] since the start.
+pub(crate) fn landing_totals() -> [u64; 3] {
+    [0, 1, 2].map(|i| LANDING[1][i].load(Ordering::Relaxed))
+}
+
 /// For the slot kind line: mismatches by path, then reruns, since the last
 /// call.
 pub(crate) fn take() -> [u64; 4] {
@@ -187,6 +272,21 @@ mod tests {
         }
         assert_eq!(lines, LINES_A_SECOND);
         assert!(may_say(said, 8).0, "a new second says again");
+    }
+
+    /// Synthetic stamps: slot 9 made as a constant buffer view (kind 1,
+    /// 4 writes), found a texture view (kind 2) after 2 more writes; slot
+    /// 10 written again with its kind kept.
+    #[test]
+    fn slots_written_under_their_list_are_counted_by_whether_the_kind_moved() {
+        let before = landing_totals();
+        rewritten(9, 1, 4, 4 << 2 | 1, 6 << 2 | 2, "test", 0);
+        rewritten(10, 2, 4, 4 << 2 | 1, 5 << 2 | 1, "test", 0);
+        past(800_000, 737_855, 3, 0);
+        let after = landing_totals();
+        assert!(after[0] >= before[0] + 2);
+        assert!(after[1] >= before[1] + 1);
+        assert!(after[2] >= before[2] + 1);
     }
 
     #[test]

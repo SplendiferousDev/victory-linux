@@ -533,6 +533,21 @@ pub(crate) fn release_dynamic(heap: usize, id: u64, first: u32, n: u32) {
     }
 }
 
+/// Calls `f` with the host heap behind the title heap at `heap`, if that
+/// heap is still there and `id` says it is the same one
+/// ([`release_dynamic`]).
+#[cfg(windows)]
+pub(crate) fn with_host(heap: usize, id: u64, f: impl FnOnce(&host::HostHeap)) {
+    let heaps = crate::lockmeter::read("de:SHADER_HEAPS", &SHADER_HEAPS);
+    if heaps.iter().any(|&(_, _, h)| h == heap)
+        // SAFETY: registered heaps are live (removed when dropped).
+        && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
+        && host.id() == id
+    {
+        f(host);
+    }
+}
+
 #[cfg(windows)]
 impl Drop for Heap {
     fn drop(&mut self) {

@@ -224,6 +224,7 @@ pub(crate) fn section(out: &mut String) {
         r[2],
         r[3],
     );
+    crate::slotguard::section(out);
 }
 
 #[cfg(test)]
