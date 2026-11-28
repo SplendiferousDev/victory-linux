@@ -2960,6 +2960,9 @@ impl State {
             // Slots whose texture's memory the runtime mapped, unmapped or
             // wrote since the last pass are due again.
             host.texture_slots_remapped(frame);
+            // Textures picked for eviction (`crate::resource::evict`): their
+            // slots made null and due again.
+            host.texture_slots_evicted(frame);
             // Levels on demand: the slots of textures whose first level
             // with memory changed since the last pass are made again from
             // it.
@@ -3192,7 +3195,9 @@ impl State {
             // had its colour only in the launches that entered the world
             // under the line. `VICTORY_REUPLOAD_WHEN_FULL=0`: refused, as
             // before.
-            if !room {
+            // (A slot texture eviction made null that the title touched
+            // again goes past the hold: `crate::resource::evict`.)
+            if !room && !host.texture_slot_refill(index, frame) {
                 let has_its_texture = reupload_when_full()
                     && heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle));
                 if !has_its_texture {

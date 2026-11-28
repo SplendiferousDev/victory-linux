@@ -148,6 +148,11 @@ pub(crate) struct HostHeap {
     /// one of them stood in the queue of textures picked by index, ahead
     /// of or behind the ones shaders do pick by index.
     tabled: Vec<std::sync::atomic::AtomicU32>,
+    /// Per title slot, the frame (plus one; 0: never) in which the title
+    /// last wrote a texture view into it, or the runtime mapped, unmapped
+    /// or wrote memory under its texture: what texture eviction sees of a
+    /// slot shaders pick by index (`crate::resource::evict`).
+    touched: Vec<std::sync::atomic::AtomicU32>,
     /// Per title slot, the frame (plus one; 0: never) in which a draw last
     /// took a buffer or constant view of it from a table
     /// ([`HostHeap::buffer_slot_tabled`]).
@@ -1224,6 +1229,9 @@ impl HostHeap {
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
+            touched: (0..if sampler { 0 } else { count })
+                .map(|_| std::sync::atomic::AtomicU32::new(0))
+                .collect(),
             tabled_buffers: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
@@ -1573,6 +1581,9 @@ impl HostHeap {
         slots.sort_unstable();
         slots.dedup();
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
+        for &slot in &slots {
+            self.touch(slot, frame);
+        }
         let mut textures = crate::lockmeter::lock("dh:textures", &self.textures);
         for &slot in &slots {
             textures.changed(slot, frame, frame + 1);
@@ -1613,6 +1624,9 @@ impl HostHeap {
         slots.sort_unstable();
         slots.dedup();
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
+        for &slot in &slots {
+            self.touch(slot, frame);
+        }
         let held = slots.len();
         let mut textures = crate::lockmeter::lock("dh:textures", &self.textures);
         // Uploaded before: out of the queue, or in it after an upload (in
@@ -1914,6 +1928,112 @@ impl HostHeap {
         true
     }
 
+    /// Texture eviction (`crate::resource::evict`): the title slots that
+    /// show the host textures picked since the last pass are made null
+    /// again, as [`HostHeap::texture_slot_gone`] does for a texture whose
+    /// memory went, and are due again from the next frame, as memory mapped
+    /// under them would make them: the queue makes and fills the copy anew
+    /// when the card has room. A texture is taken only if every slot that
+    /// shows it is a title slot no draw read through a table lately (one in
+    /// a list's table copy, or read by draws, stays as it is). The slots'
+    /// references are retired by [`HostHeap::keep`]: a submission in flight
+    /// that read a slot before keeps its texture. Returns the slots made
+    /// null.
+    pub(crate) fn texture_slots_evicted(&self, frame: u64) -> usize {
+        use windows::core::Interface;
+        if self.sampler {
+            return 0;
+        }
+        let wanted = crate::resource::evict::take_wanted();
+        if wanted.is_empty() {
+            return 0;
+        }
+        let by_address: std::collections::HashMap<usize, usize> =
+            wanted.iter().enumerate().map(|(i, w)| (w.0.as_raw() as usize, i)).collect();
+        // The slots showing each, one piece at a time.
+        let mut found: Vec<Vec<u32>> = vec![Vec::new(); wanted.len()];
+        for (piece, kept) in self.kept.iter().enumerate() {
+            let kept = kept.lock().unwrap_or_else(|e| e.into_inner());
+            for (at, slot) in kept.iter().enumerate() {
+                if let Some(resource) = slot
+                    && let Some(&i) = by_address.get(&(resource.as_raw() as usize))
+                {
+                    found[i].push(at as u32 * KEPT_PIECES + piece as u32);
+                }
+            }
+        }
+        let (mut textures, mut left) = (0u64, 0u64);
+        let mut unmade: Vec<u32> = Vec::new();
+        {
+            let mut made = locked(&self.made, 4);
+            for (i, slots) in found.iter().enumerate() {
+                if !crate::resource::evict::slots_free(slots, self.count, |s| {
+                    self.tabled_lately(s, frame) || self.touched_lately(s, frame)
+                }) {
+                    left += 1;
+                    continue;
+                }
+                let address = wanted[i].0.as_raw() as usize;
+                let before = unmade.len();
+                for &slot in slots {
+                    // Still showing it (slots are made under `made`'s lock,
+                    // held here).
+                    let still = self.kept[(slot % KEPT_PIECES) as usize]
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get((slot / KEPT_PIECES) as usize)
+                        .is_some_and(|k| k.as_ref().is_some_and(|r| r.as_raw() as usize == address));
+                    if still {
+                        self.unmake(&mut made, slot);
+                        unmade.push(slot);
+                    }
+                }
+                textures += u64::from(unmade.len() > before);
+            }
+        }
+        if !unmade.is_empty() {
+            crate::resource::evict::note_evicted(&unmade, frame);
+            let mut queue = crate::lockmeter::lock("dh:textures", &self.textures);
+            for &slot in &unmade {
+                queue.changed(slot, frame, frame + 1);
+            }
+        }
+        crate::resource::evict::slots_done(wanted, textures, unmade.len() as u64, left);
+        unmade.len()
+    }
+
+    /// Title slot `index` was touched in `frame` ([`HostHeap::touched`]).
+    fn touch(&self, index: u32, frame: u64) {
+        if let Some(t) = self.touched.get(index as usize) {
+            let now = (frame as u32).wrapping_add(1);
+            if t.load(std::sync::atomic::Ordering::Relaxed) != now {
+                t.store(now, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Whether title slot `index` was touched within the last
+    /// `crate::resource::evict::TOUCH_FRAMES` frames before `frame`.
+    fn touched_lately(&self, index: u32, frame: u64) -> bool {
+        let stamp = self.touched.get(index as usize).map_or(0, |t| t.load(std::sync::atomic::Ordering::Relaxed));
+        let now = (frame as u32).wrapping_add(1);
+        stamp != 0 && u64::from(now.wrapping_sub(stamp)) <= crate::resource::evict::TOUCH_FRAMES
+    }
+
+    /// For the texture pass while the card has no room: whether title slot
+    /// `index`, made null by texture eviction, is to be made again all the
+    /// same, because the title touched it or a table covered it since
+    /// (within this frame's refills, `crate::resource::evict::refill_take`).
+    pub(crate) fn texture_slot_refill(&self, index: u32, frame: u64) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(evicted) = crate::resource::evict::evicted_stamp(index) else {
+            return false;
+        };
+        let touched = u64::from(self.touched.get(index as usize).map_or(0, |t| t.load(Relaxed)));
+        let tabled = u64::from(self.tabled_stamp(index) & !TABLED_READ);
+        crate::resource::evict::refill_wanted(evicted, touched, tabled) && crate::resource::evict::refill_take(index, frame)
+    }
+
     /// Makes host slot `index` null again, as it is before its view is
     /// made: a null view of the kind it held.
     fn unmake(&self, made: &mut [u64], index: u32) {
@@ -2002,6 +2122,9 @@ impl HostHeap {
         // Made now by a draw of this frame that read it through a table:
         // up to date.
         let read_now = seen && stamp == now | TABLED_READ;
+        if texture {
+            self.touch(index, frame);
+        }
         let mut textures = crate::lockmeter::lock("dh:textures", &self.textures);
         if texture && !read_now {
             let due = if lately && !seen {

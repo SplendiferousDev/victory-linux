@@ -142,6 +142,11 @@ impl Governor {
 static LEVEL: AtomicU8 = AtomicU8::new(0);
 static GOVERNOR: Mutex<Governor> = Mutex::new(Governor { level: 0, changed: None, calm_since: None });
 
+/// The governor's level now (0: nothing held).
+pub(crate) fn level() -> u8 {
+    LEVEL.load(Ordering::Relaxed)
+}
+
 /// A kind of placement the governor may hold back (its level).
 #[derive(Clone, Copy)]
 pub(crate) enum Hold {
