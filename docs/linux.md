@@ -92,6 +92,10 @@ scripts/linux/run.sh --game <your game folder> --exe <file name of the title> \
 ```
 
 - The log goes to `~/.local/state/victory-linux/logs/` and to the terminal.
+- `--preset <name>` (or `VICTORY_PRESET`) sets a group of `VICTORY_*` switches
+  first; see "Tested configuration" below. Default `none` changes nothing.
+  `--print-env` runs every check, prints the environment and the command, and
+  stops: nothing is started and no directory is made.
 - `--diag` uses the diagnostics build, made with
   `cargo xwin build --profile diag -p victory --features diagnostics --target x86_64-pc-windows-msvc`.
   It enables `VICTORY_CAPTURE` and related variables.
@@ -329,6 +333,155 @@ turns it off; with `VICTORY_HOST_FAULT_FILE` already set, `run.sh` starts no
 watcher and the layer reads the given file (run `fault-watch.sh <file>`
 yourself). Without journal access `run.sh` warns and runs without it.
 
+## Tested configuration
+
+The project's own runs use one machine class: a PC with **16 GB of RAM and an
+8 GB NVIDIA card (RTX 3060 Ti class)**, 6 cores, Proton with the patched
+wineserver (see below), the `series-s` console profile, the card's driver
+cache warmed once. `run.sh --preset tested-8gb` reproduces the switches of
+that setup:
+
+```sh
+scripts/linux/run.sh --game <your game folder> --exe <file name of the title> \
+    --preset tested-8gb --scope --memory-high 13G --memory-max 14G --swap-max 24G
+```
+
+The preset sets these variables, unless you have set them yourself (your value
+wins, and the launcher prints which ones it kept; so does `--print-env`):
+`VICTORY_TIGHT_MEMORY=1`, `VICTORY_SNAPSHOT_POOL_MB=256`,
+`VICTORY_TEXTURE_READ_KEEP_MB=16`, `VICTORY_BACK_OWN_VIEW=1`,
+`VICTORY_ASYNC_SUBMIT=1`, `VICTORY_QUEUE2=1`, `VICTORY_JOIN_PARTS=1`,
+`VICTORY_CARD_REHASH_RUNS=1`, `VICTORY_INDIRECT_GATHER=1`,
+`VICTORY_MEM_SUBPAGE=1`, `VICTORY_CARD_BUFFERS_MIN_KB=64`,
+`VICTORY_CARD_BUFFERS_MB=1280`, `VICTORY_CARD_HASH_LEN=1`,
+`VICTORY_INDIRECT_WINDOW=1`, `VICTORY_VRAM_HEADROOM_MB=768`,
+`VICTORY_ASYNC_PRESENT=1`, `VICTORY_LOOKUP_CACHE=1`,
+`VICTORY_TEXTURE_BUDGET_EVICT=1`, `VICTORY_WINDOW_TAILS=1`,
+`VICTORY_WINDOW_KB=256` and `VICTORY_PIPELINE_HOLD=1` (see "Tuning for 16 GB
+machines"). It also picks `--console series-s` unless you give
+`--console`. Every one of these is off by default in the code; the preset is
+how the tested set is turned on together. Not in the preset, because they are
+yours: the pipeline archive (`VICTORY_SHADER_ARCHIVE`, built offline by
+`victory warm` and `victory precompile-graphics`) and the memory limits.
+
+What to expect on that class of machine: the opening scene runs at about
+**9 frames a second** (about 110 ms a frame) once the world has loaded. That is
+not playable. Several runs in a row of 7 minutes or more in the world were
+clean; a faulting run does happen (next sections), and a run started right
+after another one has faulted more often (leave a few minutes between runs).
+A bigger card and more RAM are what the memory sections below are short of;
+on another vendor or size the preset is a starting point, not a promise:
+`VICTORY_CARD_BUFFERS_MB`, `VICTORY_VRAM_HEADROOM_MB` and the window switches
+depend on the card's memory.
+
+### Before the first run, a checklist
+
+| Item | Where |
+|---|---|
+| Prefix with Microsoft's `d3dcompiler_47` and `d3dcompiler_47=n` in the overrides | `setup.sh` step 3; `run.sh` sets the override |
+| `vm.max_map_count` of 1048576 or more, `/dev/ntsync` | `run.sh` warns at every start; fix in "Running" |
+| Patched wineserver (and ntdll) | `build-wine.sh`; `run.sh` uses the tree automatically, `--wineserver <path>` otherwise |
+| Driver shader cache of its own, 12 GB, no clean-up | automatic: `__GL_SHADER_DISK_CACHE_PATH`, `_SIZE`, `_SKIP_CLEANUP` (and Mesa's) |
+| Fault watcher | automatic: `fault-watch.sh`, see "GPU faults and recovery" |
+| Memory guard | `--scope` with limits, or a unit (below); optional but wanted |
+| Swap | zram plus a swap file; see the ballast note below |
+
+A systemd user unit does the same as `--scope` and survives your terminal. It
+is an example; adjust the sizes and paths, and do not run the title from a
+slice that has a smaller memory limit (an editor's or agent's):
+
+```ini
+# ~/.config/systemd/user/victory.slice
+[Slice]
+MemoryHigh=13G
+MemoryMax=14848M
+MemorySwapMax=24G
+```
+
+```sh
+systemd-run --user --unit=victory-game --slice=victory.slice --collect \
+    -p OOMScoreAdjust=900 -p WorkingDirectory=<a directory outside the repository> \
+    scripts/linux/run.sh --game ... --exe ... --preset tested-8gb
+```
+
+Swap ballast (idea, not shipped): zram is fast but its compressed store
+takes RAM, and the title's pinned host copies leave little. On a 16 GB machine
+a root user can cap zram (`mem_limit`) so the rest goes to a disk swap file.
+Without root, a small program can fill most of zram's slots with same-filled
+pages (they take a slot but no RAM), so further swap goes to the file. It was
+used in the project's runs, is not part of the repository, and the launcher
+never starts it; setting `mem_limit` on the zram device as root is the clean
+way.
+
+## Memory on 16 GB
+
+The title's host copies of its memory (windows, card copies, texture copies)
+are driver-pinned buffers, so on a 16 GB machine with an 8 GB card they decide
+whether the run lives. What each switch of the preset does for memory (default
+in the code in brackets; all are off or unset unless noted):
+
+| Switch | What it does |
+|---|---|
+| `VICTORY_TIGHT_MEMORY=1` | A mode for short memory: smaller spare pools, windows cut on a 1 MiB grid, windows in upload heaps while the card has room. A switch you set keeps your value. |
+| `VICTORY_WINDOW_KB=256` (4096, or 1024 in the tight mode) | The grid a window of title memory outside a buffer is cut on, in KiB: less memory nothing reads is held. |
+| `VICTORY_WINDOW_TAILS=1` (off) | A window begins at the ask's 256 KiB step instead of its cell's start; pays only with a grid under 4096. About 1 GB less pinned memory in the project's measurement. |
+| `VICTORY_VRAM_HEADROOM_MB=768` (off) | The card's memory budget falls while a run goes on; this plans placements against budget minus this many MB and, over the line, holds back (in order) windows on the card, card copies, new texture copies. It frees nothing itself. |
+| `VICTORY_TEXTURE_BUDGET_EVICT=1` (off) | With the headroom switch: while the governor is at its top level and use is over the line, host copies of textures no list holds are let go, least recently used first. Does nothing without `VICTORY_VRAM_HEADROOM_MB`. |
+| `VICTORY_CARD_BUFFERS_MIN_KB=64`, `VICTORY_CARD_BUFFERS_MB=1280` (1 MiB; 1024) | Title buffers of at least this size get a copy in the card's memory, up to that many MB in all: smaller ones are read over the bus. |
+| `VICTORY_CARD_HASH_LEN=1` (off: whole) | The card's change check hashes the buffer's own length, not the whole rounded-up copy. |
+| `VICTORY_SNAPSHOT_POOL_MB`, `VICTORY_TEXTURE_READ_KEEP_MB` (512; 16 in tight mode) | Caps on spare snapshot and texture read buffers kept resident. |
+
+`VICTORY_AT_BUDGET_MARGIN_MB` (32) and `VICTORY_AT_BUDGET_EXIT=<lines>` (0, off)
+make the memory line warn, and optionally end the run, when the card's memory
+stands at its budget. Not in the preset: the NVIDIA driver once failed inside
+its address-space records at that point (next section).
+
+## GPU faults and recovery
+
+A fault of the card (an NVIDIA `Xid 13` or `31`, or amdgpu's ring timeout,
+reset or page fault) is in the kernel's log, not in anything Wine can see.
+`run.sh` starts `scripts/linux/fault-watch.sh` (disable with
+`--no-fault-watch`), which writes each fault line to `<log name>.faults` in the
+logs directory; `VICTORY_HOST_FAULT_FILE` (set by the launcher) makes the layer
+read it. The first fault switches off the paths under suspicion
+(`VICTORY_INDIRECT_WINDOW=1`'s windows among them) for the rest of the run and
+puts a `WARN` line in the log. See "The card's faults from the kernel's log"
+for the details and for the journal access it needs.
+
+On the NVIDIA lines `intermapRegisterDmaMapping: Failed to insert new mapping
+node` and `gpu_vaspace.c` assertions the layer ends the process at once,
+without its exit handlers (`VICTORY_DRIVER_BROKEN_EXIT`, on by default; `=0`
+keeps running). Going on after those lines once hung the kernel driver and the
+desktop; the early exit trades the run for a machine that stays up. After a
+fault: check `journalctl -k --since "-10 min" | grep -E 'Xid|NVRM'`, and wait
+a few minutes before the next start (a run started right after a fault faults
+more often).
+
+Re-warming is rarely needed. A fault, a kill or the early exit does not lose
+the pipeline caches: the layer's library is written atomically, vkd3d-proton
+merges its cache at the next start and the driver appends as it goes. What
+does lose them: changing the vkd3d-proton DLLs (the pipeline library and the
+driver's compiled code are keyed by them), a new build that changes shader
+output, and any other program using the driver's default cache (the launcher
+gives the title a directory of its own, so tests and desktop programs cannot
+wipe it; give tools and test binaries their own `__GL_SHADER_DISK_CACHE_PATH`
+as well). Only then run `victory warm` and `victory precompile-graphics`
+again. A start with a cold cache shows as a long hold at the start screen
+(minutes) and compute pipelines taking seconds each; the stall report
+(below) may fire during it.
+
+## Diagnostic switches
+
+All off unless noted; they cost time, so leave them off for speed
+measurements.
+
+| Switch | Default | What it gives |
+|---|---|---|
+| `VICTORY_MEM_SITES=1` | off | Host objects alive by the code that made them: one line every 10 s (counts and MB per site), to find what holds memory. |
+| `VICTORY_FRAME_TIMELINE=1` | off | Stamps a frame's hand-offs (title recording, preparing, card, present); medians in the log. Costs a few ms a frame. |
+| `VICTORY_READER_CHECK=1` | off | At each bind, counts reads of view-heap slots as a constant buffer that hold another kind of view (the cause of the type 2 fault); reported with the slot-kind lines. |
+| `VICTORY_STALL_REPORT=<seconds>` | 15 | One `STALL REPORT` warning when no frame was presented for that long (`0` or `off` disables it). Expect false alarms during a cold pipeline load. |
+
 ## Measuring a run
 
 `run.sh --measure <file>` samples once a second while the title runs and
@@ -354,7 +507,7 @@ Verified on a machine with 16 GB of RAM, an 8 GB card and an NVIDIA driver:
 - On a machine short of cores, the pipelines started early (the ones earlier
   runs drew with) can take minutes to load and compile. If the world loads
   meanwhile, its pipelines wait behind them and the picture stays black.
-  `VICTORY_PIPELINE_HOLD=1` (off by default; `run.sh` does not set it) holds
+  `VICTORY_PIPELINE_HOLD=1` (off by default; `--preset tested-8gb` sets it) holds
   the title's input until they are made: pads and keyboard stay connected
   but report no buttons, sticks or keys, so the title keeps running at its
   first screen that waits for a button. Scripted pad steps are queued and
