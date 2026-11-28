@@ -136,12 +136,26 @@ pub(crate) fn hand_out<T>(
     answer(kind, iid, Some(Box::into_raw(object).cast()), out)
 }
 
+/// Releases a reference of ours ([`add_ref`]) as the title would: through
+/// the object's own table.
+#[cfg(windows)]
+pub(crate) fn release_by_table(this: This) -> u32 {
+    // SAFETY: `this` is one of our objects; every table has `Release` third.
+    let release = unsafe { *(*this).functions.add(2) };
+    // SAFETY: the slot's signature.
+    let release = unsafe { std::mem::transmute::<*const (), extern "system" fn(This) -> u32>(release) };
+    release(this)
+}
+
 /// Release for objects made by [`hand_out`]: the last reference frees it.
 pub(crate) fn release_boxed<T>(this: This) -> u32 {
     // SAFETY: `this` is the header of a boxed `T`.
     let refs = &unsafe { &*this }.refs;
     match refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)) {
         Ok(1) => {
+            // List calls written down may name it through a descriptor.
+            #[cfg(windows)]
+            crate::thin::before_free();
             private_data().retain(|&(object, _), _| object != this as usize);
             // SAFETY: that was the last reference to a `Box<T>`.
             drop(unsafe { Box::from_raw(this.cast_mut().cast::<T>()) });

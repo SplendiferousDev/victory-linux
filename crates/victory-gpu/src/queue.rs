@@ -1179,6 +1179,9 @@ fn execute_now(this: This, count: u32, lists: *const This) {
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        // With `VICTORY_THIN=1`: what the title recorded is all on the host
+        // lists before anything looks at them.
+        crate::list::settle(lists);
         if cuts() && !this.is_null() {
             submit_cut(this, lists);
             return;

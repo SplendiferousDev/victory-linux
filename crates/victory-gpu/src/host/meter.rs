@@ -84,6 +84,7 @@ impl Meter {
         crate::queue2::line(frames);
         crate::plaincopy::line(frames);
         crate::memopt::line(frames);
+        crate::thin::line(frames);
         crate::noquery::line(frames);
         #[cfg(feature = "diagnostics")]
         crate::backreads::line(frames);
