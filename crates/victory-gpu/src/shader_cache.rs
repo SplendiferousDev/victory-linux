@@ -68,7 +68,7 @@ fn build() -> [u8; 32] {
         }
     });
     let mut h = blake3::Hasher::new();
-    h.update(b"victory shader cache key 2\0");
+    h.update(b"victory shader cache key 3\0");
     if let Some(exe) = exe {
         h.update(exe);
     }
@@ -343,6 +343,11 @@ fn encode(s: &HostShader) -> Vec<u8> {
         word(&mut out, u32::from(slot));
         word(&mut out, dword);
     }
+    word(&mut out, s.constant_views.len() as u32);
+    for &(slot, dword) in &s.constant_views {
+        word(&mut out, u32::from(slot));
+        word(&mut out, dword);
+    }
     out
 }
 
@@ -416,6 +421,11 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     for _ in 0..n {
         half_views.push((u8::try_from(r.word()?).ok()?, r.word()?));
     }
+    let n = r.word()? as usize;
+    let mut constant_views = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        constant_views.push((u8::try_from(r.word()?).ok()?, r.word()?));
+    }
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -427,6 +437,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_uavs,
         root_indexed_views,
         half_views,
+        constant_views,
     })
 }
 
@@ -462,6 +473,7 @@ mod tests {
                 shift: 5,
             }],
             half_views: vec![(0, 8), (4, 0)],
+            constant_views: vec![(1, 16), (2, u32::MAX)],
         }
     }
 

@@ -303,6 +303,16 @@ pub struct HostShader {
     /// descriptor picked at run time keeps the float path (its slot, and so
     /// its format, is known only then).
     pub half_views: Vec<(u8, u32)>,
+    /// Table descriptors (root parameter, dword offset in the table) the
+    /// code reads as constant buffers, whatever the used-resource list
+    /// says of the place: a load at a fixed place past the start of the
+    /// range its entry describes, or at a place no entry names, is here
+    /// too. A dword offset of `u32::MAX` stands for a place in that table
+    /// worked out as the program runs. The host makes the slots of these
+    /// places constant buffer views, and tables long enough to hold them:
+    /// a constant buffer read through a slot holding another kind of view
+    /// faults on some hosts.
+    pub constant_views: Vec<(u8, u32)>,
 }
 
 impl HostShader {
@@ -987,6 +997,7 @@ fn emit_program(
         root_uavs: l.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
         half_views: l.half_views,
+        constant_views: l.constant_views,
     };
     Ok((shader, wave_size))
 }
@@ -1604,6 +1615,7 @@ mod tests {
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
             half_views: Vec::new(),
+            constant_views: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1617,6 +1629,7 @@ mod tests {
                 root_uavs: Vec::new(),
                 root_indexed_views: Vec::new(),
                 half_views: Vec::new(),
+                constant_views: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -2035,6 +2048,82 @@ mod tests {
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
     }
 
+    /// The table places a program reads constant buffers at are named for
+    /// the host (`HostShader::constant_views`), also the place its
+    /// used-resource list does not name: here the list names the constant
+    /// buffer at entry 0 of the table alone, and the code reads another
+    /// through the descriptor at entry 2 (dword 16).
+    #[test]
+    fn table_places_read_as_constant_buffers_are_named() {
+        let words: Vec<u32> = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0 (entry 0)
+            0xF408_0302,
+            0xFA00_0040, // s_load_dwordx4 s[12:15], s[4:5], 0x40 (entry 2)
+            0xF428_0604,
+            0xFA00_0008, // s_buffer_load_dwordx4 s[24:27], s[8:11], 0x8
+            0xF428_0706,
+            0xFA00_0000, // s_buffer_load_dwordx4 s[28:31], s[12:15], 0x0
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = super::NativeProgram {
+            stage: super::HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![
+                crate::RootParam {
+                    root: crate::RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                crate::RootParam {
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![crate::UsedResource {
+                kind: crate::ResourceType::Cbv,
+                root: crate::RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            }],
+            io: crate::native::StageIo::Cs(crate::native::ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, None).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let l = super::lower::lower(&super::lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .unwrap();
+        assert_eq!(l.constant_views, [(1, 0), (1, 16)]);
+    }
+
     /// `s_buffer_load_dwordx4`, `x8` and `x16` from a raw SRV read the dwords
     /// the console's range-checked load reads, a call a dword or
     /// (`VICTORY_SHADER_OPT` with 64) a call for every four: also where a
@@ -2170,6 +2259,7 @@ mod tests {
             root_uavs: l.root_uavs,
             root_indexed_views: Vec::new(),
             half_views: l.half_views,
+            constant_views: l.constant_views,
         };
         let (root, pso) = host.compute_pipeline(&cs).unwrap();
         // Twelve dwords: the loads below run across the view's end.
@@ -2324,6 +2414,7 @@ mod tests {
                 root_uavs: l.root_uavs,
                 root_indexed_views: Vec::new(),
                 half_views: l.half_views,
+                constant_views: l.constant_views,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [
