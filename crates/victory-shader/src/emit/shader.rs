@@ -120,6 +120,11 @@ pub const USER_DISPATCH_THREADS: u32 = 0x106;
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const DOUBLES: u64 = 1 << 2;
+    /// Depth and stencil are tested before a pixel program runs
+    /// (`slot_mark::with_early_depth`).
+    pub const EARLY_DEPTH: u64 = 1 << 3;
+    /// UAVs outside pixel and compute programs (slot marks there).
+    pub const UAVS_AT_EVERY_STAGE: u64 = 1 << 16;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const WAVE_OPS: u64 = 1 << 19;
@@ -221,6 +226,9 @@ pub(crate) struct Shader {
     lds: Option<V>,
     main: V,
     pub entry: usize,
+    /// The handle of the buffer slot marks go to (`slot_mark`), made in
+    /// the entry block by the first mark.
+    mark: Option<V>,
 }
 
 impl Shader {
@@ -279,7 +287,71 @@ impl Shader {
             lds: None,
             main,
             entry,
+            mark: None,
         }
+    }
+
+    /// A slot mark (`slot_mark`): stores 1 into dword `index` of the raw
+    /// buffer at view heap slot `slot`.
+    fn slot_mark(&mut self, block: usize, index: V, slot: u32) {
+        let h = match self.mark {
+            Some(h) => h,
+            None => {
+                let s = self.m.i32(slot);
+                let no = self.m.bool(false);
+                let entry = self.entry;
+                let h = self.op(entry, "createHandleFromHeap", Attr::ReadNone, self.t.handle, 218, &[s, no, no]);
+                // A raw buffer with the UAV bit, never rasterizer ordered
+                // (not through `annotate`, which orders every UAV of a
+                // program that has ordered ones).
+                let p = [self.m.i32(11 | 0x1000), self.m.i32(0)];
+                let p = self.m.aggregate(self.t.props, &p);
+                let h = self.op(entry, "annotateHandle", Attr::ReadNone, self.t.handle, 216, &[h, p]);
+                self.flags |= flags::RESOURCE_HEAP | flags::RAW_BUFFERS;
+                self.mark = Some(h);
+                h
+            }
+        };
+        let two = self.m.i32(2);
+        let byte = self.m.bin(block, super::bitcode::Bin::Shl, index, two);
+        let one = self.m.i32(1);
+        let iu = self.m.undef(self.t.i32);
+        let mask = self.m.i8(1);
+        let align = self.m.i32(4);
+        let void = self.t.void;
+        self.op(block, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &[h, byte, iu, one, iu, iu, iu, mask, align]);
+    }
+
+    /// The slot marks of the finished code: for a pixel program, taken out
+    /// again where `VICTORY_SLOT_FEEDBACK_PIXEL` says so. The payload of
+    /// the container's `PRIV` part if marks stay; the early depth and
+    /// stencil test and UAVs at every stage are declared as they apply.
+    fn settle_marks(&mut self) -> Option<[u8; 8]> {
+        use super::slot_mark;
+        let mark = self.mark?;
+        let sides = self.m.sides(Some(mark));
+        if sides.marks == 0 {
+            return None;
+        }
+        let mut bits = slot_mark::MARKS;
+        if self.pixel {
+            let exports = self.outputs.iter().any(|o| o.kind != 16)
+                || self.inputs.iter().any(|i| matches!(i.kind, 14 | 15))
+                || self.rov;
+            let facts = slot_mark::Facts { discards: sides.discards, writes: sides.writes, exports };
+            let (keep, more) = slot_mark::decide(slot_mark::settings().pixel, facts, slot_mark::early_depth());
+            if !keep {
+                self.m.drop_marks(mark);
+                return None;
+            }
+            bits |= more;
+            if more & slot_mark::EARLY != 0 {
+                self.flags |= flags::EARLY_DEPTH;
+            }
+        } else if self.threads.is_none() || self.mesh.is_some() {
+            self.flags |= flags::UAVS_AT_EVERY_STAGE;
+        }
+        Some(slot_mark::part(bits, sides.marks))
     }
 
     /// The thread-group shared memory: `[lds_dwords x i32]` in address
@@ -501,6 +573,22 @@ impl Shader {
         nonuniform: bool,
         props: (u32, u32),
     ) -> V {
+        self.heap_handle_at(block, index, sampler, nonuniform, props, false)
+    }
+
+    /// [`Self::heap_handle`]; `picked`: the host cannot know the slot (it
+    /// is not a fixed place of a table it reads for the draw), so a texture
+    /// taken from it is noted with a slot mark where programs store them
+    /// (`slot_mark`; nothing while `VICTORY_SLOT_FEEDBACK` is off).
+    pub fn heap_handle_at(
+        &mut self,
+        block: usize,
+        index: V,
+        sampler: bool,
+        nonuniform: bool,
+        props: (u32, u32),
+        picked: bool,
+    ) -> V {
         // a view index past the host heap (`set_view_heap_limit`) reads its null slot instead
         let limit = VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
         // (as `dx.op.binary` UMin: a compare and select emitted here made the bitcode invalid)
@@ -529,6 +617,16 @@ impl Shader {
         } else {
             flags::RESOURCE_HEAP
         };
+        // A texture (resource kinds 1 to 9, read or written) at a slot the
+        // host cannot know: noted at its clamped index.
+        if picked
+            && !sampler
+            && (1..=9).contains(&(props.0 & 0xff))
+            && let Some(slot) = super::slot_mark::mark_slot()
+            && !(self.pixel && super::slot_mark::settings().pixel == super::slot_mark::Pixel::None)
+        {
+            self.slot_mark(block, index, slot);
+        }
         self.nonuniform_handles += u32::from(nonuniform);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
@@ -546,6 +644,9 @@ impl Shader {
     pub fn finish(mut self) -> Vec<u8> {
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
+        // Slot marks, before the clean-up (which drops the handle of marks
+        // taken out again): `None` in every program without them.
+        let marks = self.settle_marks();
         // The clean-up, before anything is declared about the code: a
         // feature whose last use it removed must not be declared (the
         // validator compares the flags with what the code uses).
@@ -892,6 +993,12 @@ impl Shader {
         if self.flags & flags::DOUBLES != 0 {
             features |= 0x1;
         }
+        if self.flags & flags::EARLY_DEPTH != 0 {
+            features |= 0x2;
+        }
+        if self.flags & flags::UAVS_AT_EVERY_STAGE != 0 {
+            features |= 0x4;
+        }
         if self.flags & flags::STENCIL_REF != 0 {
             features |= 0x200;
         }
@@ -950,6 +1057,9 @@ impl Shader {
             parts.push((b"PSG1", &psg1));
         }
         parts.extend([(b"PSV0", &psv0[..]), (b"HASH", &hash), (b"DXIL", &dxil)]);
+        if let Some(marks) = &marks {
+            parts.push((b"PRIV", &marks[..]));
+        }
         container::build(&parts)
     }
 
