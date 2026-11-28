@@ -25,6 +25,16 @@
 //! Every 10 s, with the memory line: one line, the kinds' totals and the
 //! largest sites. With the switch off a factory pays one relaxed load.
 //!
+//! The line also sets our count beside the driver's (what the system says
+//! this process holds of the card's memory and of the PC's memory shared
+//! with it, `QueryVideoMemoryInfo`): the difference is device memory that is
+//! not an object of ours, chiefly vkd3d-proton's own. vkd3d-proton places a
+//! buffer under 2 MiB in a 16 MiB block it shares with others of the same
+//! heap and a texture under 8 MiB in a 32 MiB one, and frees a block only
+//! once all in it are gone, so the line counts our objects below those
+//! sizes apart (the room a block keeps is in the difference, not in ours),
+//! and the host pipelines made and loaded (their code is the driver's).
+//!
 //! Idea from skornuta, victory-memory-stack (call-site counting of buffers).
 
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering::Relaxed};
@@ -83,6 +93,35 @@ static ALIVE: [AtomicU64; SITES] = [const { AtomicU64::new(0) }; SITES];
 static BYTES: [AtomicU64; SITES] = [const { AtomicU64::new(0) }; SITES];
 static MADE: [AtomicU64; SITES] = [const { AtomicU64::new(0) }; SITES];
 static UNTRACKED: [AtomicU64; SITES] = [const { AtomicU64::new(0) }; SITES];
+/// Per kind: alive and bytes alive of the objects small enough for
+/// vkd3d-proton to place in a shared block ([`small`]).
+static SMALL_ALIVE: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
+static SMALL_BYTES: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
+
+/// Whether vkd3d-proton places an object of `kind` and `bytes` in a block it
+/// shares with others (`memory.c`: buffers under `VKD3D_VA_BLOCK_SIZE`, 2 MiB,
+/// in 16 MiB chunks; textures under 8 MiB in 32 MiB ones). Heaps of views,
+/// queries and command objects are not resources.
+fn small(kind: Kind, bytes: u64) -> bool {
+    match kind {
+        Kind::Upload | Kind::Shared | Kind::GpuUpload | Kind::ReadBack | Kind::Card | Kind::SharedWindow => {
+            bytes < (2 << 20)
+        }
+        Kind::Texture => bytes < (8 << 20),
+        _ => false,
+    }
+}
+
+/// Which of the system's two memory groups a kind's memory is in: 0 the
+/// card's own, 1 the PC's shared with the card, `None` not known here
+/// (resource heaps of either, reserved resources, command objects).
+fn group(kind: Kind) -> Option<usize> {
+    match kind {
+        Kind::Card | Kind::Texture | Kind::GpuUpload | Kind::ViewHeap | Kind::QueryHeap => Some(0),
+        Kind::Upload | Kind::Shared | Kind::ReadBack | Kind::SharedWindow => Some(1),
+        _ => None,
+    }
+}
 
 /// The sites in the order first seen: kind, file, line.
 static NAMES: Mutex<Vec<(Kind, &'static str, u32)>> = Mutex::new(Vec::new());
@@ -130,18 +169,24 @@ fn place_of(file: &'static str) -> &'static str {
     }
 }
 
-/// The destruction callback's data: the site in the low bits, the bytes in
-/// 64 KiB units above. No allocation, nothing to free.
+/// The destruction callback's data: the site in the low bits, then the
+/// kind's number plus one for a small object ([`small`]) or 0, the bytes in
+/// 64 KiB units above. No allocation, nothing to free, no lock.
 const SITE_BITS: u32 = 10;
+const KIND_BITS: u32 = 4;
+const UNITS_AT: u32 = SITE_BITS + KIND_BITS;
 
-fn pack(site: usize, bytes: u64) -> usize {
+fn pack(site: usize, bytes: u64, small: Option<Kind>) -> usize {
     let units = bytes.div_ceil(64 << 10);
-    ((units << SITE_BITS) | site as u64) as usize
+    let small = small.map_or(0, |k| k as u64 + 1);
+    ((units << UNITS_AT) | (small << SITE_BITS) | site as u64) as usize
 }
 
-fn unpack(data: usize) -> (usize, u64) {
+fn unpack(data: usize) -> (usize, u64, Option<Kind>) {
     let data = data as u64;
-    ((data & ((1 << SITE_BITS) - 1)) as usize, (data >> SITE_BITS) << 16)
+    let small = ((data >> SITE_BITS) & ((1 << KIND_BITS) - 1)) as usize;
+    let kind = small.checked_sub(1).and_then(|k| KIND_OF.get(k).copied());
+    ((data & ((1 << SITE_BITS) - 1)) as usize, (data >> UNITS_AT) << 16, kind)
 }
 
 /// Counts `object`, made at the caller's place, as `kind` of `bytes` until
@@ -210,14 +255,23 @@ fn count<T: Interface>(object: &T, kind: Kind, bytes: u64, at: &'static std::pan
         UNTRACKED[n].fetch_add(1, Relaxed);
         return;
     };
-    let data = pack(n, bytes);
-    let (_, rounded) = unpack(data);
+    let tiny = small(kind, bytes);
+    let data = pack(n, bytes, tiny.then_some(kind));
+    let (_, rounded, _) = unpack(data);
     ALIVE[n].fetch_add(1, Relaxed);
     BYTES[n].fetch_add(rounded, Relaxed);
+    if tiny {
+        SMALL_ALIVE[kind as usize].fetch_add(1, Relaxed);
+        SMALL_BYTES[kind as usize].fetch_add(rounded, Relaxed);
+    }
     // SAFETY: a live object; the callback's data is a plain number.
     if unsafe { notifier.RegisterDestructionCallback(Some(destroyed), data as *const _) }.is_err() {
         ALIVE[n].fetch_sub(1, Relaxed);
         BYTES[n].fetch_sub(rounded, Relaxed);
+        if tiny {
+            SMALL_ALIVE[kind as usize].fetch_sub(1, Relaxed);
+            SMALL_BYTES[kind as usize].fetch_sub(rounded, Relaxed);
+        }
         UNTRACKED[n].fetch_add(1, Relaxed);
     }
 }
@@ -225,12 +279,74 @@ fn count<T: Interface>(object: &T, kind: Kind, bytes: u64, at: &'static std::pan
 /// The device's call as a counted object is destroyed (on whatever thread
 /// let it go last).
 unsafe extern "system" fn destroyed(data: *mut core::ffi::c_void) {
-    let (n, bytes) = unpack(data as usize);
+    let (n, bytes, tiny) = unpack(data as usize);
     if n < SITES {
         ALIVE[n].fetch_sub(1, Relaxed);
         BYTES[n].fetch_sub(bytes, Relaxed);
+        if let Some(k) = tiny {
+            SMALL_ALIVE[k as usize].fetch_sub(1, Relaxed);
+            SMALL_BYTES[k as usize].fetch_sub(bytes, Relaxed);
+        }
     }
 }
+
+/// Our side beside the driver's, for the line: per group (the card's own,
+/// the PC's shared) the driver's use (`None` unknown), our bytes alive, and
+/// of them the objects in shared blocks (alive, bytes); then the host
+/// pipelines made and loaded since the start.
+fn driver_text(rows: &[Row], driver: Option<[u64; 2]>, small: &[(u64, u64); KINDS], pipelines: (u64, u64)) -> String {
+    let mb = |b: u64| b as f64 / f64::from(1 << 20);
+    let mut ours = [0u64; 2];
+    for r in rows {
+        if let Some(g) = group(r.kind) {
+            ours[g] += r.bytes;
+        }
+    }
+    let mut tiny = [(0u64, 0u64); 2];
+    for (k, &(n, b)) in small.iter().enumerate() {
+        let Some(g) = KIND_OF.get(k).and_then(|&kind| group(kind)) else { continue };
+        tiny[g].0 += n;
+        tiny[g].1 += b;
+    }
+    let names = ["the card's own", "the PC's shared"];
+    let sides: Vec<String> = (0..2)
+        .map(|g| {
+            let theirs = match driver {
+                Some(d) => format!(
+                    "the driver counts {:.0} MB, ours {:.0} MB ({:.0} MB not ours)",
+                    mb(d[g]),
+                    mb(ours[g]),
+                    mb(d[g]) - mb(ours[g])
+                ),
+                None => format!("ours {:.0} MB (the driver's count not known)", mb(ours[g])),
+            };
+            format!("{}: {theirs}, of ours {} objects {:.0} MB in vkd3d-proton's shared blocks", names[g], tiny[g].0, mb(tiny[g].1))
+        })
+        .collect();
+    format!(
+        "; device memory beside the driver's count: {}; host pipelines made {} and loaded {} since the start",
+        sides.join("; "),
+        pipelines.0,
+        pipelines.1
+    )
+}
+
+/// The kinds by their number.
+const KIND_OF: [Kind; KINDS] = [
+    Kind::Upload,
+    Kind::Shared,
+    Kind::GpuUpload,
+    Kind::ReadBack,
+    Kind::Card,
+    Kind::Texture,
+    Kind::Reserved,
+    Kind::Heap,
+    Kind::ViewHeap,
+    Kind::QueryHeap,
+    Kind::Allocator,
+    Kind::List,
+    Kind::SharedWindow,
+];
 
 /// One site's figures.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -320,8 +436,14 @@ pub(crate) fn line() {
         crate::list::idle_count() as u64,
         crate::host::LISTS[1].load(Relaxed),
     ];
-    let extra = crate::host::prelude_pool_text() + &crate::host::allocator_trim_text() + &crate::shadow::window_use_text();
-    tracing::info!("{}", text(&rows(), lists, &extra));
+    let rows = rows();
+    let driver = crate::host::host().and_then(|h| h.video_memory_groups()).map(|[own, shared]| [own[1], shared[1]]);
+    let small = std::array::from_fn(|k| (SMALL_ALIVE[k].load(Relaxed), SMALL_BYTES[k].load(Relaxed)));
+    let extra = crate::host::prelude_pool_text()
+        + &crate::host::allocator_trim_text()
+        + &crate::shadow::window_use_text()
+        + &driver_text(&rows, driver, &small, crate::pipeline::frame_log_counts());
+    tracing::info!("{}", text(&rows, lists, &extra));
 }
 
 #[cfg(test)]
@@ -331,8 +453,42 @@ mod tests {
     #[test]
     fn the_callback_data_carries_site_and_whole_64k_units() {
         for (site, bytes, back) in [(0, 0, 0), (3, 1, 64 << 10), (1023, 64 << 10, 64 << 10), (7, 5 << 30, 5 << 30)] {
-            assert_eq!(unpack(pack(site, bytes)), (site, back));
+            for tiny in [None, Some(Kind::Upload), Some(Kind::SharedWindow), Some(Kind::Texture)] {
+                assert_eq!(unpack(pack(site, bytes, tiny)), (site, back, tiny));
+            }
         }
+    }
+
+    #[test]
+    fn small_follows_vkd3d_protons_block_sizes() {
+        assert!(small(Kind::Shared, (2 << 20) - 1));
+        assert!(!small(Kind::Shared, 2 << 20));
+        assert!(small(Kind::Texture, (8 << 20) - 1));
+        assert!(!small(Kind::Texture, 8 << 20));
+        assert!(!small(Kind::ViewHeap, 1));
+        assert!(!small(Kind::Allocator, 0));
+    }
+
+    #[test]
+    fn kinds_are_listed_in_their_order() {
+        for (i, k) in KIND_OF.iter().enumerate() {
+            assert_eq!(*k as usize, i);
+        }
+    }
+
+    #[test]
+    fn the_driver_part_sets_ours_beside_theirs() {
+        let row = |kind, bytes| Row { kind, place: "a.rs:1".into(), alive: 1, bytes, made: 1, untracked: 0 };
+        let rows = [row(Kind::Card, 100 << 20), row(Kind::Texture, 200 << 20), row(Kind::SharedWindow, 300 << 20)];
+        let mut small = [(0, 0); KINDS];
+        small[Kind::Card as usize] = (5, 10 << 20);
+        small[Kind::SharedWindow as usize] = (7, 20 << 20);
+        let t = driver_text(&rows, Some([500 << 20, 450 << 20]), &small, (3, 9));
+        assert!(t.contains("the card's own: the driver counts 500 MB, ours 300 MB (200 MB not ours), of ours 5 objects 10 MB"), "{t}");
+        assert!(t.contains("the PC's shared: the driver counts 450 MB, ours 300 MB (150 MB not ours), of ours 7 objects 20 MB"), "{t}");
+        assert!(t.contains("host pipelines made 3 and loaded 9"), "{t}");
+        let t = driver_text(&rows, None, &small, (0, 0));
+        assert!(t.contains("ours 300 MB (the driver's count not known)"), "{t}");
     }
 
     #[test]
