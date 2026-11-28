@@ -1818,6 +1818,7 @@ fn plane_pass() -> Option<&'static PlanePass> {
                     NodeMask: 0,
                 })
                 .ok()?;
+            crate::memsites::note_view_heap(&host.device, &views);
             Some(PlanePass {
                 cpu: views.GetCPUDescriptorHandleForHeapStart().ptr,
                 gpu: views.GetGPUDescriptorHandleForHeapStart().ptr,
@@ -4849,6 +4850,9 @@ impl Host {
                 Ok((allocator, list))
             })()
         };
+        if let Ok((a, l)) = &made {
+            crate::memsites::note_pair(a, l);
+        }
         LISTS[1].fetch_add(1, Ordering::Relaxed);
         match made {
             Ok(prelude) => Some(prelude),
@@ -4871,6 +4875,7 @@ impl Host {
                 &allocator,
                 None,
             )?;
+            crate::memsites::note_pair(&allocator, &list);
             let prelude = OnceLock::new();
             if !lazy_prelude() {
                 let _ = prelude.set(self.make_prelude());
@@ -10210,6 +10215,7 @@ impl Host {
     /// A buffer in the upload heap, mapped for writing.
     /// A buffer of `size` bytes the card writes and we read (a read back),
     /// in the state copies into it need.
+    #[track_caller]
     pub(crate) fn read_back_buffer(&self, size: u64) -> Option<ID3D12Resource> {
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_READBACK,
@@ -10241,7 +10247,10 @@ impl Host {
             )
         };
         match made {
-            Ok(()) => buffer,
+            Ok(()) => {
+                crate::memsites::note(buffer.as_ref()?, crate::memsites::Kind::ReadBack, size);
+                buffer
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no read-back buffer");
                 None
@@ -10249,6 +10258,7 @@ impl Host {
         }
     }
 
+    #[track_caller]
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
@@ -10288,7 +10298,10 @@ impl Host {
                 })
         };
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(()) => {
+                crate::memsites::note(buffer.as_ref()?, crate::memsites::Kind::Upload, size);
+                Some((buffer?, data.cast()))
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no upload buffer");
                 None
@@ -10727,6 +10740,7 @@ impl Host {
     /// nothing of ours does) and shaders read: for host copies the CPU
     /// fills and no shader writes. `None` where the device has no such
     /// heaps or turns the buffer down (then the caller's usual buffer).
+    #[track_caller]
     pub(crate) fn gpu_upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         if !self.gpu_upload() {
             return None;
@@ -10788,6 +10802,9 @@ impl Host {
                     }
                     same
                 });
+                if works {
+                    crate::memsites::note(&buffer, crate::memsites::Kind::GpuUpload, size);
+                }
                 works.then_some((buffer, data.cast()))
             }
             (made, _) => {
@@ -10805,6 +10822,7 @@ impl Host {
     /// it is fast too) and shaders read and write: for host copies of title
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
+    #[track_caller]
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[2].fetch_add(1, Ordering::Relaxed);
         MADE[3].fetch_add(size, Ordering::Relaxed);
@@ -10847,7 +10865,10 @@ impl Host {
                 })
         };
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(()) => {
+                crate::memsites::note(buffer.as_ref()?, crate::memsites::Kind::Shared, size);
+                Some((buffer?, data.cast()))
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no shared buffer");
                 None
@@ -10857,6 +10878,7 @@ impl Host {
 
     /// A device-local buffer shaders may write (unordered access) and indirect
     /// execution may read, starting in the common state.
+    #[track_caller]
     pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
         MADE[4].fetch_add(1, Ordering::Relaxed);
         MADE[5].fetch_add(size, Ordering::Relaxed);
@@ -10891,7 +10913,10 @@ impl Host {
             )
         };
         match made {
-            Ok(()) => buffer,
+            Ok(()) => {
+                crate::memsites::note(buffer.as_ref()?, crate::memsites::Kind::Card, size);
+                buffer
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no unordered-access buffer");
                 None

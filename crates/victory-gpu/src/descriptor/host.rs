@@ -1130,6 +1130,7 @@ impl HostHeap {
                         Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                         NodeMask: 0,
                     })
+                    .inspect(|h| crate::memsites::note_view_heap(&host.device, h))
             }
         };
         let extra = if sampler { 0 } else { DYNAMIC };
@@ -1269,6 +1270,7 @@ impl HostHeap {
                     NumDescriptors: BLOCK,
                     ..Default::default()
                 })?;
+            crate::memsites::note_view_heap(&host.device, &block);
             let start = block.GetCPUDescriptorHandleForHeapStart();
             let at = |i: u32| D3D12_CPU_DESCRIPTOR_HANDLE {
                 ptr: start.ptr + (i * self.step) as usize,

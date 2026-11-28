@@ -506,6 +506,7 @@ fn twin_texture(
         TWINS[1].fetch_add(1, Relaxed);
         return None;
     };
+    crate::memsites::note_resource(&host.device, &texture, crate::memsites::Kind::Texture);
     crate::host::name(&texture, || {
         format!("depth twin {}x{} f{}", d.width, d.height, d.format)
     });
@@ -566,6 +567,7 @@ fn twin_texture(
             tracing::warn!(error = %e, desc = ?d, "no twin for a depth plane");
         }
         texture.map(|texture| {
+            crate::memsites::note_resource(&host.device, &texture, crate::memsites::Kind::Texture);
             crate::host::name(&texture, || {
                 format!("depth plane twin {}x{} f{}", d.width, d.height, d.format)
             });
@@ -2270,6 +2272,8 @@ fn host_texture_as(
         return Err(why);
     }
     let texture = texture.ok_or(NoTexture::Refused)?;
+    let kind = if reserved { crate::memsites::Kind::Reserved } else { crate::memsites::Kind::Texture };
+    crate::memsites::note_resource(&host.device, &texture, kind);
     crate::host::name(&texture, || {
         format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
     });

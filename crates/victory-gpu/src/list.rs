@@ -242,6 +242,12 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 // 8 ms to make and more to free, on the thread that submits.)
 const IDLE_MOST: (usize, u64) = (512, 256 << 20);
 
+/// Host lists kept idle now (`crate::memsites`).
+#[cfg(windows)]
+pub(crate) fn idle_count() -> usize {
+    crate::lockmeter::lock("li:IDLE", &IDLE).0.len()
+}
+
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
 #[cfg(windows)]

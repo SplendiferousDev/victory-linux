@@ -238,6 +238,7 @@ impl Lane {
             let allocator: ID3D12CommandAllocator = self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)?;
             let list: ID3D12GraphicsCommandList =
                 self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)?;
+            crate::memsites::note_pair(&allocator, &list);
             Ok((allocator, list))
         }
     }
@@ -431,6 +432,7 @@ impl Second {
             };
             match (made, buffer) {
                 (Ok(()), Some(buffer)) => {
+                    crate::memsites::note_resource(&self.device, &buffer, crate::memsites::Kind::Card);
                     let wide: Vec<u16> = "victory landing buffer (title bytes on their way up)".encode_utf16().chain([0]).collect();
                     // SAFETY: a live buffer and a terminated string.
                     let _ = unsafe { buffer.SetName(windows::core::PCWSTR(wide.as_ptr())) };

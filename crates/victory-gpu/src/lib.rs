@@ -130,6 +130,8 @@ pub mod signature;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
+mod memsites;
+#[cfg(windows)]
 mod tight;
 #[cfg(windows)]
 mod watch;

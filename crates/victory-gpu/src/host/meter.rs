@@ -90,6 +90,7 @@ impl Meter {
         crate::shadow::placed_line();
         crate::tight::say();
         crate::tight::line();
+        crate::memsites::line();
         if let Some(host) = host() {
             host.drain_messages();
         }
