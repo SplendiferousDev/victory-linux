@@ -105,3 +105,70 @@ proton_fingerprint() { # proton dir
 
 # The private patched Proton tree made by build-wine.sh.
 vl_patched_tree=$vl_cache_home/proton-patched
+
+# ---- presets (run.sh --preset) ----------------------------------------------
+# A preset is a named set of VICTORY_* switches. It only fills in variables the
+# caller has not set: a value exported (or given on the command line) wins.
+
+vl_presets="none tested-8gb"
+
+# The variables of a preset, one KEY=VALUE per line. Fails for an unknown name.
+#
+# tested-8gb: what the project's runs on a 16 GB PC with an 8 GB NVIDIA card
+# use (about 9 frames a second in the opening scene; not playable yet).
+preset_vars() { # name
+  case $1 in
+    none) ;;
+    tested-8gb)
+      printf '%s\n' \
+        VICTORY_TIGHT_MEMORY=1 \
+        VICTORY_SNAPSHOT_POOL_MB=256 \
+        VICTORY_TEXTURE_READ_KEEP_MB=16 \
+        VICTORY_BACK_OWN_VIEW=1 \
+        VICTORY_ASYNC_SUBMIT=1 \
+        VICTORY_QUEUE2=1 \
+        VICTORY_JOIN_PARTS=1 \
+        VICTORY_CARD_REHASH_RUNS=1 \
+        VICTORY_INDIRECT_GATHER=1 \
+        VICTORY_MEM_SUBPAGE=1 \
+        VICTORY_CARD_BUFFERS_MIN_KB=64 \
+        VICTORY_CARD_BUFFERS_MB=1280 \
+        VICTORY_CARD_HASH_LEN=1 \
+        VICTORY_INDIRECT_WINDOW=1 \
+        VICTORY_VRAM_HEADROOM_MB=768 \
+        VICTORY_ASYNC_PRESENT=1 \
+        VICTORY_LOOKUP_CACHE=1 \
+        VICTORY_TEXTURE_BUDGET_EVICT=1 \
+        VICTORY_WINDOW_TAILS=1 \
+        VICTORY_WINDOW_KB=256 \
+        VICTORY_PIPELINE_HOLD=1
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# The console profile a preset was tested with ("" = no opinion).
+preset_console() { # name
+  case $1 in
+    tested-8gb) printf 'series-s' ;;
+  esac
+}
+
+# Exports the preset's variables that are not set yet and fills PRESET_REPORT
+# with one line per variable: "KEY=value" or "KEY=value (yours; preset: other)".
+apply_preset() { # name
+  local line k v
+  PRESET_REPORT=()
+  preset_vars "$1" >/dev/null || die "unknown preset '$1' (known: $vl_presets)"
+  while IFS= read -r line; do
+    [[ -n $line ]] || continue
+    k=${line%%=*}
+    v=${line#*=}
+    if [[ -n ${!k+x} ]]; then
+      PRESET_REPORT+=("$k=${!k} (yours; preset: $v)")
+    else
+      export "$k=$v"
+      PRESET_REPORT+=("$k=$v")
+    fi
+  done < <(preset_vars "$1")
+}

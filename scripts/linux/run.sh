@@ -13,6 +13,16 @@ Usage: run.sh --game <folder> --exe <file name> [options]
   --game <folder>      your unpacked game folder
   --exe <file name>    the title's executable inside that folder
   --console <profile>  series-x (default) or series-s
+  --preset <name>      a named set of VICTORY_* switches (or VICTORY_PRESET):
+                         none        change nothing (default)
+                         tested-8gb  what the project tests with on a 16 GB PC
+                                     and an 8 GB NVIDIA card (series-s unless
+                                     --console is given; holds the title at its
+                                     start screen until pipelines are made).
+                                     Variables you set yourself win.
+                       The applied switches are printed before the start.
+  --print-env          check everything, print the environment and the command,
+                       and stop: nothing is started, no directory is made
   --diag               use the diagnostics build (target/.../diag/victory.exe)
   --proton <dir>       Proton build (default: saved by setup.sh, or VICTORY_PROTON)
   --prefix <dir>       Wine prefix (default: saved by setup.sh)
@@ -57,9 +67,9 @@ Logs go to $vl_state_home/logs.
 USAGE
 }
 
-game= exe= console=series-x diag=0 proton=${VICTORY_PROTON:-} prefix=
+game= exe= console= diag=0 proton=${VICTORY_PROTON:-} prefix=
 wserver= stock=0 stockwine=0 measure= config= name=$(date +%Y%m%d-%H%M%S) scope=0 mhigh= mmax= swapmax=
-pool_dir= fault_watch=1
+pool_dir= fault_watch=1 preset=${VICTORY_PRESET:-none} print_env=0
 
 while (($#)); do
   case $1 in
@@ -67,6 +77,8 @@ while (($#)); do
     --exe) exe=${2:?--exe needs a file name}; shift 2 ;;
     --console) console=${2:?}; shift 2 ;;
     --diag) diag=1; shift ;;
+    --preset) preset=${2:?--preset needs a name}; shift 2 ;;
+    --print-env) print_env=1; shift ;;
     --proton) proton=${2:?}; shift 2 ;;
     --prefix) prefix=${2:?}; shift 2 ;;
     --config) config=${2:?}; shift 2 ;;
@@ -89,6 +101,9 @@ done
 [[ -n $game && -n $exe ]] || { usage >&2; die "--game and --exe are required"; }
 [[ -d $game ]] || die "game folder not found: $game"
 [[ -f $game/$exe ]] || die "no file named $exe in $game"
+apply_preset "$preset"
+[[ -n $console ]] || console=$(preset_console "$preset")
+[[ -n $console ]] || console=series-x
 case $console in series-x | series-s) ;; *) die "--console must be series-x or series-s" ;; esac
 [[ $name =~ ^[A-Za-z0-9._-]+$ ]] || die "--name may only hold letters, digits, . _ -"
 if [[ -z $mhigh$mmax$swapmax ]]; then
@@ -155,9 +170,15 @@ exe_dir=release
 victory=$VL_ROOT/target/$VL_TARGET/$exe_dir/victory.exe
 if [[ ! -f $victory ]]; then
   if ((diag)); then
-    die "$victory missing; build it: cargo xwin build --profile diag -p victory --features diagnostics --target $VL_TARGET"
+    hint="build it: cargo xwin build --profile diag -p victory --features diagnostics --target $VL_TARGET"
+  else
+    hint="run setup.sh or: cargo xwin build --release -p victory --target $VL_TARGET"
   fi
-  die "$victory missing; run setup.sh or: cargo xwin build --release -p victory --target $VL_TARGET"
+  if ((print_env)); then
+    warn "$victory is missing (a real start would stop here)"
+  else
+    die "$victory missing; $hint"
+  fi
 fi
 
 unixpath() { # Windows Z: path -> Unix path (other drives are left alone)
@@ -202,10 +223,10 @@ fi
 preflight_host
 if [[ -n $measure ]]; then
   refuse_inside_repo "measure file" "$measure"
-  mkdir -p "$(dirname -- "$measure")"
+  ((print_env)) || mkdir -p "$(dirname -- "$measure")"
 fi
 
-mkdir -p "$run_dir" "$log_dir" "$vkd3d_cache" "$driver_cache"
+((print_env)) || mkdir -p "$run_dir" "$log_dir" "$vkd3d_cache" "$driver_cache"
 log=$log_dir/$name.log
 
 # The page pool on a file (VICTORY_XMEM_POOL_DIR). The file holds title data:
@@ -215,12 +236,12 @@ log=$log_dir/$name.log
 if [[ -n $pool_dir ]]; then
   [[ ${VICTORY_INPLACE:-0} == 0 ]] || die "--pool-dir and VICTORY_INPLACE exclude each other"
   refuse_inside_repo "pool directory" "$pool_dir"
-  mkdir -p -- "$pool_dir"
-  pool_dir=$(realpath -- "$pool_dir")
+  ((print_env)) || mkdir -p -- "$pool_dir"
+  pool_dir=$(realpath -m -- "$pool_dir")
   # Files of a run that was killed (with its wineserver) before it could
   # delete them. Nothing else uses them.
-  find "$pool_dir" -maxdepth 1 -type f -name 'victory-pool-*.tmp' -delete
-  case $(stat -f -c %T -- "$pool_dir") in
+  ((print_env)) || find "$pool_dir" -maxdepth 1 -type f -name 'victory-pool-*.tmp' -delete
+  case $( ((print_env)) && echo none || stat -f -c %T -- "$pool_dir") in
     btrfs)
       if ! { command -v chattr >/dev/null && chattr +C -- "$pool_dir" 2>/dev/null; }; then
         warn "could not mark $pool_dir no copy-on-write (chattr +C); the pool file will be copy-on-write"
@@ -273,6 +294,12 @@ echo "prefix:   $prefix"
 echo "vkd3d:    ${b:-unknown version} (the log's 'vkd3d-proton - build:' line confirms the build)"
 echo "drivers:  shader cache in $__GL_SHADER_DISK_CACHE_PATH (NVIDIA) / $MESA_SHADER_CACHE_DIR (Mesa)"
 echo "profile:  $console ($exe_dir build)"
+if [[ $preset == none ]]; then
+  echo "preset:   none"
+else
+  echo "preset:   $preset (variables you set yourself are kept)"
+  printf '            %s\n' "${PRESET_REPORT[@]}"
+fi
 echo "log:      $log"
 [[ -z $pool_dir ]] || echo "pool:     a file in $pool_dir (VICTORY_XMEM_POOL_DIR)"
 if [[ -n $patched_tree ]]; then
@@ -302,6 +329,20 @@ if ((scope)); then
   [[ -z $mmax ]] || props+=(-p "MemoryMax=$mmax")
   [[ -z $swapmax ]] || props+=(-p "MemorySwapMax=$swapmax")
   cmd=(systemd-run --user --scope --collect --quiet "${props[@]}" -- "${cmd[@]}")
+fi
+
+if ((print_env)); then
+  echo "scope:    $( ((scope)) && echo "systemd user scope (MemoryHigh=${mhigh:-} MemoryMax=${mmax:-} MemorySwapMax=${swapmax:-})" || echo none)"
+  if ((fault_watch)) && [[ -z ${VICTORY_HOST_FAULT_FILE:-} ]]; then
+    echo "faults:   $log_dir/$name.faults (fault-watch.sh would run beside the title)"
+  fi
+  echo "environment:"
+  env | grep -E '^(WINE|VICTORY_|VKD3D_|__GL_|MESA_)' | LC_ALL=C sort | sed 's/^/  /'
+  echo "command:"
+  printf '  %q' "${cmd[@]}"
+  echo
+  echo "(--print-env: nothing was started)"
+  exit 0
 fi
 
 cd "$run_dir"
