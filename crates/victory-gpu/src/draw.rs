@@ -3293,6 +3293,19 @@ impl State {
             // before.
             // (A slot texture eviction made null that the title touched
             // again goes past the hold: `crate::resource::evict`.)
+            // Slot marks (`crate::slotuse`): a slot of a texture eviction
+            // let go while no shader read it stays null, out of the queue,
+            // until a shader is seen reading it or the title touches it.
+            let went_unread = !only
+                && crate::resource::evict::any_unread()
+                && record
+                    .as_ref()
+                    .and_then(|(v, _)| crate::descriptor::host::texture_named(v))
+                    .is_some_and(|texture| host.texture_slot_parks(index, texture, frame));
+            if went_unread {
+                host.texture_slot_done(index, write, None);
+                continue;
+            }
             if !room && !host.texture_slot_refill(index, frame) {
                 let has_its_texture = reupload_when_full()
                     && heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle));

@@ -668,7 +668,12 @@ impl Launch {
                         BytecodeLength: t.host.dxil.len(),
                     })
                 };
-                let (ms, ps) = (code(&r.ms), r.ps.as_ref().map_or(D3D12_SHADER_BYTECODE::default(), code));
+                let early = r.ps.as_ref().and_then(|ps| early_pixel(ps, &r.state.depth, &r.state.blend, r.state.depth_format));
+                let ps = match &early {
+                    Some(early) => D3D12_SHADER_BYTECODE { pShaderBytecode: early.as_ptr().cast(), BytecodeLength: early.len() },
+                    None => r.ps.as_ref().map_or(D3D12_SHADER_BYTECODE::default(), code),
+                };
+                let ms = code(&r.ms);
                 let name = super::library::name(
                     "mesh payload",
                     &r.root_blob,
@@ -945,7 +950,15 @@ impl HostPipeline {
                 return None;
             }
         };
+        // Slot marks: the pixel stage in its early depth form where this
+        // state makes that exact ([`early_pixel`]).
+        let early_ps = g.and_then(|g| stages.get(1).and_then(|(s, _)| early_pixel(s, &g.depth, &g.blend, g.depth_format)));
         let code = |i: usize| {
+            if i == 1
+                && let Some(early) = &early_ps
+            {
+                return D3D12_SHADER_BYTECODE { pShaderBytecode: early.as_ptr().cast(), BytecodeLength: early.len() };
+            }
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),
                 |t| D3D12_SHADER_BYTECODE {
@@ -1415,6 +1428,39 @@ fn mesh_pipeline(
 }
 
 /// The bytes of shader code (none for an absent stage).
+/// Slot marks (`crate::slotuse`, `VICTORY_SLOT_FEEDBACK=1`): the pixel
+/// program `shader` translated in the form that tests depth and stencil
+/// before it runs, for a pipeline with this depth, stencil and blend state,
+/// if the program marks slots and the form changes nothing of what such a
+/// pipeline draws (`crate::slotuse::early_wanted`). Without it a program
+/// that marks is shaded for the pixels the depth test throws away too.
+/// From the shader cache, under a key of its own.
+fn early_pixel(
+    shader: &Arc<Shader>,
+    depth: &D3D12_DEPTH_STENCIL_DESC,
+    blend: &D3D12_BLEND_DESC,
+    depth_format: DXGI_FORMAT,
+) -> Option<Vec<u8>> {
+    use victory_shader::emit::slot_mark::{EARLY, MARKS, slot_marks_of};
+    if !crate::slotuse::on() || shader.stage != "pixel" {
+        return None;
+    }
+    let bits = slot_marks_of(&shader.translated()?.host.dxil).0;
+    if bits & MARKS == 0 {
+        return None;
+    }
+    let writes = depth_format != DXGI_FORMAT_UNKNOWN
+        && ((depth.DepthEnable.as_bool() && depth.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL)
+            || (depth.StencilEnable.as_bool() && depth.StencilWriteMask != 0));
+    let early = crate::slotuse::early_wanted(bits, writes, blend.AlphaToCoverageEnable.as_bool())
+        .then(|| crate::shader_cache::host_shader_early(&shader.container).ok())
+        .flatten()
+        .map(|h| h.dxil)
+        .filter(|dxil| slot_marks_of(dxil).0 & EARLY != 0);
+    crate::slotuse::STATS[if early.is_some() { 4 } else { 5 }].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    early
+}
+
 fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
     if code.pShaderBytecode.is_null() {
         return Vec::new();

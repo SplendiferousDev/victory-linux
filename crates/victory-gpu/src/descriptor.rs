@@ -135,6 +135,37 @@ const SHADER_VISIBLE: u32 = 1;
 #[cfg(windows)]
 static SHADER_HEAPS: std::sync::RwLock<Vec<(u64, u64, usize)>> = std::sync::RwLock::new(Vec::new());
 
+/// Slot marks (`crate::slotuse`): of the title slots `read` (a shader was
+/// seen reading them), the ones texture eviction made null are due again
+/// in every shader-visible view heap. Returns how many.
+#[cfg(windows)]
+pub(crate) fn slots_read_again(read: &[u32], frame: u64) -> u64 {
+    let heaps = crate::lockmeter::read("de:SHADER_HEAPS", &SHADER_HEAPS);
+    let mut n = 0;
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        if let Some(Some(host)) = unsafe { &*(at as *const Heap) }.host.get() {
+            n += host.texture_slots_read_again(read, frame);
+        }
+    }
+    n
+}
+
+/// Slot marks (`crate::slotuse`): the host textures the title slots `read`
+/// show now, over every shader-visible view heap (by address).
+#[cfg(windows)]
+pub(crate) fn textures_shown(read: &[u32]) -> std::collections::HashSet<usize> {
+    let heaps = crate::lockmeter::read("de:SHADER_HEAPS", &SHADER_HEAPS);
+    let mut shown = std::collections::HashSet::new();
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        if let Some(Some(host)) = unsafe { &*(at as *const Heap) }.host.get() {
+            host.shown_at(read, &mut shown);
+        }
+    }
+    shown
+}
+
 /// One [`sync_heaps`] at a time, as when the list above was a mutex.
 #[cfg(windows)]
 static SYNCING: std::sync::Mutex<()> = std::sync::Mutex::new(());

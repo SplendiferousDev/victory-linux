@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 
 pub mod census;
+mod marks;
 pub mod opt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
