@@ -133,6 +133,7 @@ fn lowered_on(
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
         half_views: lowered.half_views,
+        constant_views: lowered.constant_views,
     })
 }
 
@@ -1010,6 +1011,7 @@ fn threads_past_a_dispatch_x_count_do_nothing() {
             root_uavs: lowered.root_uavs,
             root_indexed_views: res.root_indexed_views.clone(),
             half_views: lowered.half_views,
+            constant_views: lowered.constant_views,
         };
         if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
             let mut copy = shader.dxil.clone();

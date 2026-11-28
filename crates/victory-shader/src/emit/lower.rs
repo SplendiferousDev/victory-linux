@@ -91,6 +91,8 @@ pub(crate) struct Lowered {
     pub root_uavs: Vec<u8>,
     /// See [`super::HostShader::half_views`].
     pub half_views: Vec<(u8, u32)>,
+    /// See [`super::HostShader::constant_views`].
+    pub constant_views: Vec<(u8, u32)>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// The wave size the shader requires of the host, if any.
@@ -287,6 +289,10 @@ struct Lower<'a> {
     /// Table descriptors read or written sixteen bits a channel
     /// ([`super::HostShader::half_views`]): root parameter, dword offset.
     half_views: std::collections::BTreeSet<(u8, u32)>,
+    /// Table descriptors read as constant buffers
+    /// ([`super::HostShader::constant_views`]): root parameter, dword
+    /// offset (`u32::MAX`: a place worked out as the program runs).
+    constant_views: std::collections::BTreeSet<(u8, u32)>,
     /// [`Self::places_read_as_halves`], found before the code is lowered.
     halves_only: std::collections::BTreeSet<(u8, u32)>,
     samplers: Vec<[u32; 4]>,
@@ -1144,6 +1150,7 @@ impl<'a> Lower<'a> {
             user_data: None,
             user_reads: BTreeMap::new(),
             half_views: Default::default(),
+            constant_views: Default::default(),
             halves_only: Default::default(),
             samplers: Vec::new(),
             descriptors: x
@@ -1993,6 +2000,7 @@ impl<'a> Lower<'a> {
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let half_views = std::mem::take(&mut self.half_views).into_iter().collect();
+        let constant_views = std::mem::take(&mut self.constant_views).into_iter().collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
         Ok(Lowered {
@@ -2002,6 +2010,7 @@ impl<'a> Lower<'a> {
             root_srvs,
             root_uavs,
             half_views,
+            constant_views,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -6577,6 +6586,23 @@ impl<'a> Lower<'a> {
             .max_by_key(|u| u.table_offset_dwords)
     }
 
+    /// Notes the table places `src` names as read as constant buffers
+    /// ([`super::HostShader::constant_views`]): each descriptor it may be,
+    /// at its fixed place in its table, or the table alone (`u32::MAX`)
+    /// for a place worked out as the program runs.
+    fn note_constant(&mut self, src: &Source) {
+        for leaf in src.leaves() {
+            if let Some(place) = self.table_place(leaf) {
+                self.constant_views.insert(place);
+            } else if let Source::Loaded { load, .. } | Source::Fetched { load, .. } = leaf
+                && let Some(rp) = self.scalar.get(load).and_then(|a| self.x.native.layout.get(a.param))
+                && rp.root == RootType::Table
+            {
+                self.constant_views.insert((rp.slot, u32::MAX));
+            }
+        }
+    }
+
     /// A handle for the descriptor `src` read at `site`.
     fn handle(
         &mut self,
@@ -6585,6 +6611,9 @@ impl<'a> Lower<'a> {
         sampler: bool,
         props: (u32, u32),
     ) -> Result<V, Why> {
+        if !sampler && props.0 == 13 {
+            self.note_constant(src);
+        }
         match src {
             Source::Loaded { load, first } => {
                 let key = (self.cur, *load, *first, sampler, props);

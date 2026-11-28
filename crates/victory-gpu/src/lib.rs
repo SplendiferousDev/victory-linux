@@ -111,6 +111,8 @@ mod slotkind;
 #[cfg(windows)]
 mod readercheck;
 #[cfg(windows)]
+mod slotguard;
+#[cfg(windows)]
 mod tablekey;
 #[cfg(windows)]
 mod memory;

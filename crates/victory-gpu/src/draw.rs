@@ -574,6 +574,12 @@ pub(crate) struct State {
     root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// Root UAVs bound as one-view tables in this list, likewise.
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    /// With the reader check: the tables this recording made in dynamic
+    /// slots, for the look when they are given back ([`State::audit`]):
+    /// title heap, that heap's identity, first slot, count, and where the
+    /// slots' stamps as made (`HostHeap::stamp_of`) start in `made_stamps`.
+    made_tables: Vec<(usize, u64, u32, u32, u32)>,
+    made_stamps: Vec<u32>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
     /// Its recording held dynamic slots when they were given back.
@@ -586,6 +592,7 @@ pub(crate) struct State {
 
 impl Drop for State {
     fn drop(&mut self) {
+        self.audit("when its list gave them back");
         for &(heap, id, first, n) in &self.dynamic {
             crate::descriptor::release_dynamic(heap, id, first, n);
         }
@@ -614,6 +621,9 @@ impl State {
             ONCE.call_once(|| tracing::warn!("a list ran again after its descriptor tables were given back"));
         }
         self.had_tables |= !self.dynamic.is_empty();
+        self.audit("when its list gave them back");
+        self.made_tables.clear();
+        self.made_stamps.clear();
         for (heap, id, first, n) in self.dynamic.drain(..) {
             crate::descriptor::release_dynamic(heap, id, first, n);
         }
@@ -625,6 +635,62 @@ impl State {
         #[cfg(feature = "diagnostics")]
         {
             self.recording = 0;
+        }
+    }
+
+    /// With the reader check: the table of `n` slots just made from `first`
+    /// in the host heap behind title heap `heap` is remembered as made.
+    fn note_made(&mut self, heap: usize, host: &crate::descriptor::host::HostHeap, first: u32, n: u32) {
+        let at = self.made_stamps.len() as u32;
+        self.made_stamps.extend((0..n).map(|k| host.stamp_of(first + k)));
+        self.made_tables.push((heap, host.id(), first, n, at));
+    }
+
+    /// The reader check's look at the tables this recording made
+    /// ([`State::note_made`]): a list holds its dynamic slots until its
+    /// submission has run, so none of them may have been written since.
+    /// One that was is counted and said (`crate::readercheck::rewritten`):
+    /// the draws of this list read it as it is now. `when`: for the log.
+    pub(crate) fn audit(&self, when: &'static str) {
+        for &(heap, id, first, n, at) in &self.made_tables {
+            crate::descriptor::with_host(heap, id, |host| {
+                for k in 0..n {
+                    let (was, now) = (self.made_stamps[(at + k) as usize], host.stamp_of(first + k));
+                    if was != now {
+                        crate::readercheck::rewritten(first + k, k, n, was, now, when, self.pipeline);
+                    }
+                }
+            });
+        }
+    }
+
+    /// The fault test (`crate::slotguard::fault_test`): the dynamic slots
+    /// go back now, with the list's submission only just sent. What the
+    /// list made stays remembered, so the look when it has run says what
+    /// was written under it.
+    pub(crate) fn tables_back_early(&mut self) {
+        for (heap, id, first, n) in self.dynamic.drain(..) {
+            crate::descriptor::release_dynamic(heap, id, first, n);
+        }
+    }
+
+    /// With the reader check: whether the table in root parameter `slot`,
+    /// which a stage reads at the title's own place (no table was made
+    /// afresh for it), lies past the host heap's title slots. Its reads
+    /// then land in dynamic slots made for other tables, or in the null
+    /// slot at the heap's end.
+    fn past_check(&self, compute: bool, slot: u8) {
+        let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+            return;
+        };
+        let Some(heap) = self.heap_of(table) else {
+            return;
+        };
+        if let (Some(host), Some(index)) = (heap.host(), heap.index(table))
+            && !heap.samplers()
+            && index >= host.count()
+        {
+            crate::readercheck::past(index, host.count(), slot, self.pipeline);
         }
     }
 }
@@ -1188,6 +1254,16 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     let (gpu, to) = list.scratch(len)?;
     list.defer_fill(to, address as *const u8, len as usize);
     Some(gpu)
+}
+
+/// A dynamic slot for the one-view table of a root view: with
+/// `VICTORY_SLOT_GUARD` one that only such tables use.
+fn one_view_slot(host: &crate::descriptor::host::HostHeap) -> Option<u32> {
+    if crate::slotguard::set() {
+        host.dynamic_shaped(1, crate::slotguard::SHAPE_VIEW)
+    } else {
+        host.dynamic(1)
+    }
 }
 
 macro_rules! once {
@@ -1805,7 +1881,16 @@ impl State {
             if crate::readercheck::on() {
                 crate::readercheck::shader(&stage.shader.hash);
             }
-            let made = self.tables(list, &t.used, &t.host.root_indexed_views, &t.host.half_views, compute, &spans, &mut staged);
+            let made = self.tables(
+                list,
+                &t.used,
+                &t.host.root_indexed_views,
+                &t.host.half_views,
+                &t.host.constant_views,
+                compute,
+                &spans,
+                &mut staged,
+            );
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -1848,7 +1933,12 @@ impl State {
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
-                        None => self.user_value(compute, u.slot, u.root, u.dword),
+                        None => {
+                            if u.root == RootType::Table && crate::readercheck::on() {
+                                self.past_check(compute, u.slot);
+                            }
+                            self.user_value(compute, u.slot, u.root, u.dword)
+                        }
                     };
                 }
                 // SAFETY: an open list; `values` covers the parameter.
@@ -2053,7 +2143,7 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1) else {
+                let Some(index) = one_view_slot(host) else {
                     #[cfg(feature = "diagnostics")]
                     crate::pipeline::note_why("no free dynamic slot for the one-view table of a root view".to_owned());
                     return false;
@@ -2126,7 +2216,7 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1) else {
+                let Some(index) = one_view_slot(host) else {
                     #[cfg(feature = "diagnostics")]
                     crate::pipeline::note_why("no free dynamic slot for the one-view table of a root view".to_owned());
                     return false;
@@ -4018,11 +4108,31 @@ impl State {
         used: &[UsedResource],
         indexed: &[RootIndexedView],
         half: &[(u8, u32)],
+        constant: &[(u8, u32)],
         compute: bool,
         spans: &[(u8, u32, u32)],
         staged: &mut Vec<(u64, u32)>,
     ) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
+        // `constant`: the table places the stage's code reads as constant
+        // buffers (`HostShader::constant_views`), whatever its
+        // used-resource list names there. With `VICTORY_SLOT_GUARD` on
+        // (`reach`) their tables are made afresh and long enough to hold
+        // them, and their slots are made constant buffer views; with the
+        // reader check the ones the list does not name are counted.
+        let reach = crate::slotguard::parts() != 0;
+        if crate::readercheck::on() {
+            for &(slot, dword) in constant {
+                let named = dword != u32::MAX
+                    && used
+                        .iter()
+                        .filter(tables)
+                        .any(|u| u.slot == slot && u.kind == ResourceType::Cbv && u.table_offset_dwords / 8 == dword / 8);
+                if !named {
+                    crate::readercheck::unnamed(slot, (dword != u32::MAX).then_some(dword / 8), reach, self.pipeline);
+                }
+            }
+        }
         let mut fresh_mask: u64 = 0;
         let mut fresh_extra: Vec<u8> = Vec::new();
         let mark_fresh = |mask: &mut u64, extra: &mut Vec<u8>, slot: u8| {
@@ -4041,6 +4151,11 @@ impl State {
         };
         for u in used.iter().filter(tables).filter(|u| u.kind == ResourceType::Cbv) {
             mark_fresh(&mut fresh_mask, &mut fresh_extra, u.slot);
+        }
+        if reach {
+            for &(slot, _) in constant.iter().filter(|c| c.1 != u32::MAX) {
+                mark_fresh(&mut fresh_mask, &mut fresh_extra, slot);
+            }
         }
         // The view shown in place of the title's at dword `at` of the table
         // in root parameter `slot`, if the shader moves halves there and
@@ -4156,10 +4271,19 @@ impl State {
             );
             selected.sort_unstable();
             selected.dedup();
+            // The entries the code reads as constant buffers (`reach`).
+            let mut reads: Vec<u32> = if reach {
+                constant.iter().filter(|c| c.0 == slot && c.1 != u32::MAX).map(|c| c.1 / 8).collect()
+            } else {
+                Vec::new()
+            };
+            reads.sort_unstable();
+            reads.dedup();
             let n = entries
                 .iter()
                 .map(|u| u.table_offset_dwords / 8)
                 .chain(selected.last().copied())
+                .chain(reads.last().copied())
                 .max()
                 .unwrap_or(0)
                 + 1;
@@ -4198,11 +4322,17 @@ impl State {
             halves.dedup();
             // And which entries it reads as constant buffers over another
             // view (`VICTORY_TABLE_KEY_CBV`; off, none).
-            let forced = if crate::tablekey::key_cbv() {
+            let mut forced = if crate::tablekey::key_cbv() {
                 crate::tablekey::forced(&entries, n, |k| crate::descriptor::view(table + u64::from(k) * 32))
             } else {
                 Vec::new()
             };
+            if !reads.is_empty() {
+                let other = |k: &u32| !matches!(crate::descriptor::view(table + u64::from(*k) * 32), Some(View::Constant(..)));
+                forced.extend(reads.iter().copied().filter(|k| *k < n).filter(other));
+                forced.sort_unstable();
+                forced.dedup();
+            }
             let key = crate::tablekey::key(table_hash(table, n), &halves, &forced);
             let same = self.fresh_tables.get(&key).filter(|f| {
                 f.table == table
@@ -4263,7 +4393,27 @@ impl State {
             }
             #[cfg(feature = "diagnostics")]
             let mut clock = table_asked(&mut self.recording, table, n);
-            let Some(first) = host.dynamic(n) else {
+            // With `VICTORY_SLOT_GUARD` the slots are asked for by the
+            // table's shape (which entries are made constant buffer views,
+            // by the rule of the loop below): the entries' views are looked
+            // up here, once, and the loop takes them from here.
+            let mut views: Option<Vec<Option<View>>> = crate::slotguard::set()
+                .then(|| (0..n).map(|k| crate::descriptor::view(table + u64::from(k) * 32)).collect());
+            let taken = match &views {
+                Some(views) => {
+                    let constant = |(k, view): (usize, &Option<View>)| {
+                        matches!(view, Some(View::Constant(..)))
+                            || reads.binary_search(&(k as u32)).is_ok()
+                            || entries
+                                .iter()
+                                .find(|u| u.table_offset_dwords / 8 == k as u32)
+                                .is_some_and(|u| u.kind == ResourceType::Cbv)
+                    };
+                    host.dynamic_shaped(n, crate::slotguard::shape(views.iter().enumerate().map(constant)))
+                }
+                None => host.dynamic(n),
+            };
+            let Some(first) = taken else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
                 made.push((slot, u32::MAX));
@@ -4289,7 +4439,10 @@ impl State {
             for k in 0..n {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
-                let view = crate::descriptor::view(table + u64::from(k) * 32);
+                let view = match views.as_mut() {
+                    Some(views) => views[k as usize].take(),
+                    None => crate::descriptor::view(table + u64::from(k) * 32),
+                };
                 // An entry the shader reads as a constant buffer is made a
                 // constant buffer view whatever it holds: read through a
                 // slot of another kind (a null texture view where it holds
@@ -4299,7 +4452,7 @@ impl State {
                 // its bytes, as the console's descriptor would.
                 let view = match view {
                     Some(View::Constant(..)) => view,
-                    _ if !used.is_some_and(|u| u.kind == ResourceType::Cbv) => view,
+                    _ if !used.is_some_and(|u| u.kind == ResourceType::Cbv) && reads.binary_search(&k).is_err() => view,
                     Some(other) => match crate::descriptor::host::buffer_range(&other) {
                         Some((address, len)) if len > 0 => {
                             crate::slotkind::table_constant(crate::slotkind::TableEntry::BufferView);
@@ -4399,6 +4552,7 @@ impl State {
             }
             if crate::readercheck::on() {
                 self.check_readers(&entries, host, first, crate::readercheck::Path::Fresh);
+                self.note_made(std::ptr::from_ref(heap) as usize, host, first, n);
             }
             made.push((slot, first * 32));
         }

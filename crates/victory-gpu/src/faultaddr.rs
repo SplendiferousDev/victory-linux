@@ -67,8 +67,12 @@ pub(crate) fn say(text: &str) {
     let family = family(raw).unwrap_or("none known");
     let live = crate::shadow::live_holding(a).unwrap_or_else(|| "none".into());
     let gone = crate::shadow::gone_holding(a, 0).unwrap_or_else(|| "none".into());
+    // The lists in the air now: was any slot they made a table in written
+    // since (`crate::readercheck::rewritten` says which)? Before the counts.
+    let looked = crate::host::audit_flights();
     let mut counts = String::new();
     crate::gpuwatch::roots_section(&mut counts);
+    let _ = std::fmt::Write::write_fmt(&mut counts, format_args!("; {looked} lists in flight looked at"));
     tracing::warn!(
         "the card's fault address {raw:#x} ({a:#x} in 40 bits): family {family}; a live copy of ours holding it: {live}; \
          a copy of ours let go lately holding it: {gone}; root views and slot kinds: {counts}"

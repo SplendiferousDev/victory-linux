@@ -209,6 +209,18 @@ impl Detached {
     pub(crate) fn host(&self) -> &crate::host::HostList {
         &self.host
     }
+
+    /// The reader check's look at the tables the list made
+    /// (`crate::draw::State::audit`).
+    pub(crate) fn audit(&self, when: &'static str) {
+        self._state.audit(when);
+    }
+
+    /// The fault test: the list's descriptor tables' slots go back now
+    /// (`crate::draw::State::tables_back_early`).
+    pub(crate) fn tables_back_early(&mut self) {
+        self._state.tables_back_early();
+    }
 }
 
 /// A host list that has run and waits to be used again, and the bytes of

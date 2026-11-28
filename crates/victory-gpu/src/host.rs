@@ -37,6 +37,8 @@ mod at_budget;
 use at_budget::at_budget_note;
 
 pub(crate) use slot_wait::land_started;
+mod slot_guard;
+pub(crate) use slot_guard::{audit_flights, finished};
 
 #[cfg(test)]
 pub(crate) use card_merge::{CARD_MERGE, CARD_MERGE3};
@@ -6671,6 +6673,7 @@ impl Host {
             crate::list::recycle(lists, &order);
             return;
         };
+        slot_guard::sent(&mut lists);
         let told = !sent.writes.is_empty();
         let most = {
             let mut line = line();
