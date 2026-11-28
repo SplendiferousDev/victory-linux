@@ -2960,6 +2960,9 @@ impl State {
             // Slots whose texture's memory the runtime mapped, unmapped or
             // wrote since the last pass are due again.
             host.texture_slots_remapped(frame);
+            // Textures picked for eviction (`crate::resource::evict`): their
+            // slots made null and due again.
+            host.texture_slots_evicted(frame);
             // Levels on demand: the slots of textures whose first level
             // with memory changed since the last pass are made again from
             // it.

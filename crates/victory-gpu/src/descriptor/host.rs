@@ -1914,6 +1914,77 @@ impl HostHeap {
         true
     }
 
+    /// Texture eviction (`crate::resource::evict`): the title slots that
+    /// show the host textures picked since the last pass are made null
+    /// again, as [`HostHeap::texture_slot_gone`] does for a texture whose
+    /// memory went, and are due again from the next frame, as memory mapped
+    /// under them would make them: the queue makes and fills the copy anew
+    /// when the card has room. A texture is taken only if every slot that
+    /// shows it is a title slot no draw read through a table lately (one in
+    /// a list's table copy, or read by draws, stays as it is). The slots'
+    /// references are retired by [`HostHeap::keep`]: a submission in flight
+    /// that read a slot before keeps its texture. Returns the slots made
+    /// null.
+    pub(crate) fn texture_slots_evicted(&self, frame: u64) -> usize {
+        use windows::core::Interface;
+        if self.sampler {
+            return 0;
+        }
+        let wanted = crate::resource::evict::take_wanted();
+        if wanted.is_empty() {
+            return 0;
+        }
+        let by_address: std::collections::HashMap<usize, usize> =
+            wanted.iter().enumerate().map(|(i, w)| (w.0.as_raw() as usize, i)).collect();
+        // The slots showing each, one piece at a time.
+        let mut found: Vec<Vec<u32>> = vec![Vec::new(); wanted.len()];
+        for (piece, kept) in self.kept.iter().enumerate() {
+            let kept = kept.lock().unwrap_or_else(|e| e.into_inner());
+            for (at, slot) in kept.iter().enumerate() {
+                if let Some(resource) = slot
+                    && let Some(&i) = by_address.get(&(resource.as_raw() as usize))
+                {
+                    found[i].push(at as u32 * KEPT_PIECES + piece as u32);
+                }
+            }
+        }
+        let (mut textures, mut left) = (0u64, 0u64);
+        let mut unmade: Vec<u32> = Vec::new();
+        {
+            let mut made = locked(&self.made, 4);
+            for (i, slots) in found.iter().enumerate() {
+                if !crate::resource::evict::slots_free(slots, self.count, |s| self.tabled_lately(s, frame)) {
+                    left += 1;
+                    continue;
+                }
+                let address = wanted[i].0.as_raw() as usize;
+                let before = unmade.len();
+                for &slot in slots {
+                    // Still showing it (slots are made under `made`'s lock,
+                    // held here).
+                    let still = self.kept[(slot % KEPT_PIECES) as usize]
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get((slot / KEPT_PIECES) as usize)
+                        .is_some_and(|k| k.as_ref().is_some_and(|r| r.as_raw() as usize == address));
+                    if still {
+                        self.unmake(&mut made, slot);
+                        unmade.push(slot);
+                    }
+                }
+                textures += u64::from(unmade.len() > before);
+            }
+        }
+        if !unmade.is_empty() {
+            let mut queue = crate::lockmeter::lock("dh:textures", &self.textures);
+            for &slot in &unmade {
+                queue.changed(slot, frame, frame + 1);
+            }
+        }
+        crate::resource::evict::slots_done(wanted, textures, unmade.len() as u64, left);
+        unmade.len()
+    }
+
     /// Makes host slot `index` null again, as it is before its view is
     /// made: a null view of the kind it held.
     fn unmake(&self, made: &mut [u64], index: u32) {

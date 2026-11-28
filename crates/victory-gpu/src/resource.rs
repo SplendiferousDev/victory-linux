@@ -11,6 +11,9 @@ use std::ptr::NonNull;
 
 use victory_formats::texture;
 
+/// Texture eviction against the headroom plan (`VICTORY_TEXTURE_BUDGET_EVICT`).
+pub(crate) mod evict;
+
 use crate::object::{
     self, E_INVALIDARG, E_OUTOFMEMORY, HEAP, HRESULT, Iid, Object, RESOURCE, S_OK, Table, This,
     guid,
@@ -1845,6 +1848,7 @@ pub(crate) fn let_go_idle() {
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
     }
+    evict::round();
     let idle_ms = crate::host::vram_idle_ms(crate::headroom::planned(crate::host::host().and_then(|h| h.video_memory())));
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
