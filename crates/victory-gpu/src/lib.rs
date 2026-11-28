@@ -51,6 +51,8 @@ mod stats;
 #[cfg(windows)]
 mod spread;
 #[cfg(windows)]
+pub mod placement;
+#[cfg(windows)]
 mod draw;
 pub mod dxgi;
 mod fastcopy;
