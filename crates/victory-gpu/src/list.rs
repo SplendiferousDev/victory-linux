@@ -18,6 +18,9 @@ use crate::object::{
 use crate::queue::Written;
 use crate::resource::PAGEABLE_IIDS;
 
+#[cfg(windows)]
+mod deferred;
+
 const ALLOCATOR_IIDS: [Iid; 4] = [
     guid(
         0x6102dee4,
@@ -127,6 +130,10 @@ struct List {
     /// at them before it runs `host`.
     #[cfg(windows)]
     gate: Vec<ValueWait>,
+    /// With `VICTORY_THIN=1`: the calls written down for threads of ours to
+    /// make (`deferred`).
+    #[cfg(windows)]
+    thin: deferred::Front,
 }
 
 /// One part of a title list cut at its waits: the waits the queue stands
@@ -161,6 +168,16 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     crate::profile::seen(crate::profile::Seen::Record);
 }
 
+/// The title submits `lists`, or holds them for a submission: with
+/// `VICTORY_THIN=1` the calls written down for them are all made first, and
+/// what was held for those calls is let go.
+#[cfg(windows)]
+pub(crate) fn settle(lists: &[This]) {
+    for &this in lists {
+        deferred::settle(this);
+    }
+}
+
 /// The submission of `lists` has run: each gives its descriptor tables'
 /// slots back ([`crate::draw::State::tables_done`]). A list cut at waits
 /// keeps them: its state goes with its last part.
@@ -178,9 +195,18 @@ pub(crate) fn tables_done(lists: &[This]) {
     }
 }
 
-/// The host list behind a title list, if there is a host GPU.
+/// The host list behind a title list, if there is a host GPU. With
+/// `VICTORY_THIN=1` the calls written down for the list are made first:
+/// whoever asks finds the list as far as the title has recorded it.
 #[cfg(windows)]
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
+    deferred::drain(this);
+    host_list_now(this)
+}
+
+/// [`host_list`] as the list is now: for the thread that makes its calls.
+#[cfg(windows)]
+fn host_list_now<'a>(this: This) -> Option<&'a crate::host::HostList> {
     if this.is_null() {
         return None;
     }
@@ -336,6 +362,7 @@ fn cut(this: This, wait: ValueWait) {
     if this.is_null() {
         return;
     }
+    deferred::drain(this);
     // SAFETY: the title passes one of our lists; a list is recorded by one
     // thread at a time and is not submitted while it records.
     let list = unsafe { &mut *this.cast_mut().cast::<List>() };
@@ -625,6 +652,8 @@ fn new_list(
         earlier: Vec::new(),
         #[cfg(windows)]
         gate: Vec::new(),
+        #[cfg(windows)]
+        thin: Default::default(),
     });
     #[cfg(not(windows))]
     let _ = pipeline;
@@ -647,6 +676,9 @@ extern "system" fn list_query(this: This, iid: *const Iid, out: *mut This) -> HR
     object::answer(LIST, iid, object::is(iid, &LIST_IIDS).then_some(this), out)
 }
 extern "system" fn list_release(this: This) -> u32 {
+    // Calls written down for it are made while it is still there.
+    #[cfg(windows)]
+    deferred::settle(this);
     object::release_boxed::<List>(this)
 }
 extern "system" fn list_type(this: This) -> u32 {
@@ -654,6 +686,11 @@ extern "system" fn list_type(this: This) -> u32 {
     unsafe { (*this.cast::<List>()).kind }
 }
 extern "system" fn close(this: This) -> HRESULT {
+    #[cfg(windows)]
+    if let Some(front) = deferred::front(this) {
+        front.close(this);
+        return S_OK;
+    }
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
         host.close();
@@ -663,6 +700,12 @@ extern "system" fn close(this: This) -> HRESULT {
 extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT {
     if allocator.is_null() {
         return E_INVALIDARG;
+    }
+    #[cfg(windows)]
+    if let Some(front) = deferred::front(this) {
+        front.settle();
+        // The pipeline the recording begins with, as one it sets.
+        front.hold(pipeline, false);
     }
     // A wait recorded and never submitted goes with the recording.
     VALUE_WAITS
@@ -775,11 +818,23 @@ const UAV_BARRIER: Barrier = Barrier {
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
-        && !barriers.is_null()
-    {
+    if !barriers.is_null() {
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
+        if let Some(front) = deferred::front(this) {
+            front.barriers(this, barriers);
+        } else if let Some(list) = host_list(this) {
+            barrier_now(list, barriers);
+        }
+    }
+    0
+}
+
+/// [`barrier`] on the list's host list.
+#[cfg(windows)]
+fn barrier_now(list: &crate::host::HostList, barriers: &[Barrier]) {
+    let count = barriers.len();
+    {
         // What the dispatches before it wrote is seen from here on: a
         // segment that outlived them ends (`crate::indirect::segments_across`).
         if count > 0 && crate::indirect::segments_across() {
@@ -813,7 +868,6 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             unsafe { list.list.ResourceBarrier(host) };
         }
     }
-    0
 }
 
 /// Moves a title texture's host copy to `state` in the list, if needed.
@@ -1590,6 +1644,10 @@ static ALLOCATOR_FUNCTIONS: Table<24> = {
 extern "system" fn set_pipeline(this: This, pipeline: This) {
     crate::pipeline::bound(pipeline);
     #[cfg(windows)]
+    if let Some(front) = deferred::front(this) {
+        return front.pipeline(this, pipeline);
+    }
+    #[cfg(windows)]
     with_state(this, |_, state| state.set_pipeline(pipeline));
     #[cfg(not(windows))]
     let _ = this;
@@ -1640,6 +1698,7 @@ extern "system" fn ignored_state(_: This) {}
 /// set on the host list at once. Without a host GPU these do nothing.
 #[cfg(windows)]
 mod state {
+    use super::deferred::{Call, front};
     use super::{This, with_state};
     use crate::draw::{IndexView, VertexView};
     use windows::Win32::Foundation::RECT;
@@ -1655,6 +1714,9 @@ mod state {
     }
 
     pub(super) extern "system" fn topology(this: This, topology: u32) {
+        if let Some(f) = front(this) {
+            return f.put(this, Call::Topology(topology));
+        }
         with_state(this, |list, s| s.set_topology(list, topology));
     }
     pub(super) extern "system" fn viewports(
@@ -1662,35 +1724,63 @@ mod state {
         count: u32,
         viewports: *const D3D12_VIEWPORT,
     ) {
+        if let Some(f) = front(this) {
+            return f.put_all(this, items(viewports, count), |at, count| Call::Viewports { at, count });
+        }
         // (Through the draw state, which keeps them for the host list
         // that continues this one after a cut: `State::replay`.)
         with_state(this, |list, s| s.set_viewports(list, items(viewports, count)));
     }
     pub(super) extern "system" fn scissors(this: This, count: u32, rects: *const RECT) {
+        if let Some(f) = front(this) {
+            return f.put_all(this, items(rects, count), |at, count| Call::Scissors { at, count });
+        }
         with_state(this, |list, s| s.set_scissors(list, items(rects, count)));
     }
     pub(super) extern "system" fn blend_factor(this: This, factor: *const [f32; 4]) {
+        if let Some(f) = front(this) {
+            // SAFETY: the title passes four floats or null.
+            return f.put(this, Call::Blend(unsafe { factor.as_ref() }.copied()));
+        }
         with_state(this, |list, s| {
             // SAFETY: the title passes four floats or null.
             s.set_blend_factor(list, unsafe { factor.as_ref() })
         });
     }
     pub(super) extern "system" fn stencil_ref(this: This, reference: u32) {
+        if let Some(f) = front(this) {
+            return f.put(this, Call::StencilRef(reference));
+        }
         with_state(this, |list, s| s.set_stencil_ref(list, reference));
     }
     pub(super) extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
+        if let Some(f) = front(this) {
+            return f.put(this, Call::DepthBounds(min, max));
+        }
         with_state(this, |list, s| s.set_depth_bounds(list, min, max));
     }
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
+        if let Some(f) = front(this) {
+            return f.heaps(this, items(heaps, count));
+        }
         with_state(this, |_, s| s.set_heaps(items(heaps, count)));
     }
     pub(super) extern "system" fn compute_table(this: This, slot: u32, handle: u64) {
+        if let Some(f) = front(this) {
+            return f.table(this, true, slot, handle);
+        }
         with_state(this, |_, s| s.set_table(true, slot, handle));
     }
     pub(super) extern "system" fn graphics_table(this: This, slot: u32, handle: u64) {
+        if let Some(f) = front(this) {
+            return f.table(this, false, slot, handle);
+        }
         with_state(this, |_, s| s.set_table(false, slot, handle));
     }
     pub(super) extern "system" fn compute_constant(this: This, slot: u32, value: u32, offset: u32) {
+        if let Some(f) = front(this) {
+            return f.put(this, Call::Constant { compute: true, slot, value, offset });
+        }
         with_state(this, |_, s| s.set_constants(true, slot, &[value], offset));
     }
     pub(super) extern "system" fn graphics_constant(
@@ -1699,6 +1789,9 @@ mod state {
         value: u32,
         offset: u32,
     ) {
+        if let Some(f) = front(this) {
+            return f.put(this, Call::Constant { compute: false, slot, value, offset });
+        }
         with_state(this, |_, s| s.set_constants(false, slot, &[value], offset));
     }
     pub(super) extern "system" fn compute_constants(
@@ -1708,6 +1801,9 @@ mod state {
         values: *const u32,
         offset: u32,
     ) {
+        if let Some(f) = front(this) {
+            return f.put_all(this, items(values, count), |at, count| Call::Constants { compute: true, slot, offset, at, count });
+        }
         with_state(this, |_, s| {
             s.set_constants(true, slot, items(values, count), offset)
         });
@@ -1719,18 +1815,31 @@ mod state {
         values: *const u32,
         offset: u32,
     ) {
+        if let Some(f) = front(this) {
+            return f.put_all(this, items(values, count), |at, count| Call::Constants { compute: false, slot, offset, at, count });
+        }
         with_state(this, |_, s| {
             s.set_constants(false, slot, items(values, count), offset)
         });
     }
     /// Root constant buffer, shader resource and unordered access views.
     pub(super) extern "system" fn compute_view(this: This, slot: u32, address: u64) {
+        if let Some(f) = front(this) {
+            return f.put(this, Call::View { compute: true, slot, address });
+        }
         with_state(this, |_, s| s.set_view(true, slot, address));
     }
     pub(super) extern "system" fn graphics_view(this: This, slot: u32, address: u64) {
+        if let Some(f) = front(this) {
+            return f.put(this, Call::View { compute: false, slot, address });
+        }
         with_state(this, |_, s| s.set_view(false, slot, address));
     }
     pub(super) extern "system" fn index_buffer(this: This, view: *const IndexView) {
+        if let Some(f) = front(this) {
+            // SAFETY: the title passes a view or null.
+            return f.put(this, Call::Index(unsafe { view.as_ref() }.copied()));
+        }
         // SAFETY: the title passes a view or null.
         with_state(this, |_, s| s.set_index_buffer(unsafe { view.as_ref() }));
     }
@@ -1740,6 +1849,10 @@ mod state {
         count: u32,
         views: *const VertexView,
     ) {
+        if let Some(f) = front(this) {
+            let given = !views.is_null();
+            return f.put_all(this, items(views, count), |at, _| Call::Vertex { start, count, at, given });
+        }
         with_state(this, |_, s| {
             if views.is_null() {
                 s.clear_vertex_buffers(start, count);
@@ -1766,6 +1879,9 @@ mod state {
         };
         // SAFETY: the title passes a handle or null.
         let depth = unsafe { depth.as_ref() }.copied().unwrap_or(0);
+        if let Some(f) = front(this) {
+            return f.targets(this, &handles, depth);
+        }
         with_state(this, |list, s| s.set_targets(list, &handles, depth));
     }
     pub(super) extern "system" fn draw(
@@ -1776,16 +1892,28 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
+        if let Some(f) = front(this) {
+            f.mark(this, Some(false));
+            return f.put(this, Call::Draw { vertices, instances, first, first_instance });
+        }
         with_state(this, |list, s| {
             s.draw(list, vertices, instances, first, first_instance)
         });
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
+        if let Some(f) = front(this) {
+            f.mark(this, Some(true));
+            return f.put(this, Call::Dispatch { x, y, z });
+        }
         with_state(this, |list, s| s.dispatch(list, x, y, z));
     }
     pub(super) fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
         super::count_dispatch();
+        if let Some(f) = front(this) {
+            f.mark(this, Some(true));
+            return f.put(this, Call::DispatchX { x, y, z, flags });
+        }
         with_state(this, |list, s| s.dispatch_x(list, x, y, z, flags));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
@@ -1795,6 +1923,10 @@ mod state {
         if y * z != 1 {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
+        }
+        if let Some(f) = front(this) {
+            f.mark(this, Some(false));
+            return f.put(this, Call::DispatchMesh { x });
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
     }
@@ -1814,6 +1946,10 @@ mod state {
             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
             return;
         }
+        if let Some(f) = front(this) {
+            f.mark(this, Some(false));
+            return f.put(this, Call::DispatchMesh { x });
+        }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
     }
     pub(super) extern "system" fn draw_indexed(
@@ -1825,6 +1961,10 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
+        if let Some(f) = front(this) {
+            f.mark(this, Some(false));
+            return f.put(this, Call::DrawIndexed { indices, instances, first, base, first_instance });
+        }
         with_state(this, |list, s| {
             s.draw_indexed(list, indices, instances, first, base, first_instance)
         });
@@ -1890,6 +2030,43 @@ extern "system" fn execute_indirect(
     count_offset: u64,
 ) {
     count_draw();
+    #[cfg(windows)]
+    if let Some(front) = deferred::front(this) {
+        return front.indirect(this, signature, max, arguments, offset, count, count_offset);
+    }
+    execute_indirect_now(
+        this,
+        signature,
+        max,
+        arguments,
+        offset,
+        count,
+        count_offset,
+        None,
+    );
+}
+
+/// The host list and draw state of a list, if the caller is at them.
+#[cfg(windows)]
+type Held<'a> = Option<(&'a crate::host::HostList, &'a mut crate::draw::State)>;
+#[cfg(not(windows))]
+type Held<'a> = Option<&'a ()>;
+
+/// [`execute_indirect`] made now, with the list's host list and state if
+/// the caller has them already (`deferred`).
+#[allow(clippy::too_many_arguments)] // the method's own arguments
+fn execute_indirect_now(
+    this: This,
+    signature: This,
+    max: u32,
+    arguments: This,
+    offset: u64,
+    count: This,
+    count_offset: u64,
+    held: Held<'_>,
+) {
+    #[cfg(not(windows))]
+    let _ = (this, &held);
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
     };
@@ -1903,9 +2080,13 @@ extern "system" fn execute_indirect(
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
-        with_state(this, |list, s| {
+        let mut run = |list: &crate::host::HostList, s: &mut crate::draw::State| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
-        });
+        };
+        match held {
+            Some((list, s)) => run(list, s),
+            None => with_state(this, run),
+        }
     } else {
         #[cfg(all(windows, feature = "diagnostics"))]
         crate::pipeline::note_why(format!(
@@ -2146,17 +2327,25 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         }
     }
     #[cfg(windows)]
-    if count > 0
-        && let Some(list) = host_list(this)
-    {
-        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
-        // SAFETY: the same layout; no resource named.
-        let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
-        // SAFETY: an open list.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+    if count > 0 {
+        if let Some(front) = deferred::front(this) {
+            front.put(this, deferred::Call::BarrierGroups);
+        } else if let Some(list) = host_list(this) {
+            barrier_groups_now(list);
+        }
     }
     #[cfg(not(windows))]
     let _ = (this, count);
+}
+
+/// [`barrier_groups`] on the list's host list.
+#[cfg(windows)]
+fn barrier_groups_now(list: &crate::host::HostList) {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+    // SAFETY: the same layout; no resource named.
+    let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+    // SAFETY: an open list.
+    unsafe { list.list.ResourceBarrier(&[barrier]) };
 }
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and
@@ -2195,6 +2384,7 @@ fn value_written(this: This, address: u64, value: u64) {
         if address == 0 || this.is_null() {
             return;
         }
+        deferred::drain(this);
         #[cfg(not(feature = "diagnostics"))]
         let _ = value;
         #[cfg(feature = "diagnostics")]
