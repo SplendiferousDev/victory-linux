@@ -307,7 +307,8 @@ pub(crate) fn line() {
         crate::list::idle_count() as u64,
         crate::host::LISTS[1].load(Relaxed),
     ];
-    tracing::info!("{}", text(&rows(), lists, &crate::host::prelude_pool_text()));
+    let extra = crate::host::prelude_pool_text() + &crate::host::allocator_trim_text();
+    tracing::info!("{}", text(&rows(), lists, &extra));
 }
 
 #[cfg(test)]

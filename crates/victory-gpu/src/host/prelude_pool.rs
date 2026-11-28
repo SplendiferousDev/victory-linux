@@ -16,7 +16,9 @@
 //! retired path keeps it until every submission started by then has
 //! finished ([`bury`]), and only then does it return to the pool, so a
 //! prelude is never reset while a submission that runs it may still be on
-//! the card. Past [`IDLE_MOST`] idle ones it is let go instead.
+//! the card. Past [`IDLE_MOST`] idle ones it is let go instead. With
+//! `VICTORY_ALLOCATOR_TRIM_SECS` a prelude taken again gets a new allocator
+//! when its own is old (`allocator_trim`).
 //!
 //! Idea from skornuta, victory-memory-stack (shared prelude pool).
 
@@ -25,8 +27,11 @@ use super::*;
 /// The most idle preludes kept.
 const IDLE_MOST: usize = 64;
 
+/// A prelude of the pool: its allocator and when that was made, its list.
+pub(super) type Pooled = ((ID3D12CommandAllocator, u64), ID3D12GraphicsCommandList);
+
 /// Preludes whose last submission has finished, ready to record.
-static FREE: Mutex<Vec<Prelude>> = Mutex::new(Vec::new());
+static FREE: Mutex<Vec<Pooled>> = Mutex::new(Vec::new());
 
 /// The pool's preludes alive, made, and taken again since the start.
 pub(crate) static STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
@@ -46,27 +51,30 @@ pub(crate) fn on() -> bool {
 }
 
 /// A prelude whose last submission has finished, or a new one.
-pub(super) fn take(host: Option<&Host>) -> Option<Prelude> {
+pub(super) fn take(host: Option<&Host>) -> Option<Pooled> {
     let kept = crate::lockmeter::lock("ho:PRELUDE_POOL", &FREE).pop();
-    if let Some(prelude) = kept {
+    if let Some(mut prelude) = kept {
         STATS[2].fetch_add(1, Ordering::Relaxed);
+        // Its last submission has finished (it came back through `retire`)
+        // and its list is reset onto the allocator before recording.
+        super::allocator_trim::refresh(&mut prelude.0, super::allocator_trim::PRELUDE);
         return Some(prelude);
     }
-    let made = host?.make_prelude()?;
+    let (allocator, list) = host?.make_prelude()?;
     STATS[0].fetch_add(1, Ordering::Relaxed);
     STATS[1].fetch_add(1, Ordering::Relaxed);
-    Some(made)
+    Some(((allocator, now_ms()), list))
 }
 
 /// A prelude just recorded for the submission being prepared: back to the
 /// pool when every submission started so far has finished.
-pub(super) fn give(prelude: Prelude) {
+pub(super) fn give(prelude: Pooled) {
     retire(Back(Some(prelude)));
 }
 
 /// What [`retire`] holds: dropped only once the submissions that may run
 /// the prelude have finished, and then the prelude goes back to the pool.
-struct Back(Option<Prelude>);
+struct Back(Option<Pooled>);
 
 impl Drop for Back {
     fn drop(&mut self) {

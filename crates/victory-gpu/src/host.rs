@@ -28,6 +28,8 @@ mod slot_wait;
 mod stall_report;
 mod twin_ring;
 mod prelude_pool;
+mod allocator_trim;
+pub(crate) use allocator_trim::text as allocator_trim_text;
 pub(crate) use prelude_pool::text as prelude_pool_text;
 mod late_line;
 use late_line::late_line;
@@ -1563,7 +1565,8 @@ mod tests;
 
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
-    allocator: ID3D12CommandAllocator,
+    /// And when it was made: renewed at a reset when old (`allocator_trim`).
+    allocator: Mutex<(ID3D12CommandAllocator, u64)>,
     pub(crate) list: ID3D12GraphicsCommandList,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
@@ -4883,7 +4886,7 @@ impl Host {
                 let _ = prelude.set(self.make_prelude());
             }
             Ok(HostList {
-                allocator,
+                allocator: Mutex::new((allocator, now_ms())),
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
@@ -7801,12 +7804,12 @@ impl HostList {
         if let Some(fills) = crate::lockmeter::lock("ho:card_fills", &self.card_fills).as_mut() {
             (fills.1, fills.2) = (0, false);
         }
+        let mut allocator = crate::lockmeter::lock("ho:allocator", &self.allocator);
+        // Nothing of the list runs: an old allocator may be renewed.
+        allocator_trim::refresh(&mut allocator, allocator_trim::LIST);
         // SAFETY: the list is not executing.
-        let reset = unsafe {
-            self.allocator
-                .Reset()
-                .and_then(|()| self.list.Reset(&self.allocator, None))
-        };
+        let reset = unsafe { allocator.0.Reset().and_then(|()| self.list.Reset(&allocator.0, None)) };
+        drop(allocator);
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
@@ -8219,9 +8222,9 @@ impl HostList {
         // through `retire` once recorded (`prelude_pool`).
         let pooled = if prelude_pool::on() { prelude_pool::take(host()) } else { None };
         let Some((allocator, list)) = (match &pooled {
-            Some(p) => Some(p),
+            Some(p) => Some((&p.0.0, &p.1)),
             None if prelude_pool::on() => None,
-            None => self.prelude.get_or_init(|| host().and_then(|h| h.make_prelude())).as_ref(),
+            None => self.prelude.get_or_init(|| host().and_then(|h| h.make_prelude())).as_ref().map(|(a, l)| (a, l)),
         }) else {
             fail(format_args!("no host list for a state prelude"));
         };
